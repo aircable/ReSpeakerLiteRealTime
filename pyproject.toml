@@ -1,0 +1,31 @@
+[project]
+name = "respeaker-thinking-companion"
+version = "0.1.0"
+description = "Local OpenAI Realtime gateway for a ReSpeaker Lite thinking companion"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.116,<0.117",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.35,<1",
+  "websockets>=15,<16",
+]
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gateway*"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.4,<9", "pytest-asyncio>=1.1,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100

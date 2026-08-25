@@ -1,0 +1,2 @@
+"""ReSpeaker Thinking Companion gateway."""
+

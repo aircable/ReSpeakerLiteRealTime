@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+*.swp
+data/
+firmware/secrets.yaml
+firmware/.esphome/

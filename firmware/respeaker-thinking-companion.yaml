@@ -1,0 +1,214 @@
+substitutions:
+  name: thinking-companion
+  friendly_name: Thinking Companion
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.6.0
+  project:
+    name: aircable.respeaker-thinking-companion
+    version: 0.1.0
+  on_shutdown:
+    then:
+      - lambda: id(respeaker).mute_speaker();
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+logger:
+  level: DEBUG
+  logs:
+    realtime_companion: DEBUG
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [realtime_companion]
+  # Known-good hardware integration revisions; update only after hardware regression testing.
+  - source:
+      type: git
+      url: https://github.com/formatBCE/esphome
+      ref: f8f41eeac4381c1c5ef8feaa8de4cedc25d0898f
+    components: [i2s_audio]
+    refresh: 30d
+  - source:
+      type: git
+      url: https://github.com/formatBCE/Respeaker-Lite-ESPHome-integration
+      ref: 3136cf79238184e06bdf11e9b2105c58a16f6714
+    components: [respeaker_lite]
+    refresh: 30d
+
+i2c:
+  id: internal_i2c
+  sda: GPIO5
+  scl: GPIO6
+  frequency: 400kHz
+
+audio_dac:
+  - platform: aic3204
+    id: codec
+    i2c_id: internal_i2c
+
+i2s_audio:
+  - id: i2s_input
+    i2s_lrclk_pin: {number: GPIO7, allow_other_uses: true}
+    i2s_bclk_pin: {number: GPIO8, allow_other_uses: true}
+    i2s_mclk_pin: {number: GPIO9, allow_other_uses: true}
+  - id: i2s_output
+    i2s_lrclk_pin: {number: GPIO7, allow_other_uses: true}
+    i2s_bclk_pin: {number: GPIO8, allow_other_uses: true}
+    i2s_mclk_pin: {number: GPIO9, allow_other_uses: true}
+
+microphone:
+  - platform: i2s_audio
+    id: xmos_microphones
+    i2s_audio_id: i2s_input
+    i2s_din_pin: GPIO44
+    adc_type: external
+    pdm: false
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    channel: stereo
+
+speaker:
+  - platform: i2s_audio
+    id: xmos_speaker
+    i2s_audio_id: i2s_output
+    i2s_dout_pin: GPIO43
+    dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+    audio_dac: codec
+  - platform: resampler
+    id: realtime_resampler
+    output_speaker: xmos_speaker
+    sample_rate: 48000
+    bits_per_sample: 32
+    buffer_duration: 100ms
+    filters: 16
+    taps: 32
+
+respeaker_lite:
+  id: respeaker
+  reset_pin: GPIO2
+  mute_state:
+    id: hardware_mute_state
+    internal: true
+    on_state:
+      - lambda: id(realtime).set_muted(x);
+  firmware_version:
+    id: xmos_firmware_version
+    internal: true
+  firmware:
+    url: https://github.com/formatBCE/Respeaker-Lite-ESPHome-integration/raw/3136cf79238184e06bdf11e9b2105c58a16f6714/respeaker_lite_i2s_dfu_firmware_48k_v1.1.0.bin
+    version: "1.1.0"
+    md5: 9297155d1bf3eb21a9d4db52a89ea0c6
+
+realtime_companion:
+  id: realtime
+  microphone: xmos_microphones
+  speaker: realtime_resampler
+  url: !secret gateway_ws_url
+  token: !secret device_token
+  device_id: ${name}
+
+switch:
+  # A 300 ms pulse toggles the XMOS hardware mute latch (USR/MUTE jumper required).
+  - platform: gpio
+    id: mute_toggle
+    internal: true
+    pin: {number: GPIO4, inverted: true}
+    on_turn_on:
+      - delay: 300ms
+      - switch.turn_off: mute_toggle
+
+binary_sensor:
+  - platform: gpio
+    id: user_button
+    internal: true
+    pin: {number: GPIO3, inverted: true}
+    filters: [delayed_on: 50ms, delayed_off: 50ms]
+    on_click:
+      - min_length: 50ms
+        max_length: 1s
+        then:
+          - lambda: id(realtime).toggle_session();
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    internal: true
+    pin: GPIO1
+    num_leds: 1
+    rgb_order: GRB
+    chipset: ws2812
+    rmt_symbols: 192
+    default_transition_length: 0s
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          using esphome::realtime_companion::CompanionState;
+          auto call = id(status_led).turn_on();
+          call.set_transition_length(0);
+          switch (id(realtime).get_state()) {
+            case CompanionState::IDLE: call.set_rgb(0.0f, 0.0f, 0.08f); break;
+            case CompanionState::CONNECTING: call.set_rgb(0.4f, 0.2f, 0.0f); break;
+            case CompanionState::LISTENING: call.set_rgb(0.0f, 0.35f, 0.1f); break;
+            case CompanionState::THINKING: call.set_rgb(0.15f, 0.0f, 0.45f); break;
+            case CompanionState::SPEAKING: call.set_rgb(0.0f, 0.2f, 0.5f); break;
+            case CompanionState::MUTED: call.set_rgb(0.55f, 0.0f, 0.0f); break;
+            case CompanionState::ERROR: call.set_rgb(0.6f, 0.0f, 0.25f); break;
+          }
+          call.perform();
+
+micro_wake_word:
+  id: wake_word
+  microphone:
+    microphone: xmos_microphones
+    channels: 1
+    gain_factor: 4
+  stop_after_detection: false
+  models:
+    - model: hey_jarvis
+  vad:
+    probability_cutoff: 0.05
+  on_wake_word_detected:
+    - if:
+        condition:
+          lambda: return !id(hardware_mute_state).state;
+        then:
+          - lambda: id(realtime).start_session();
