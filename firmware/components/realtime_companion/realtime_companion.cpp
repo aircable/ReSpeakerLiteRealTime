@@ -46,7 +46,7 @@ void RealtimeCompanion::setup() {
   }
   this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 2, 24000));
   this->speaker_->add_audio_output_callback([this](uint32_t frames, int64_t) {
-    if (!this->stream_id_.empty())
+    if (this->playback_active_.load(std::memory_order_acquire))
       this->played_frames_.fetch_add(frames, std::memory_order_relaxed);
   });
   this->microphone_->add_data_callback(
@@ -62,6 +62,7 @@ void RealtimeCompanion::connect() {
   config.network_timeout_ms = 5000;
   config.reconnect_timeout_ms = 2000;
   config.disable_auto_reconnect = false;
+  config.task_stack = 8192;
   config.buffer_size = 2048;
   this->client_ = esp_websocket_client_init(&config);
   if (this->client_ == nullptr) {
@@ -187,12 +188,17 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     }
   } else if (strcmp(kind, "playback.start") == 0) {
     cJSON *stream = cJSON_GetObjectItemCaseSensitive(root, "stream_id");
-    this->stream_id_ = cJSON_IsString(stream) ? stream->valuestring : "";
+    {
+      std::lock_guard<std::mutex> lock(this->playback_mutex_);
+      this->stream_id_ = cJSON_IsString(stream) ? stream->valuestring : "";
+      this->expected_duration_ms_ = 0;
+    }
     this->played_frames_.store(0, std::memory_order_relaxed);
-    this->expected_duration_ms_ = 0;
+    this->playback_active_.store(true, std::memory_order_release);
     this->speaker_->start();
   } else if (strcmp(kind, "playback.end") == 0) {
     cJSON *duration = cJSON_GetObjectItemCaseSensitive(root, "duration_ms");
+    std::lock_guard<std::mutex> lock(this->playback_mutex_);
     this->expected_duration_ms_ = cJSON_IsNumber(duration) ? duration->valueint : 0;
   } else if (strcmp(kind, "playback.flush") == 0) {
     this->flush_playback();
@@ -313,14 +319,27 @@ void RealtimeCompanion::loop() {
       // Progress is counted by the DAC-output callback, not by accepted input bytes.
     }
   }
-  if (!this->stream_id_.empty() && millis() - this->last_progress_ms_ >= 100) {
+  if (millis() - this->last_progress_ms_ >= 100) {
     this->last_progress_ms_ = millis();
-    const uint32_t played_ms = this->played_frames_.load(std::memory_order_relaxed) / 24;
-    this->send_json("{\"v\":1,\"type\":\"playback.progress\",\"stream_id\":\"" +
-                    this->stream_id_ + "\",\"played_ms\":" + std::to_string(played_ms) + "}");
-    if (this->expected_duration_ms_ != 0 && played_ms >= this->expected_duration_ms_) {
-      this->stream_id_.clear();
-      this->expected_duration_ms_ = 0;
+    std::string stream_id;
+    uint32_t expected_duration_ms;
+    {
+      std::lock_guard<std::mutex> lock(this->playback_mutex_);
+      stream_id = this->stream_id_;
+      expected_duration_ms = this->expected_duration_ms_;
+    }
+    if (!stream_id.empty()) {
+      const uint32_t played_ms = this->played_frames_.load(std::memory_order_relaxed) / 24;
+      this->send_json("{\"v\":1,\"type\":\"playback.progress\",\"stream_id\":\"" +
+                      stream_id + "\",\"played_ms\":" + std::to_string(played_ms) + "}");
+      if (expected_duration_ms != 0 && played_ms >= expected_duration_ms) {
+        std::lock_guard<std::mutex> lock(this->playback_mutex_);
+        if (this->stream_id_ == stream_id) {
+          this->stream_id_.clear();
+          this->expected_duration_ms_ = 0;
+          this->playback_active_.store(false, std::memory_order_release);
+        }
+      }
     }
   }
 }
@@ -379,8 +398,10 @@ void RealtimeCompanion::set_muted(bool muted) {
 void RealtimeCompanion::flush_playback() {
   xQueueReset(this->playback_queue_);
   this->speaker_->stop();
-  this->stream_id_.clear();
   this->played_frames_.store(0, std::memory_order_relaxed);
+  this->playback_active_.store(false, std::memory_order_release);
+  std::lock_guard<std::mutex> lock(this->playback_mutex_);
+  this->stream_id_.clear();
   this->expected_duration_ms_ = 0;
 }
 

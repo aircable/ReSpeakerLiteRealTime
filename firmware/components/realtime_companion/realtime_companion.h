@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,7 @@ class RealtimeCompanion : public Component {
   std::string token_;
   std::string device_id_;
   std::string stream_id_;
+  std::mutex playback_mutex_;
   static constexpr size_t RESAMPLER_INPUT_FRAMES = 256;
   static constexpr size_t RESAMPLER_OUTPUT_FRAMES = 384;
   esp_audio_libs::resampler::Resampler input_resampler_{RESAMPLER_INPUT_FRAMES,
@@ -108,6 +110,7 @@ class RealtimeCompanion : public Component {
   std::atomic<uint32_t> dropped_frames_{0};
   std::atomic<uint16_t> capture_peak_{0};
   std::atomic<uint32_t> played_frames_{0};
+  std::atomic<bool> playback_active_{false};
   uint32_t expected_duration_ms_{0};
   uint32_t last_progress_ms_{0};
   uint32_t last_audio_stats_ms_{0};

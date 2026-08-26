@@ -26,7 +26,9 @@ CONFIG_SCHEMA = cv.Schema(
 
 
 async def to_code(config):
-    esp32.add_idf_component(name="espressif/esp_websocket_client", ref="1.4.0")
+    # 1.8.0 fixes a potential segfault in the client's variadic error formatter. Audio transport
+    # exercises that path whenever a write is interrupted by a reconnect, so do not loosen this pin.
+    esp32.add_idf_component(name="espressif/esp_websocket_client", ref="1.8.0")
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     mic = await cg.get_variable(config[CONF_MICROPHONE])
