@@ -5,6 +5,7 @@
 #include "esphome/core/component.h"
 
 #include <esp_websocket_client.h>
+#include <resampler.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -39,19 +40,6 @@ struct OutputFrame {
   uint16_t offset{0};
 };
 
-class FirDecimator2 {
- public:
-  void push(int16_t sample, int16_t *output, bool *ready);
-  void reset();
-
- protected:
-  static constexpr size_t TAPS = 31;
-  static const int16_t COEFFICIENTS[TAPS];
-  int16_t history_[TAPS]{};
-  size_t position_{0};
-  bool phase_{false};
-};
-
 class RealtimeCompanion : public Component {
  public:
   void setup() override;
@@ -79,6 +67,7 @@ class RealtimeCompanion : public Component {
   static void audio_sender_task(void *parameter);
   void handle_websocket_event(int32_t event_id, esp_websocket_event_data_t *event);
   void handle_microphone_data(const std::vector<uint8_t> &data);
+  void append_capture_sample(int16_t sample);
   void run_audio_sender();
   void handle_text(const char *data, size_t length);
   void connect();
@@ -93,7 +82,12 @@ class RealtimeCompanion : public Component {
   std::string token_;
   std::string device_id_;
   std::string stream_id_;
-  FirDecimator2 decimator_;
+  static constexpr size_t RESAMPLER_INPUT_FRAMES = 256;
+  static constexpr size_t RESAMPLER_OUTPUT_FRAMES = 384;
+  esp_audio_libs::resampler::Resampler input_resampler_{RESAMPLER_INPUT_FRAMES,
+                                                         RESAMPLER_OUTPUT_FRAMES};
+  std::array<int16_t, RESAMPLER_INPUT_FRAMES> resampler_input_{};
+  std::array<int16_t, RESAMPLER_OUTPUT_FRAMES> resampler_output_{};
 
   StaticQueue_t capture_queue_struct_{};
   StaticQueue_t playback_queue_struct_{};

@@ -49,9 +49,11 @@ then compile `firmware/respeaker-thinking-companion.yaml` with ESPHome 2026.6 or
 
 The configuration pins the tested formatBCE component revisions. It retains XMOS DFU, the AIC3204
 codec, 48 kHz 32-bit stereo I²S, hardware AEC, separate wake-word channel, mute/button, status LED,
-OTA, and ESPHome's output resampler. The custom component takes channel 0 through a 31-tap Q15 FIR
-decimator, sends fixed 20 ms PCM16 frames from a six-frame static FreeRTOS queue, and expands
-incoming mono PCM before the 24-to-48 kHz speaker resampler. Capture stays active during playback.
+OTA, and ESPHome's output resampler. The formatBCE microphone fork derives a 16 kHz PCM32 stereo
+callback from the 48 kHz XMOS bus for microWakeWord. The custom component resamples AEC channel 0
+to 24 kHz with ESPHome's sinc resampler, sends fixed 20 ms PCM16 frames from a six-frame static
+FreeRTOS queue, and expands incoming mono PCM before the 24-to-48 kHz speaker resampler. Capture
+stays active during playback.
 
 The USR-to-D2 and MUTE-to-D3 rear-pad jumpers are required for the physical controls used by the
 configuration. See [PROTOCOL.md](PROTOCOL.md) for the wire contract.

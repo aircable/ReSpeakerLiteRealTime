@@ -14,40 +14,28 @@ namespace esphome::realtime_companion {
 
 static const char *const TAG = "realtime_companion";
 
-const int16_t FirDecimator2::COEFFICIENTS[TAPS] = {
-    2, 9, -12, -54, 16, 180, 45, -426, -303, 787, 991, -1191, -2691, 1514, 10144, 14746,
-    10144, 1514, -2691, -1191, 991, 787, -303, -426, 45, 180, 16, -54, -12, 9, 2,
-};
-
-void FirDecimator2::reset() {
-  memset(this->history_, 0, sizeof(this->history_));
-  this->position_ = 0;
-  this->phase_ = false;
-}
-
-void FirDecimator2::push(int16_t sample, int16_t *output, bool *ready) {
-  this->history_[this->position_] = sample;
-  this->position_ = (this->position_ + 1) % TAPS;
-  this->phase_ = !this->phase_;
-  *ready = this->phase_;
-  if (!*ready)
-    return;
-  int64_t accumulator = 0;
-  size_t cursor = this->position_;
-  for (size_t tap = 0; tap < TAPS; tap++) {
-    cursor = cursor == 0 ? TAPS - 1 : cursor - 1;
-    accumulator += static_cast<int32_t>(this->history_[cursor]) * COEFFICIENTS[tap];
-  }
-  accumulator = (accumulator + (1 << 14)) >> 15;
-  *output = static_cast<int16_t>(std::clamp<int64_t>(accumulator, INT16_MIN, INT16_MAX));
-}
-
 void RealtimeCompanion::setup() {
   ESP_LOGI(TAG, "Initializing transport; WebSocket will wait for network readiness");
   this->capture_queue_ = xQueueCreateStatic(6, sizeof(InputFrame), this->capture_queue_storage_,
                                              &this->capture_queue_struct_);
   this->playback_queue_ = xQueueCreateStatic(10, sizeof(OutputFrame), this->playback_queue_storage_,
                                               &this->playback_queue_struct_);
+  esp_audio_libs::resampler::ResamplerConfiguration resampler_config = {
+      .source_sample_rate = 16000.0f,
+      .target_sample_rate = 24000.0f,
+      .source_bits_per_sample = 16,
+      .target_bits_per_sample = 16,
+      .channels = 1,
+      .use_pre_or_post_filter = false,
+      .subsample_interpolate = false,
+      .number_of_taps = 32,
+      .number_of_filters = 16,
+  };
+  if (!this->input_resampler_.initialize(resampler_config)) {
+    ESP_LOGE(TAG, "Could not initialize the 16-to-24 kHz microphone resampler");
+    this->mark_failed();
+    return;
+  }
   this->audio_sender_task_handle_ = xTaskCreateStatic(
       &RealtimeCompanion::audio_sender_task, "realtime_tx", AUDIO_SENDER_STACK_WORDS, this,
       tskIDLE_PRIORITY + 3, this->audio_sender_task_stack_, &this->audio_sender_task_struct_);
@@ -219,7 +207,6 @@ void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data)
   if (!capture_enabled) {
     if (this->capture_running_) {
       ESP_LOGI(TAG, "Microphone frame capture paused");
-      this->decimator_.reset();
       this->building_samples_ = 0;
       this->building_peak_ = 0;
       this->capture_running_ = false;
@@ -228,38 +215,54 @@ void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data)
   }
   if (!this->capture_running_) {
     ESP_LOGI(TAG, "Microphone frame capture started");
-    this->decimator_.reset();
     this->building_samples_ = 0;
     this->building_peak_ = 0;
     this->capture_running_ = true;
   }
-  // XMOS stream is interleaved stereo, signed little-endian PCM32. Channel 0 carries AEC speech.
-  for (size_t offset = 0; offset + 7 < data.size(); offset += 8) {
-    int32_t input;
-    memcpy(&input, data.data() + offset, sizeof(input));
-    int16_t output;
-    bool ready;
-    this->decimator_.push(static_cast<int16_t>(input >> 16), &output, &ready);
-    if (!ready)
-      continue;
-    const uint16_t magnitude = output < 0 ? static_cast<uint16_t>(-static_cast<int32_t>(output))
-                                          : static_cast<uint16_t>(output);
-    this->building_peak_ = std::max(this->building_peak_, magnitude);
-    this->building_frame_.data[2 * this->building_samples_] = static_cast<uint8_t>(output);
-    this->building_frame_.data[2 * this->building_samples_ + 1] = static_cast<uint8_t>(output >> 8);
-    if (++this->building_samples_ == INPUT_FRAME_BYTES / 2) {
-      this->captured_frames_.fetch_add(1, std::memory_order_relaxed);
-      uint16_t previous_peak = this->capture_peak_.load(std::memory_order_relaxed);
-      while (previous_peak < this->building_peak_ &&
-             !this->capture_peak_.compare_exchange_weak(previous_peak, this->building_peak_,
-                                                        std::memory_order_relaxed)) {}
-      if (xQueueSend(this->capture_queue_, &this->building_frame_, 0) != pdTRUE) {
-        this->dropped_frames_.fetch_add(1, std::memory_order_relaxed);
-        ESP_LOGW(TAG, "Capture queue full; dropping 20 ms frame");
-      }
-      this->building_samples_ = 0;
-      this->building_peak_ = 0;
+  // The pinned formatBCE microphone reads the 48 kHz XMOS bus, keeps every third frame, and
+  // advertises its callback as 16 kHz PCM32 stereo. Channel 0 is the AEC speech channel.
+  const size_t source_frames = data.size() / 8;
+  for (size_t base = 0; base < source_frames;) {
+    const size_t frames = std::min(RESAMPLER_INPUT_FRAMES, source_frames - base);
+    for (size_t i = 0; i < frames; i++) {
+      int32_t input;
+      memcpy(&input, data.data() + (base + i) * 8, sizeof(input));
+      this->resampler_input_[i] = static_cast<int16_t>(input >> 16);
     }
+    const auto result = this->input_resampler_.resample(
+        reinterpret_cast<const uint8_t *>(this->resampler_input_.data()),
+        reinterpret_cast<uint8_t *>(this->resampler_output_.data()), frames,
+        RESAMPLER_OUTPUT_FRAMES, 0.0f);
+    if (result.frames_used != frames) {
+      ESP_LOGW(TAG, "Microphone resampler consumed %u of %u input frames",
+               static_cast<unsigned>(result.frames_used), static_cast<unsigned>(frames));
+    }
+    for (size_t i = 0; i < result.frames_generated; i++)
+      this->append_capture_sample(this->resampler_output_[i]);
+    base += result.frames_used;
+    if (result.frames_used == 0)
+      break;
+  }
+}
+
+void RealtimeCompanion::append_capture_sample(int16_t sample) {
+  const uint16_t magnitude = sample < 0 ? static_cast<uint16_t>(-static_cast<int32_t>(sample))
+                                        : static_cast<uint16_t>(sample);
+  this->building_peak_ = std::max(this->building_peak_, magnitude);
+  this->building_frame_.data[2 * this->building_samples_] = static_cast<uint8_t>(sample);
+  this->building_frame_.data[2 * this->building_samples_ + 1] = static_cast<uint8_t>(sample >> 8);
+  if (++this->building_samples_ == INPUT_FRAME_BYTES / 2) {
+    this->captured_frames_.fetch_add(1, std::memory_order_relaxed);
+    uint16_t previous_peak = this->capture_peak_.load(std::memory_order_relaxed);
+    while (previous_peak < this->building_peak_ &&
+           !this->capture_peak_.compare_exchange_weak(previous_peak, this->building_peak_,
+                                                      std::memory_order_relaxed)) {}
+    if (xQueueSend(this->capture_queue_, &this->building_frame_, 0) != pdTRUE) {
+      this->dropped_frames_.fetch_add(1, std::memory_order_relaxed);
+      ESP_LOGW(TAG, "Capture queue full; dropping 20 ms frame");
+    }
+    this->building_samples_ = 0;
+    this->building_peak_ = 0;
   }
 }
 

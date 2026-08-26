@@ -17,7 +17,7 @@
 
   - Replace Home Assistant voice_assistant with a dedicated Realtime component.
   - Capture speech from XMOS channel 0; keep channel 1 for wake-word detection.
-  - Convert 48 kHz/32-bit speech to 24 kHz PCM16 mono using a proper fixed-ratio FIR decimator.
+  - Convert the formatBCE 16 kHz callback (derived from the 48 kHz XMOS bus) to 24 kHz PCM16 mono using proper fixed-ratio sinc resampling.
   - Send 20 ms binary audio frames through fixed-size FreeRTOS buffers; avoid dynamic audio queues and blocking network calls.
   - Play incoming 24 kHz PCM16 through the existing ESPHome resampler into the 48 kHz ReSpeaker output.
   - Continue transmitting microphone audio during playback so XMOS AEC and OpenAI VAD can detect interruptions.
@@ -112,5 +112,4 @@
 )
 
   - Initial deployment is single-user on a trusted LAN; remote multi-user access and Home Assistant control are out of scope.
-
 
