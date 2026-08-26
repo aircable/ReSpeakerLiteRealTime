@@ -301,6 +301,7 @@ interval:
               break;
             case IDLE:
               call.set_rgb(0.0f, 1.0f, 0.0f);
+              call.set_brightness(0.15f);
               call.set_effect("None");
               break;
             case MUTED: break;
