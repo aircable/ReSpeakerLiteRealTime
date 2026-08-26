@@ -48,6 +48,14 @@ void RealtimeCompanion::setup() {
                                              &this->capture_queue_struct_);
   this->playback_queue_ = xQueueCreateStatic(10, sizeof(OutputFrame), this->playback_queue_storage_,
                                               &this->playback_queue_struct_);
+  this->audio_sender_task_handle_ = xTaskCreateStatic(
+      &RealtimeCompanion::audio_sender_task, "realtime_tx", AUDIO_SENDER_STACK_WORDS, this,
+      tskIDLE_PRIORITY + 3, this->audio_sender_task_stack_, &this->audio_sender_task_struct_);
+  if (this->audio_sender_task_handle_ == nullptr) {
+    ESP_LOGE(TAG, "Could not create audio sender task");
+    this->mark_failed();
+    return;
+  }
   this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 2, 24000));
   this->speaker_->add_audio_output_callback([this](uint32_t frames, int64_t) {
     if (!this->stream_id_.empty())
@@ -91,14 +99,50 @@ void RealtimeCompanion::websocket_event(void *handler_args, esp_event_base_t, in
       ->handle_websocket_event(event_id, static_cast<esp_websocket_event_data_t *>(event_data));
 }
 
+void RealtimeCompanion::audio_sender_task(void *parameter) {
+  static_cast<RealtimeCompanion *>(parameter)->run_audio_sender();
+}
+
+void RealtimeCompanion::run_audio_sender() {
+  InputFrame captured;
+  while (true) {
+    if (xQueueReceive(this->capture_queue_, &captured, portMAX_DELAY) != pdTRUE)
+      continue;
+    if (!this->authenticated_.load(std::memory_order_acquire) ||
+        !this->session_active_.load(std::memory_order_acquire) ||
+        !this->stream_ready_.load(std::memory_order_acquire) ||
+        this->muted_.load(std::memory_order_acquire) || this->client_ == nullptr ||
+        !esp_websocket_client_is_connected(this->client_)) {
+      continue;
+    }
+    const int sent = esp_websocket_client_send_bin(
+        this->client_, reinterpret_cast<const char *>(captured.data.data()), captured.data.size(),
+        pdMS_TO_TICKS(50));
+    if (sent != static_cast<int>(captured.data.size())) {
+      ESP_LOGW(TAG, "Audio WebSocket send failed: sent %d of %u bytes", sent,
+               static_cast<unsigned>(captured.data.size()));
+      // A short lock-contention timeout can fail without disconnecting the client. Drop only
+      // that frame in this case; the disconnect callback owns stream shutdown and queue reset.
+      if (!esp_websocket_client_is_connected(this->client_)) {
+        this->stream_ready_.store(false, std::memory_order_release);
+        xQueueReset(this->capture_queue_);
+        if (this->session_active_.load(std::memory_order_acquire))
+          this->update_state(CompanionState::CONNECTING);
+      }
+    }
+  }
+}
+
 void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_event_data_t *event) {
   if (event_id == WEBSOCKET_EVENT_CONNECTED) {
     this->authenticated_ = false;
     this->auth_pending_.store(true, std::memory_order_release);
   } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
     this->authenticated_ = false;
+    this->stream_ready_.store(false, std::memory_order_release);
     this->auth_pending_.store(false, std::memory_order_release);
     this->session_start_pending_.store(false, std::memory_order_release);
+    xQueueReset(this->capture_queue_);
     if (this->session_active_)
       this->update_state(CompanionState::CONNECTING);
   } else if (event_id == WEBSOCKET_EVENT_DATA && event->payload_offset == 0 &&
@@ -130,9 +174,12 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     if (this->session_active_)
       this->session_start_pending_.store(true, std::memory_order_release);
   } else if (strcmp(kind, "session.started") == 0) {
+    this->stream_ready_.store(true, std::memory_order_release);
     this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::LISTENING);
   } else if (strcmp(kind, "session.ended") == 0) {
     this->session_active_ = false;
+    this->stream_ready_.store(false, std::memory_order_release);
+    xQueueReset(this->capture_queue_);
     this->flush_playback();
     this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::IDLE);
   } else if (strcmp(kind, "state") == 0) {
@@ -159,8 +206,22 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
 }
 
 void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data) {
-  if (!this->session_active_ || this->muted_)
+  const bool capture_enabled = this->session_active_.load(std::memory_order_acquire) &&
+                               this->stream_ready_.load(std::memory_order_acquire) &&
+                               !this->muted_.load(std::memory_order_acquire);
+  if (!capture_enabled) {
+    if (this->capture_running_) {
+      this->decimator_.reset();
+      this->building_samples_ = 0;
+      this->capture_running_ = false;
+    }
     return;
+  }
+  if (!this->capture_running_) {
+    this->decimator_.reset();
+    this->building_samples_ = 0;
+    this->capture_running_ = true;
+  }
   // XMOS stream is interleaved stereo, signed little-endian PCM32. Channel 0 carries AEC speech.
   for (size_t offset = 0; offset + 7 < data.size(); offset += 8) {
     int32_t input;
@@ -195,13 +256,10 @@ void RealtimeCompanion::loop() {
   }
   if (this->session_start_pending_.load(std::memory_order_acquire) && this->authenticated_ &&
       this->session_active_ && this->send_json("{\"v\":1,\"type\":\"session.start\"}")) {
+    // The gateway buffers subsequent WebSocket frames while it establishes the OpenAI session.
+    // Enabling capture here preserves speech that begins immediately after the wake word.
+    this->stream_ready_.store(true, std::memory_order_release);
     this->session_start_pending_.store(false, std::memory_order_release);
-  }
-  InputFrame captured;
-  if (this->authenticated_ && this->session_active_ && !this->muted_ &&
-      xQueueReceive(this->capture_queue_, &captured, 0) == pdTRUE) {
-    esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char *>(captured.data.data()),
-                                  captured.data.size(), 0);
   }
   OutputFrame playback;
   if (xQueueReceive(this->playback_queue_, &playback, 0) == pdTRUE) {
@@ -230,12 +288,11 @@ void RealtimeCompanion::start_session() {
   if (this->muted_)
     return;
   this->session_active_ = true;
-  this->decimator_.reset();
-  this->building_samples_ = 0;
+  this->stream_ready_.store(false, std::memory_order_release);
   xQueueReset(this->capture_queue_);
   this->update_state(CompanionState::CONNECTING);
   if (this->authenticated_)
-    this->send_json("{\"v\":1,\"type\":\"session.start\"}");
+    this->session_start_pending_.store(true, std::memory_order_release);
 }
 
 void RealtimeCompanion::stop_session(const char *reason) {
@@ -243,6 +300,8 @@ void RealtimeCompanion::stop_session(const char *reason) {
     return;
   this->send_json("{\"v\":1,\"type\":\"session.stop\",\"reason\":\"" + std::string(reason) + "\"}");
   this->session_active_ = false;
+  this->stream_ready_.store(false, std::memory_order_release);
+  xQueueReset(this->capture_queue_);
   this->flush_playback();
   this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::IDLE);
 }

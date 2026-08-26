@@ -7,6 +7,7 @@
 #include <esp_websocket_client.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/task.h>
 
 #include <array>
 #include <atomic>
@@ -75,8 +76,10 @@ class RealtimeCompanion : public Component {
 
  protected:
   static void websocket_event(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+  static void audio_sender_task(void *parameter);
   void handle_websocket_event(int32_t event_id, esp_websocket_event_data_t *event);
   void handle_microphone_data(const std::vector<uint8_t> &data);
+  void run_audio_sender();
   void handle_text(const char *data, size_t length);
   void connect();
   bool send_json(const std::string &json);
@@ -98,8 +101,13 @@ class RealtimeCompanion : public Component {
   uint8_t playback_queue_storage_[10 * sizeof(OutputFrame)]{};
   QueueHandle_t capture_queue_{nullptr};
   QueueHandle_t playback_queue_{nullptr};
+  static constexpr uint32_t AUDIO_SENDER_STACK_WORDS = 4096;
+  StaticTask_t audio_sender_task_struct_{};
+  StackType_t audio_sender_task_stack_[AUDIO_SENDER_STACK_WORDS]{};
+  TaskHandle_t audio_sender_task_handle_{nullptr};
   InputFrame building_frame_{};
   size_t building_samples_{0};
+  bool capture_running_{false};
   std::atomic<uint32_t> played_frames_{0};
   uint32_t expected_duration_ms_{0};
   uint32_t last_progress_ms_{0};
@@ -110,6 +118,7 @@ class RealtimeCompanion : public Component {
   std::atomic<bool> authenticated_{false};
   std::atomic<bool> authenticated_once_{false};
   std::atomic<bool> session_active_{false};
+  std::atomic<bool> stream_ready_{false};
   std::atomic<bool> muted_{false};
 };
 

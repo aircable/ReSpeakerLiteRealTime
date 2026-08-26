@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 from typing import Any, BinaryIO
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 
 from .config import Settings
 from .context import build_instructions
@@ -70,6 +70,26 @@ class DeviceSession:
             await self.websocket.send_json(message)
         if self.observer is not None:
             await self.observer(message)
+
+    async def publish_json(self, message_type: str, **payload: Any) -> None:
+        """Publish server state without writing to the device connection."""
+        if self.observer is not None:
+            await self.observer(
+                server_message(message_type, **{"device_id": self.device_id, **payload})
+            )
+
+    async def send_optional(
+        self, message_type: str, notify_device: bool, **payload: Any
+    ) -> bool:
+        """Send when connected, falling back to UI-only publication after disconnect."""
+        if notify_device:
+            try:
+                await self.send_json(message_type, **payload)
+                return True
+            except (WebSocketDisconnect, RuntimeError):
+                notify_device = False
+        await self.publish_json(message_type, **payload)
+        return notify_device
 
     async def send_bytes(self, data: bytes) -> None:
         async with self.send_lock:
@@ -243,32 +263,39 @@ class DeviceSession:
         )
         self.output.ended = True
 
-    async def stop(self, reason: str) -> None:
+    async def stop(self, reason: str, notify_device: bool = True) -> None:
         if self.stopping or self.cloud is None:
             return
         self.stopping = True
-        if self.output:
-            await self.send_json("playback.flush", stream_id=self.output.stream_id)
-        cloud, self.cloud = self.cloud, None
-        await cloud.close()
-        if self.timer_task and self.timer_task is not asyncio.current_task():
-            self.timer_task.cancel()
-            await asyncio.gather(self.timer_task, return_exceptions=True)
         session_id, project_id = self.session_id, self.project_id
-        if session_id is not None:
-            self.db.end_session(session_id, reason, self.usage)
-        self.session_id = self.project_id = None
-        self.output = None
-        self.output_buffer.clear()
-        for recording in (self.diagnostic_input, self.diagnostic_output):
-            if recording is not None:
-                recording.close()
-        self.diagnostic_input = self.diagnostic_output = None
-        await self.set_state(DeviceState.IDLE)
-        await self.send_json("session.ended", reason=reason)
-        self.stopping = False
-        if session_id is not None and project_id is not None:
-            asyncio.create_task(self.planner.update_after_session(project_id, session_id))
+        try:
+            if self.output:
+                notify_device = await self.send_optional(
+                    "playback.flush", notify_device, stream_id=self.output.stream_id
+                )
+            cloud, self.cloud = self.cloud, None
+            await cloud.close()
+            if self.timer_task and self.timer_task is not asyncio.current_task():
+                self.timer_task.cancel()
+                await asyncio.gather(self.timer_task, return_exceptions=True)
+            if session_id is not None:
+                self.db.end_session(session_id, reason, self.usage)
+            self.session_id = self.project_id = None
+            self.output = None
+            self.output_buffer.clear()
+            for recording in (self.diagnostic_input, self.diagnostic_output):
+                if recording is not None:
+                    recording.close()
+            self.diagnostic_input = self.diagnostic_output = None
+            self.state = DeviceState.IDLE
+            notify_device = await self.send_optional(
+                "state", notify_device, state=DeviceState.IDLE.value
+            )
+            await self.send_optional("session.ended", notify_device, reason=reason)
+        finally:
+            self.stopping = False
+            if session_id is not None and project_id is not None:
+                asyncio.create_task(self.planner.update_after_session(project_id, session_id))
 
     async def _watch_timeouts(self) -> None:
         while self.cloud is not None:
@@ -286,4 +313,4 @@ class DeviceSession:
 
     async def close(self) -> None:
         if self.cloud is not None:
-            await self.stop("device_disconnect")
+            await self.stop("device_disconnect", notify_device=False)

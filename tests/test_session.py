@@ -1,5 +1,8 @@
+import asyncio
 import base64
 from dataclasses import replace
+
+from fastapi import WebSocketDisconnect
 
 from gateway.config import Settings
 from gateway.db import Database
@@ -11,8 +14,11 @@ from gateway.session import DeviceSession
 class FakeWebSocket:
     def __init__(self):
         self.messages = []
+        self.disconnected = False
 
     async def send_json(self, value):
+        if self.disconnected:
+            raise WebSocketDisconnect(code=1006)
         self.messages.append(("json", value))
 
     async def send_bytes(self, value):
@@ -24,6 +30,7 @@ class FakeCloud:
         self.audio = []
         self.cancelled = 0
         self.truncations = []
+        self.closed = False
 
     async def append_audio(self, pcm):
         self.audio.append(pcm)
@@ -33,6 +40,18 @@ class FakeCloud:
 
     async def truncate(self, item_id, content_index, played_ms):
         self.truncations.append((item_id, content_index, played_ms))
+
+    async def close(self):
+        self.closed = True
+
+
+class FakePlanner:
+    def __init__(self):
+        self.updates = []
+
+    async def update_after_session(self, project_id, session_id):
+        self.updates.append((project_id, session_id))
+        return True
 
 
 def make_session(tmp_path):
@@ -104,3 +123,33 @@ async def test_output_is_chunked_and_padded_to_twenty_ms(tmp_path):
     assert len(frames) == 1
     assert len(frames[0]) == FRAME_BYTES
 
+
+async def test_disconnect_cleanup_does_not_write_closed_device(tmp_path):
+    session, ws = make_session(tmp_path)
+    cloud = session.cloud
+    session_id, project_id = session.session_id, session.project_id
+    planner = FakePlanner()
+    published = []
+
+    async def observe(message):
+        published.append(message)
+
+    session.planner = planner
+    session.observer = observe
+    ws.disconnected = True
+
+    await session.close()
+    await asyncio.sleep(0)
+
+    assert ws.messages == []
+    assert cloud.closed
+    assert session.cloud is None
+    assert session.state == DeviceState.IDLE
+    assert [message["type"] for message in published] == ["state", "session.ended"]
+    assert planner.updates == [(project_id, session_id)]
+    with session.db.connect() as connection:
+        ended = connection.execute(
+            "SELECT end_reason, ended_at FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+    assert ended["end_reason"] == "device_disconnect"
+    assert ended["ended_at"] is not None
