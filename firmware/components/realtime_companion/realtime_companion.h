@@ -107,10 +107,16 @@ class RealtimeCompanion : public Component {
   TaskHandle_t audio_sender_task_handle_{nullptr};
   InputFrame building_frame_{};
   size_t building_samples_{0};
+  uint16_t building_peak_{0};
   bool capture_running_{false};
+  std::atomic<uint32_t> captured_frames_{0};
+  std::atomic<uint32_t> sent_frames_{0};
+  std::atomic<uint32_t> dropped_frames_{0};
+  std::atomic<uint16_t> capture_peak_{0};
   std::atomic<uint32_t> played_frames_{0};
   uint32_t expected_duration_ms_{0};
   uint32_t last_progress_ms_{0};
+  uint32_t last_audio_stats_ms_{0};
   uint32_t last_connect_attempt_ms_{0};
   std::atomic<CompanionState> state_{CompanionState::IDLE};
   std::atomic<bool> auth_pending_{false};

@@ -118,7 +118,9 @@ void RealtimeCompanion::run_audio_sender() {
     const int sent = esp_websocket_client_send_bin(
         this->client_, reinterpret_cast<const char *>(captured.data.data()), captured.data.size(),
         pdMS_TO_TICKS(50));
-    if (sent != static_cast<int>(captured.data.size())) {
+    if (sent == static_cast<int>(captured.data.size())) {
+      this->sent_frames_.fetch_add(1, std::memory_order_relaxed);
+    } else {
       ESP_LOGW(TAG, "Audio WebSocket send failed: sent %d of %u bytes", sent,
                static_cast<unsigned>(captured.data.size()));
       // A short lock-contention timeout can fail without disconnecting the client. Drop only
@@ -135,9 +137,11 @@ void RealtimeCompanion::run_audio_sender() {
 
 void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_event_data_t *event) {
   if (event_id == WEBSOCKET_EVENT_CONNECTED) {
+    ESP_LOGI(TAG, "Gateway WebSocket connected; authentication pending");
     this->authenticated_ = false;
     this->auth_pending_.store(true, std::memory_order_release);
   } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
+    ESP_LOGW(TAG, "Gateway WebSocket disconnected; pausing microphone transport");
     this->authenticated_ = false;
     this->stream_ready_.store(false, std::memory_order_release);
     this->auth_pending_.store(false, std::memory_order_release);
@@ -169,14 +173,17 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
   cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
   const char *kind = cJSON_IsString(type) ? type->valuestring : "";
   if (strcmp(kind, "auth.ok") == 0) {
+    ESP_LOGI(TAG, "Gateway authentication accepted");
     this->authenticated_ = true;
     this->authenticated_once_ = true;
     if (this->session_active_)
       this->session_start_pending_.store(true, std::memory_order_release);
   } else if (strcmp(kind, "session.started") == 0) {
+    ESP_LOGI(TAG, "Gateway session started; microphone audio transport active");
     this->stream_ready_.store(true, std::memory_order_release);
     this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::LISTENING);
   } else if (strcmp(kind, "session.ended") == 0) {
+    ESP_LOGI(TAG, "Gateway session ended");
     this->session_active_ = false;
     this->stream_ready_.store(false, std::memory_order_release);
     xQueueReset(this->capture_queue_);
@@ -211,15 +218,19 @@ void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data)
                                !this->muted_.load(std::memory_order_acquire);
   if (!capture_enabled) {
     if (this->capture_running_) {
+      ESP_LOGI(TAG, "Microphone frame capture paused");
       this->decimator_.reset();
       this->building_samples_ = 0;
+      this->building_peak_ = 0;
       this->capture_running_ = false;
     }
     return;
   }
   if (!this->capture_running_) {
+    ESP_LOGI(TAG, "Microphone frame capture started");
     this->decimator_.reset();
     this->building_samples_ = 0;
+    this->building_peak_ = 0;
     this->capture_running_ = true;
   }
   // XMOS stream is interleaved stereo, signed little-endian PCM32. Channel 0 carries AEC speech.
@@ -231,12 +242,23 @@ void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data)
     this->decimator_.push(static_cast<int16_t>(input >> 16), &output, &ready);
     if (!ready)
       continue;
+    const uint16_t magnitude = output < 0 ? static_cast<uint16_t>(-static_cast<int32_t>(output))
+                                          : static_cast<uint16_t>(output);
+    this->building_peak_ = std::max(this->building_peak_, magnitude);
     this->building_frame_.data[2 * this->building_samples_] = static_cast<uint8_t>(output);
     this->building_frame_.data[2 * this->building_samples_ + 1] = static_cast<uint8_t>(output >> 8);
     if (++this->building_samples_ == INPUT_FRAME_BYTES / 2) {
-      if (xQueueSend(this->capture_queue_, &this->building_frame_, 0) != pdTRUE)
+      this->captured_frames_.fetch_add(1, std::memory_order_relaxed);
+      uint16_t previous_peak = this->capture_peak_.load(std::memory_order_relaxed);
+      while (previous_peak < this->building_peak_ &&
+             !this->capture_peak_.compare_exchange_weak(previous_peak, this->building_peak_,
+                                                        std::memory_order_relaxed)) {}
+      if (xQueueSend(this->capture_queue_, &this->building_frame_, 0) != pdTRUE) {
+        this->dropped_frames_.fetch_add(1, std::memory_order_relaxed);
         ESP_LOGW(TAG, "Capture queue full; dropping 20 ms frame");
+      }
       this->building_samples_ = 0;
+      this->building_peak_ = 0;
     }
   }
 }
@@ -260,6 +282,22 @@ void RealtimeCompanion::loop() {
     // Enabling capture here preserves speech that begins immediately after the wake word.
     this->stream_ready_.store(true, std::memory_order_release);
     this->session_start_pending_.store(false, std::memory_order_release);
+    ESP_LOGI(TAG, "Session start sent; accepting microphone frames for transport");
+  }
+  if (this->session_active_.load(std::memory_order_acquire) &&
+      millis() - this->last_audio_stats_ms_ >= 2000) {
+    this->last_audio_stats_ms_ = millis();
+    const uint32_t captured = this->captured_frames_.exchange(0, std::memory_order_relaxed);
+    const uint32_t sent = this->sent_frames_.exchange(0, std::memory_order_relaxed);
+    const uint32_t dropped = this->dropped_frames_.exchange(0, std::memory_order_relaxed);
+    const uint16_t peak = this->capture_peak_.exchange(0, std::memory_order_relaxed);
+    const unsigned queued = this->capture_queue_ == nullptr ? 0 : uxQueueMessagesWaiting(this->capture_queue_);
+    ESP_LOGI(TAG,
+             "Audio stats/2s: captured=%u sent=%u dropped=%u queued=%u/6 peak=%u ready=%s connected=%s",
+             static_cast<unsigned>(captured), static_cast<unsigned>(sent),
+             static_cast<unsigned>(dropped), queued, static_cast<unsigned>(peak),
+             this->stream_ready_.load(std::memory_order_acquire) ? "yes" : "no",
+             this->client_ != nullptr && esp_websocket_client_is_connected(this->client_) ? "yes" : "no");
   }
   OutputFrame playback;
   if (xQueueReceive(this->playback_queue_, &playback, 0) == pdTRUE) {
@@ -289,8 +327,15 @@ void RealtimeCompanion::start_session() {
     return;
   this->session_active_ = true;
   this->stream_ready_.store(false, std::memory_order_release);
+  this->captured_frames_.store(0, std::memory_order_relaxed);
+  this->sent_frames_.store(0, std::memory_order_relaxed);
+  this->dropped_frames_.store(0, std::memory_order_relaxed);
+  this->capture_peak_.store(0, std::memory_order_relaxed);
+  this->last_audio_stats_ms_ = millis();
   xQueueReset(this->capture_queue_);
   this->update_state(CompanionState::CONNECTING);
+  ESP_LOGI(TAG, "Wake activation requested a Realtime session (authenticated=%s)",
+           this->authenticated_.load(std::memory_order_acquire) ? "yes" : "no");
   if (this->authenticated_)
     this->session_start_pending_.store(true, std::memory_order_release);
 }

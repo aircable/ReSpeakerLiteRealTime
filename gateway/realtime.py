@@ -29,6 +29,7 @@ class RealtimeConnection:
         if not self.settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is not configured")
         url = f"wss://api.openai.com/v1/realtime?model={quote(self.settings.realtime_model)}"
+        logger.info("Connecting to OpenAI Realtime model=%s", self.settings.realtime_model)
         self.socket = await websockets.connect(
             url,
             additional_headers={"Authorization": f"Bearer {self.settings.openai_api_key}"},
@@ -36,6 +37,7 @@ class RealtimeConnection:
             ping_interval=20,
             ping_timeout=20,
         )
+        logger.info("OpenAI Realtime WebSocket connected")
         await self.send(
             {
                 "type": "session.update",
@@ -72,6 +74,12 @@ class RealtimeConnection:
                 },
             }
         )
+        logger.info(
+            "OpenAI session.update sent: voice=%s reasoning=%s vad=semantic_vad transcription=%s",
+            self.settings.voice,
+            self.settings.reasoning_effort,
+            self.settings.transcription_model,
+        )
         self.reader_task = asyncio.create_task(self._reader(), name="openai-realtime-reader")
 
     async def send(self, event: dict[str, Any]) -> None:
@@ -101,7 +109,13 @@ class RealtimeConnection:
     async def _reader(self) -> None:
         try:
             async for raw in self.socket:
-                await self.on_event(json.loads(raw))
+                event = json.loads(raw)
+                kind = event.get("type", "unknown")
+                if kind in {"session.created", "session.updated"}:
+                    logger.info("OpenAI Realtime event: %s", kind)
+                elif kind == "error":
+                    logger.error("OpenAI Realtime error event: %s", event.get("error", event))
+                await self.on_event(event)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -116,4 +130,3 @@ class RealtimeConnection:
         if self.socket is not None:
             await self.socket.close()
         self.socket = None
-

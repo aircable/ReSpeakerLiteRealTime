@@ -63,6 +63,12 @@ class DeviceSession:
         self.observer = observer
         self.diagnostic_input: BinaryIO | None = None
         self.diagnostic_output: BinaryIO | None = None
+        self.input_frames_total = 0
+        self.input_frames_interval = 0
+        self.input_samples_interval = 0
+        self.input_square_sum = 0
+        self.input_peak = 0
+        self.last_input_log = time.monotonic()
 
     async def send_json(self, message_type: str, **payload: Any) -> None:
         message = server_message(message_type, **{"device_id": self.device_id, **payload})
@@ -106,6 +112,13 @@ class DeviceSession:
         project = self.db.get_project(requested_project_id)
         self.project_id = project["id"]
         self.session_id = self.db.start_session(self.project_id, self.device_id, self.settings.realtime_model)
+        logger.info(
+            "Starting session device=%s session=%s project=%s model=%s",
+            self.device_id,
+            self.session_id,
+            self.project_id,
+            self.settings.realtime_model,
+        )
         if self.settings.diagnostic_audio:
             diagnostic_dir = self.settings.database_path.parent / "diagnostic-audio"
             diagnostic_dir.mkdir(parents=True, exist_ok=True)
@@ -129,6 +142,7 @@ class DeviceSession:
         self.timer_task = asyncio.create_task(self._watch_timeouts(), name=f"session-timer-{self.device_id}")
         await self.set_state(DeviceState.LISTENING)
         await self.send_json("session.started", session_id=self.session_id, project_id=self.project_id)
+        logger.info("Session ready for device audio device=%s session=%s", self.device_id, self.session_id)
 
     async def receive_audio(self, pcm: bytes) -> None:
         if self.cloud is None:
@@ -139,6 +153,30 @@ class DeviceSession:
             )
             return
         self.last_activity = time.monotonic()
+        samples = memoryview(pcm).cast("h")
+        frame_peak = max(abs(sample) for sample in samples)
+        self.input_frames_total += 1
+        self.input_frames_interval += 1
+        self.input_samples_interval += len(samples)
+        self.input_square_sum += sum(int(sample) * int(sample) for sample in samples)
+        self.input_peak = max(self.input_peak, frame_peak)
+        current = time.monotonic()
+        if self.input_frames_total == 1 or current - self.last_input_log >= 2:
+            rms = int((self.input_square_sum / max(1, self.input_samples_interval)) ** 0.5)
+            logger.info(
+                "Device audio device=%s total_frames=%d interval_frames=%d peak=%d rms=%d state=%s",
+                self.device_id,
+                self.input_frames_total,
+                self.input_frames_interval,
+                self.input_peak,
+                rms,
+                self.state.value,
+            )
+            self.input_frames_interval = 0
+            self.input_samples_interval = 0
+            self.input_square_sum = 0
+            self.input_peak = 0
+            self.last_input_log = current
         if self.diagnostic_input is not None:
             self.diagnostic_input.write(pcm)
         await self.cloud.append_audio(pcm)
@@ -170,11 +208,27 @@ class DeviceSession:
     async def handle_openai_event(self, event: dict[str, Any]) -> None:
         kind = event.get("type", "")
         if kind == "input_audio_buffer.speech_started":
+            logger.info(
+                "OpenAI VAD speech started device=%s audio_start_ms=%s item=%s",
+                self.device_id,
+                event.get("audio_start_ms"),
+                event.get("item_id"),
+            )
             self.last_activity = time.monotonic()
             await self.interrupt()
             return
         if kind == "input_audio_buffer.speech_stopped":
+            logger.info(
+                "OpenAI VAD speech stopped device=%s audio_end_ms=%s item=%s",
+                self.device_id,
+                event.get("audio_end_ms"),
+                event.get("item_id"),
+            )
             await self.set_state(DeviceState.THINKING)
+            return
+        if kind == "error":
+            logger.error("OpenAI session error device=%s: %s", self.device_id, event.get("error", event))
+            await self.set_state(DeviceState.ERROR)
             return
         if kind in {
             "conversation.item.input_audio_transcription.completed",

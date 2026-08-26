@@ -203,6 +203,7 @@ async def device_socket(websocket: WebSocket) -> None:
         session = DeviceSession(
             websocket, auth.device_id, effective_settings, db, planner, live_hub.publish
         )
+        logger.info("Device authenticated device=%s", auth.device_id)
         await session.send_json(
             "auth.ok",
             device_id=auth.device_id,
@@ -220,6 +221,7 @@ async def device_socket(websocket: WebSocket) -> None:
 
             message = parse_device_message(json.loads(text))
             if isinstance(message, SessionStart):
+                logger.info("Device requested session start device=%s project=%s", auth.device_id, message.project_id)
                 await session.start(message.project_id)
             elif isinstance(message, SessionStop):
                 await session.stop(message.reason)
@@ -239,6 +241,7 @@ async def device_socket(websocket: WebSocket) -> None:
             pass
     finally:
         if session is not None:
+            logger.info("Device WebSocket closing device=%s", session.device_id)
             await session.close()
 
 
