@@ -1,6 +1,7 @@
 #include "realtime_companion.h"
 
 #include "esphome/components/audio/audio.h"
+#include "esphome/components/network/util.h"
 #include "esphome/core/log.h"
 
 #include <cJSON.h>
@@ -54,7 +55,6 @@ void RealtimeCompanion::setup() {
   this->microphone_->add_data_callback(
       [this](const std::vector<uint8_t> &data) { this->handle_microphone_data(data); });
   this->microphone_->start();
-  this->connect();
 }
 
 void RealtimeCompanion::connect() {
@@ -170,7 +170,8 @@ void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data)
 }
 
 void RealtimeCompanion::loop() {
-  if (this->client_ == nullptr && millis() - this->last_connect_attempt_ms_ > 2000)
+  if (this->client_ == nullptr && network::is_connected() &&
+      millis() - this->last_connect_attempt_ms_ > 2000)
     this->connect();
   if (this->auth_pending_.load(std::memory_order_acquire)) {
     const std::string auth = "{\"v\":1,\"type\":\"auth\",\"token\":\"" + this->token_ +
