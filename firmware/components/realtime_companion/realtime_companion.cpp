@@ -43,6 +43,7 @@ void FirDecimator2::push(int16_t sample, int16_t *output, bool *ready) {
 }
 
 void RealtimeCompanion::setup() {
+  ESP_LOGI(TAG, "Initializing transport; WebSocket will wait for network readiness");
   this->capture_queue_ = xQueueCreateStatic(6, sizeof(InputFrame), this->capture_queue_storage_,
                                              &this->capture_queue_struct_);
   this->playback_queue_ = xQueueCreateStatic(10, sizeof(OutputFrame), this->playback_queue_storage_,
@@ -72,7 +73,16 @@ void RealtimeCompanion::connect() {
     return;
   }
   esp_websocket_register_events(this->client_, WEBSOCKET_EVENT_ANY, &RealtimeCompanion::websocket_event, this);
-  esp_websocket_client_start(this->client_);
+  const esp_err_t result = esp_websocket_client_start(this->client_);
+  if (result != ESP_OK) {
+    ESP_LOGE(TAG, "Could not start WebSocket client: %s", esp_err_to_name(result));
+    esp_websocket_client_destroy(this->client_);
+    this->client_ = nullptr;
+    this->update_state(CompanionState::ERROR);
+    this->last_connect_attempt_ms_ = millis();
+    return;
+  }
+  ESP_LOGI(TAG, "WebSocket client started for %s", this->url_.c_str());
   this->last_connect_attempt_ms_ = millis();
 }
 
@@ -171,8 +181,10 @@ void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data)
 
 void RealtimeCompanion::loop() {
   if (this->client_ == nullptr && network::is_connected() &&
-      millis() - this->last_connect_attempt_ms_ > 2000)
+      millis() - this->last_connect_attempt_ms_ > 2000) {
+    ESP_LOGI(TAG, "Network is ready; starting WebSocket client");
     this->connect();
+  }
   if (this->auth_pending_.load(std::memory_order_acquire)) {
     const std::string auth = "{\"v\":1,\"type\":\"auth\",\"token\":\"" + this->token_ +
                              "\",\"device_id\":\"" + this->device_id_ +
