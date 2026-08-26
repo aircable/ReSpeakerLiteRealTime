@@ -68,7 +68,10 @@ class RealtimeCompanion : public Component {
   void stop_session(const char *reason = "button");
   void toggle_session();
   void set_muted(bool muted);
-  CompanionState get_state() const { return state_; }
+  CompanionState get_state() const { return state_.load(std::memory_order_acquire); }
+  bool is_authenticated() const { return authenticated_.load(std::memory_order_acquire); }
+  bool has_authenticated_once() const { return authenticated_once_.load(std::memory_order_acquire); }
+  bool is_network_ready() const;
 
  protected:
   static void websocket_event(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
@@ -101,12 +104,13 @@ class RealtimeCompanion : public Component {
   uint32_t expected_duration_ms_{0};
   uint32_t last_progress_ms_{0};
   uint32_t last_connect_attempt_ms_{0};
-  CompanionState state_{CompanionState::IDLE};
+  std::atomic<CompanionState> state_{CompanionState::IDLE};
   std::atomic<bool> auth_pending_{false};
   std::atomic<bool> session_start_pending_{false};
-  bool authenticated_{false};
-  bool session_active_{false};
-  bool muted_{false};
+  std::atomic<bool> authenticated_{false};
+  std::atomic<bool> authenticated_once_{false};
+  std::atomic<bool> session_active_{false};
+  std::atomic<bool> muted_{false};
 };
 
 }  // namespace esphome::realtime_companion

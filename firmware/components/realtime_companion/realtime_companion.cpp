@@ -126,6 +126,7 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
   const char *kind = cJSON_IsString(type) ? type->valuestring : "";
   if (strcmp(kind, "auth.ok") == 0) {
     this->authenticated_ = true;
+    this->authenticated_once_ = true;
     if (this->session_active_)
       this->session_start_pending_.store(true, std::memory_order_release);
   } else if (strcmp(kind, "session.started") == 0) {
@@ -288,7 +289,11 @@ bool RealtimeCompanion::send_json(const std::string &json) {
   return true;
 }
 
-void RealtimeCompanion::update_state(CompanionState state) { this->state_ = state; }
+bool RealtimeCompanion::is_network_ready() const { return network::is_connected(); }
+
+void RealtimeCompanion::update_state(CompanionState state) {
+  this->state_.store(state, std::memory_order_release);
+}
 
 void RealtimeCompanion::dump_config() {
   ESP_LOGCONFIG(TAG, "Realtime Thinking Companion:");

@@ -176,22 +176,122 @@ light:
     chipset: ws2812
     rmt_symbols: 192
     default_transition_length: 0s
+    effects:
+      - addressable_lambda:
+          name: "Fast Pulse"
+          update_interval: 10ms
+          lambda: |-
+            static float fraction = 0.0f;
+            static float step = 0.05f;
+            static bool increasing = true;
+            const auto &values = id(status_led).current_values;
+            const Color color(values.get_red() * 255, values.get_green() * 255,
+                              values.get_blue() * 255);
+            it[0].set_rgb(color.red * fraction, color.green * fraction, color.blue * fraction);
+            fraction += step * (increasing ? 1.0f : -1.0f);
+            if (fraction > 1.0f) {
+              fraction = 1.0f;
+              increasing = false;
+            } else if (fraction < 0.0f) {
+              fraction = 0.0f;
+              increasing = true;
+            }
+      - addressable_lambda:
+          name: "Slow Pulse"
+          update_interval: 30ms
+          lambda: |-
+            static float fraction = 0.0f;
+            static float step = 0.05f;
+            static bool increasing = true;
+            const auto &values = id(status_led).current_values;
+            const Color color(values.get_red() * 255, values.get_green() * 255,
+                              values.get_blue() * 255);
+            it[0].set_rgb(color.red * fraction, color.green * fraction, color.blue * fraction);
+            fraction += step * (increasing ? 1.0f : -1.0f);
+            if (fraction > 1.0f) {
+              fraction = 1.0f;
+              increasing = false;
+            } else if (fraction < 0.0f) {
+              fraction = 0.0f;
+              increasing = true;
+            }
 
 interval:
   - interval: 100ms
     then:
       - lambda: |-
           using esphome::realtime_companion::CompanionState;
+          enum LedMode : uint8_t {
+            INIT_SLOW, INIT_FAST, NO_GATEWAY, IDLE, LISTENING, THINKING,
+            SPEAKING, ERROR, BUTTON_PRESSED
+          };
+
+          LedMode mode;
+          const bool initializing = !id(realtime).has_authenticated_once() && millis() < 600000;
+          if (initializing) {
+            mode = id(realtime).is_network_ready() ? INIT_FAST : INIT_SLOW;
+          } else if (!id(realtime).is_network_ready() || !id(realtime).is_authenticated()) {
+            mode = NO_GATEWAY;
+          } else if (id(user_button).state) {
+            mode = BUTTON_PRESSED;
+          } else {
+            switch (id(realtime).get_state()) {
+              case CompanionState::CONNECTING:
+              case CompanionState::LISTENING: mode = LISTENING; break;
+              case CompanionState::THINKING: mode = THINKING; break;
+              case CompanionState::SPEAKING: mode = SPEAKING; break;
+              case CompanionState::ERROR: mode = ERROR; break;
+              case CompanionState::IDLE:
+              case CompanionState::MUTED: mode = IDLE; break;
+            }
+          }
+
+          static uint8_t previous = 0xFF;
+          if (previous == mode)
+            return;
+          previous = mode;
+
+          if (mode == IDLE) {
+            id(status_led).turn_off().perform();
+            return;
+          }
           auto call = id(status_led).turn_on();
           call.set_transition_length(0);
-          switch (id(realtime).get_state()) {
-            case CompanionState::IDLE: call.set_rgb(0.0f, 0.0f, 0.08f); break;
-            case CompanionState::CONNECTING: call.set_rgb(0.4f, 0.2f, 0.0f); break;
-            case CompanionState::LISTENING: call.set_rgb(0.0f, 0.35f, 0.1f); break;
-            case CompanionState::THINKING: call.set_rgb(0.15f, 0.0f, 0.45f); break;
-            case CompanionState::SPEAKING: call.set_rgb(0.0f, 0.2f, 0.5f); break;
-            case CompanionState::MUTED: call.set_rgb(0.55f, 0.0f, 0.0f); break;
-            case CompanionState::ERROR: call.set_rgb(0.6f, 0.0f, 0.25f); break;
+          call.set_brightness(1.0f);
+          switch (mode) {
+            case INIT_SLOW:
+              call.set_rgb(0.09f, 0.73f, 0.95f);
+              call.set_effect("Slow Pulse");
+              break;
+            case INIT_FAST:
+              call.set_rgb(0.09f, 0.73f, 0.95f);
+              call.set_effect("Fast Pulse");
+              break;
+            case NO_GATEWAY:
+              call.set_rgb(1.0f, 0.0f, 0.0f);
+              call.set_effect("Slow Pulse");
+              break;
+            case LISTENING:
+              call.set_rgb(1.0f, 0.2f, 1.0f);
+              call.set_effect("Slow Pulse");
+              break;
+            case THINKING:
+              call.set_rgb(1.0f, 0.2f, 1.0f);
+              call.set_effect("Fast Pulse");
+              break;
+            case SPEAKING:
+              call.set_rgb(0.2f, 1.0f, 1.0f);
+              call.set_effect("Slow Pulse");
+              break;
+            case ERROR:
+              call.set_rgb(1.0f, 0.0f, 0.0f);
+              call.set_effect("Fast Pulse");
+              break;
+            case BUTTON_PRESSED:
+              call.set_rgb(0.0f, 0.0f, 1.0f);
+              call.set_effect("None");
+              break;
+            case IDLE: break;
           }
           call.perform();
 
