@@ -9,6 +9,15 @@ esphome:
   project:
     name: aircable.respeaker-thinking-companion
     version: 0.1.0
+  on_boot:
+    - priority: -100
+      then:
+        - micro_wake_word.start
+        - if:
+            condition:
+              lambda: return id(hardware_mute_state).state;
+            then:
+              - switch.turn_on: mute_toggle
   on_shutdown:
     then:
       - lambda: id(respeaker).mute_speaker();
@@ -222,7 +231,7 @@ interval:
       - lambda: |-
           using esphome::realtime_companion::CompanionState;
           enum LedMode : uint8_t {
-            INIT_SLOW, INIT_FAST, NO_GATEWAY, IDLE, LISTENING, THINKING,
+            INIT_SLOW, INIT_FAST, NO_GATEWAY, IDLE, MUTED, LISTENING, THINKING,
             SPEAKING, ERROR, BUTTON_PRESSED
           };
 
@@ -241,8 +250,8 @@ interval:
               case CompanionState::THINKING: mode = THINKING; break;
               case CompanionState::SPEAKING: mode = SPEAKING; break;
               case CompanionState::ERROR: mode = ERROR; break;
-              case CompanionState::IDLE:
-              case CompanionState::MUTED: mode = IDLE; break;
+              case CompanionState::IDLE: mode = IDLE; break;
+              case CompanionState::MUTED: mode = MUTED; break;
             }
           }
 
@@ -251,12 +260,11 @@ interval:
             return;
           previous = mode;
 
-          if (mode == IDLE) {
+          if (mode == MUTED) {
             id(status_led).turn_off().perform();
             return;
           }
           auto call = id(status_led).turn_on();
-          call.set_transition_length(0);
           call.set_brightness(1.0f);
           switch (mode) {
             case INIT_SLOW:
@@ -291,7 +299,11 @@ interval:
               call.set_rgb(0.0f, 0.0f, 1.0f);
               call.set_effect("None");
               break;
-            case IDLE: break;
+            case IDLE:
+              call.set_rgb(0.0f, 1.0f, 0.0f);
+              call.set_effect("None");
+              break;
+            case MUTED: break;
           }
           call.perform();
 
