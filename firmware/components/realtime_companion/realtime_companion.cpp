@@ -84,11 +84,11 @@ void RealtimeCompanion::websocket_event(void *handler_args, esp_event_base_t, in
 void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_event_data_t *event) {
   if (event_id == WEBSOCKET_EVENT_CONNECTED) {
     this->authenticated_ = false;
-    this->send_json("{\"v\":1,\"type\":\"auth\",\"token\":\"" + this->token_ +
-                    "\",\"device_id\":\"" + this->device_id_ +
-                    "\",\"capabilities\":{\"aec\":true,\"frame_ms\":20}}");
+    this->auth_pending_.store(true, std::memory_order_release);
   } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
     this->authenticated_ = false;
+    this->auth_pending_.store(false, std::memory_order_release);
+    this->session_start_pending_.store(false, std::memory_order_release);
     if (this->session_active_)
       this->update_state(CompanionState::CONNECTING);
   } else if (event_id == WEBSOCKET_EVENT_DATA && event->payload_offset == 0 &&
@@ -117,7 +117,7 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
   if (strcmp(kind, "auth.ok") == 0) {
     this->authenticated_ = true;
     if (this->session_active_)
-      this->send_json("{\"v\":1,\"type\":\"session.start\"}");
+      this->session_start_pending_.store(true, std::memory_order_release);
   } else if (strcmp(kind, "session.started") == 0) {
     this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::LISTENING);
   } else if (strcmp(kind, "session.ended") == 0) {
@@ -172,6 +172,17 @@ void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data)
 void RealtimeCompanion::loop() {
   if (this->client_ == nullptr && millis() - this->last_connect_attempt_ms_ > 2000)
     this->connect();
+  if (this->auth_pending_.load(std::memory_order_acquire)) {
+    const std::string auth = "{\"v\":1,\"type\":\"auth\",\"token\":\"" + this->token_ +
+                             "\",\"device_id\":\"" + this->device_id_ +
+                             "\",\"capabilities\":{\"aec\":true,\"frame_ms\":20}}";
+    if (this->send_json(auth))
+      this->auth_pending_.store(false, std::memory_order_release);
+  }
+  if (this->session_start_pending_.load(std::memory_order_acquire) && this->authenticated_ &&
+      this->session_active_ && this->send_json("{\"v\":1,\"type\":\"session.start\"}")) {
+    this->session_start_pending_.store(false, std::memory_order_release);
+  }
   InputFrame captured;
   if (this->authenticated_ && this->session_active_ && !this->muted_ &&
       xQueueReceive(this->capture_queue_, &captured, 0) == pdTRUE) {
@@ -252,9 +263,16 @@ void RealtimeCompanion::flush_playback() {
   this->expected_duration_ms_ = 0;
 }
 
-void RealtimeCompanion::send_json(const std::string &json) {
-  if (this->client_ != nullptr && esp_websocket_client_is_connected(this->client_))
-    esp_websocket_client_send_text(this->client_, json.c_str(), json.size(), 0);
+bool RealtimeCompanion::send_json(const std::string &json) {
+  if (this->client_ == nullptr || !esp_websocket_client_is_connected(this->client_))
+    return false;
+  const int sent = esp_websocket_client_send_text(this->client_, json.c_str(), json.size(), pdMS_TO_TICKS(20));
+  if (sent != static_cast<int>(json.size())) {
+    ESP_LOGW(TAG, "WebSocket control send failed: sent %d of %u bytes", sent,
+             static_cast<unsigned>(json.size()));
+    return false;
+  }
+  return true;
 }
 
 void RealtimeCompanion::update_state(CompanionState state) { this->state_ = state; }

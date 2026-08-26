@@ -76,7 +76,7 @@ class RealtimeCompanion : public Component {
   void handle_microphone_data(const std::vector<uint8_t> &data);
   void handle_text(const char *data, size_t length);
   void connect();
-  void send_json(const std::string &json);
+  bool send_json(const std::string &json);
   void flush_playback();
   void update_state(CompanionState state);
 
@@ -102,6 +102,8 @@ class RealtimeCompanion : public Component {
   uint32_t last_progress_ms_{0};
   uint32_t last_connect_attempt_ms_{0};
   CompanionState state_{CompanionState::IDLE};
+  std::atomic<bool> auth_pending_{false};
+  std::atomic<bool> session_start_pending_{false};
   bool authenticated_{false};
   bool session_active_{false};
   bool muted_{false};
