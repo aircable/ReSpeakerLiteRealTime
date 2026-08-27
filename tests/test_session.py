@@ -79,8 +79,17 @@ async def test_frame_boundaries_are_enforced(tmp_path):
     assert session.cloud.audio == [bytes(FRAME_BYTES)]
 
 
-async def test_barge_in_flushes_cancels_truncates_and_rejects_late_audio(tmp_path):
+async def wait_for(predicate):
+    for _ in range(100):
+        if predicate():
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError("condition was not reached")
+
+
+async def test_barge_in_flushes_truncates_and_rejects_late_audio(tmp_path):
     session, ws = make_session(tmp_path)
+    session._start_playback_sender()
     audio = bytes(FRAME_BYTES)
     event = {
         "type": "response.output_audio.delta",
@@ -91,11 +100,12 @@ async def test_barge_in_flushes_cancels_truncates_and_rejects_late_audio(tmp_pat
     }
     await session.handle_openai_event(event)
     stream_id = session.output.stream_id
+    await wait_for(lambda: session.output.sent_ms == 20)
     await session.playback_progress(stream_id, 20)
     await session.handle_openai_event({"type": "input_audio_buffer.speech_started"})
 
     assert any(message[1]["type"] == "playback.flush" for message in ws.messages if message[0] == "json")
-    assert session.cloud.cancelled == 1
+    assert session.cloud.cancelled == 0
     assert session.cloud.truncations == [("item-1", 0, 20)]
     assert session.state == DeviceState.LISTENING
 
@@ -103,10 +113,12 @@ async def test_barge_in_flushes_cancels_truncates_and_rejects_late_audio(tmp_pat
     await session.handle_openai_event(event)  # late server event after cancellation
     assert sum(kind == "bytes" for kind, _ in ws.messages) == binary_count
     assert session.output is None
+    await session._stop_playback_sender()
 
 
 async def test_output_is_chunked_and_padded_to_twenty_ms(tmp_path):
     session, ws = make_session(tmp_path)
+    session._start_playback_sender()
     short_audio = bytes(100)
     await session.handle_openai_event(
         {
@@ -119,9 +131,44 @@ async def test_output_is_chunked_and_padded_to_twenty_ms(tmp_path):
     )
     assert not any(kind == "bytes" for kind, _ in ws.messages)
     await session.handle_openai_event({"type": "response.output_audio.done"})
+    await wait_for(lambda: session.output.ended)
     frames = [value for kind, value in ws.messages if kind == "bytes"]
     assert len(frames) == 1
     assert len(frames[0]) == FRAME_BYTES
+    await session._stop_playback_sender()
+
+
+async def test_output_frames_are_paced_at_media_rate(tmp_path):
+    session, ws = make_session(tmp_path)
+    session._start_playback_sender()
+    audio = bytes(FRAME_BYTES * 3)
+    started = asyncio.get_running_loop().time()
+    await session.handle_openai_event(
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "r",
+            "item_id": "i",
+            "content_index": 0,
+            "delta": base64.b64encode(audio).decode(),
+        }
+    )
+    await wait_for(lambda: session.output.sent_ms == 60)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed >= 0.035
+    assert len([value for kind, value in ws.messages if kind == "bytes"]) == 3
+    await session._stop_playback_sender()
+
+
+async def test_cancel_not_active_race_is_not_fatal(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.state = DeviceState.SPEAKING
+    await session.handle_openai_event(
+        {
+            "type": "error",
+            "error": {"code": "response_cancel_not_active", "message": "already stopped"},
+        }
+    )
+    assert session.state == DeviceState.SPEAKING
 
 
 async def test_disconnect_cleanup_does_not_write_closed_device(tmp_path):

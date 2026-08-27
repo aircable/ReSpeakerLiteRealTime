@@ -18,6 +18,8 @@ from .protocol import FRAME_BYTES, DeviceState, server_message
 from .realtime import RealtimeConnection
 
 logger = logging.getLogger(__name__)
+PLAYBACK_FRAME_SECONDS = 0.020
+MAX_QUEUED_PLAYBACK_FRAMES = 1500
 
 
 @dataclass
@@ -29,6 +31,12 @@ class OutputStream:
     played_ms: int = 0
     sent_ms: int = 0
     ended: bool = False
+
+
+@dataclass(frozen=True)
+class PlaybackPacket:
+    stream_id: str
+    data: bytes | None
 
 
 class DeviceSession:
@@ -52,6 +60,10 @@ class DeviceSession:
         self.state = DeviceState.IDLE
         self.output: OutputStream | None = None
         self.output_buffer = bytearray()
+        self.playback_queue: asyncio.Queue[PlaybackPacket] = asyncio.Queue(
+            maxsize=MAX_QUEUED_PLAYBACK_FRAMES
+        )
+        self.playback_task: asyncio.Task[None] | None = None
         self.assistant_text = ""
         self.usage: dict[str, Any] = {}
         self.started_monotonic = 0.0
@@ -139,6 +151,7 @@ class DeviceSession:
             await self.set_state(DeviceState.ERROR)
             raise
         self.started_monotonic = self.last_activity = time.monotonic()
+        self._start_playback_sender()
         self.timer_task = asyncio.create_task(self._watch_timeouts(), name=f"session-timer-{self.device_id}")
         await self.set_state(DeviceState.LISTENING)
         await self.send_json("session.started", session_id=self.session_id, project_id=self.project_id)
@@ -197,12 +210,13 @@ class DeviceSession:
         await self.send_json("playback.flush", stream_id=output.stream_id)
         cloud = self.cloud
         if cloud is not None:
-            with contextlib.suppress(Exception):
-                await cloud.cancel_response()
+            # turn_detection.interrupt_response=true makes OpenAI cancel the active response.
+            # Sending response.cancel here races that automatic cancellation.
             with contextlib.suppress(Exception):
                 await cloud.truncate(output.item_id, output.content_index, output.played_ms)
         self.output = None
         self.output_buffer.clear()
+        self._clear_playback_queue()
         await self.set_state(DeviceState.LISTENING)
 
     async def handle_openai_event(self, event: dict[str, Any]) -> None:
@@ -227,7 +241,13 @@ class DeviceSession:
             await self.set_state(DeviceState.THINKING)
             return
         if kind == "error":
-            logger.error("OpenAI session error device=%s: %s", self.device_id, event.get("error", event))
+            error = event.get("error", event)
+            if error.get("code") == "response_cancel_not_active":
+                logger.info(
+                    "Ignoring completed OpenAI cancellation race device=%s", self.device_id
+                )
+                return
+            logger.error("OpenAI session error device=%s: %s", self.device_id, error)
             await self.set_state(DeviceState.ERROR)
             return
         if kind in {
@@ -297,25 +317,75 @@ class DeviceSession:
         while len(self.output_buffer) >= FRAME_BYTES and self.output is not None:
             frame = bytes(self.output_buffer[:FRAME_BYTES])
             del self.output_buffer[:FRAME_BYTES]
-            await self.send_bytes(frame)
-            if self.diagnostic_output is not None:
-                self.diagnostic_output.write(frame)
-            self.output.sent_ms += 20
+            self._queue_playback(PlaybackPacket(self.output.stream_id, frame))
 
     async def _finish_audio_frame(self) -> None:
         if self.output is None:
             return
         if self.output_buffer:
             self.output_buffer.extend(b"\x00" * (FRAME_BYTES - len(self.output_buffer)))
-            await self.send_bytes(bytes(self.output_buffer))
-            if self.diagnostic_output is not None:
-                self.diagnostic_output.write(self.output_buffer)
-            self.output.sent_ms += 20
+            self._queue_playback(
+                PlaybackPacket(self.output.stream_id, bytes(self.output_buffer))
+            )
             self.output_buffer.clear()
-        await self.send_json(
-            "playback.end", stream_id=self.output.stream_id, duration_ms=self.output.sent_ms
-        )
-        self.output.ended = True
+        self._queue_playback(PlaybackPacket(self.output.stream_id, None))
+
+    def _queue_playback(self, packet: PlaybackPacket) -> None:
+        try:
+            self.playback_queue.put_nowait(packet)
+        except asyncio.QueueFull as exc:
+            raise RuntimeError("assistant playback exceeded the bounded 30-second queue") from exc
+
+    def _clear_playback_queue(self) -> None:
+        while True:
+            try:
+                self.playback_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+    def _start_playback_sender(self) -> None:
+        if self.playback_task is None or self.playback_task.done():
+            self.playback_task = asyncio.create_task(
+                self._playback_sender(), name=f"playback-sender-{self.device_id}"
+            )
+
+    async def _stop_playback_sender(self) -> None:
+        task, self.playback_task = self.playback_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._clear_playback_queue()
+
+    async def _playback_sender(self) -> None:
+        """Pace generated audio at its 20 ms media rate instead of bursting it at the device."""
+        active_stream = ""
+        next_send = 0.0
+        loop = asyncio.get_running_loop()
+        while True:
+            packet = await self.playback_queue.get()
+            output = self.output
+            if output is None or output.stream_id != packet.stream_id:
+                continue
+            if packet.data is None:
+                await self.send_json(
+                    "playback.end", stream_id=output.stream_id, duration_ms=output.sent_ms
+                )
+                output.ended = True
+                continue
+            if active_stream != packet.stream_id:
+                active_stream = packet.stream_id
+                next_send = loop.time()
+            delay = next_send - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            output = self.output
+            if output is None or output.stream_id != packet.stream_id:
+                continue
+            await self.send_bytes(packet.data)
+            if self.diagnostic_output is not None:
+                self.diagnostic_output.write(packet.data)
+            output.sent_ms += 20
+            next_send = max(next_send, loop.time()) + PLAYBACK_FRAME_SECONDS
 
     async def stop(self, reason: str, notify_device: bool = True) -> None:
         if self.stopping or self.cloud is None:
@@ -327,6 +397,7 @@ class DeviceSession:
                 notify_device = await self.send_optional(
                     "playback.flush", notify_device, stream_id=self.output.stream_id
                 )
+            await self._stop_playback_sender()
             cloud, self.cloud = self.cloud, None
             await cloud.close()
             if self.timer_task and self.timer_task is not asyncio.current_task():
