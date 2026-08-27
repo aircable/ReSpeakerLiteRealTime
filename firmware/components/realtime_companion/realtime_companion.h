@@ -54,7 +54,6 @@ class RealtimeCompanion : public Component {
   void set_token(const std::string &token) { token_ = token; }
   void set_device_id(const std::string &device_id) { device_id_ = device_id; }
   void set_output_volume(float volume) { output_volume_ = volume; }
-  void set_dac_volume(float volume) { dac_volume_ = volume; }
 
   void start_session();
   void stop_session(const char *reason = "button");
@@ -90,7 +89,6 @@ class RealtimeCompanion : public Component {
   std::mutex websocket_send_mutex_;
   std::mutex playback_mutex_;
   float output_volume_{0.5f};
-  float dac_volume_{0.85f};
   static constexpr size_t RESAMPLER_INPUT_FRAMES = 256;
   static constexpr size_t RESAMPLER_OUTPUT_FRAMES = 384;
   static constexpr UBaseType_t PLAYBACK_PREBUFFER_FRAMES = 6;

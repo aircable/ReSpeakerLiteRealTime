@@ -38,8 +38,8 @@ that the hardware AEC sufficiently suppresses playback at the microphone.
 `IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; raw
 microphone frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye”
 to end a session immediately. The firmware's `output_volume` scales direct Realtime PCM before the
-speaker path (`0.125` is -18 dB relative to full scale), while `dac_volume` explicitly constrains
-the AIC3204 codec to the formatBCE media-player range.
+speaker path (`0.125` is -18 dB relative to full scale). The AIC3204 remains at its proven default;
+changing its logarithmic control in addition to PCM scaling compounds the attenuation.
 
 Set `OPENAI_TRACE=true` (or enable **OpenAI trace** in the web UI) to log Realtime lifecycle,
 audio-duration counters, first-audio latency, response status, token usage, and post-session planner

@@ -153,10 +153,8 @@ realtime_companion:
   url: !secret gateway_ws_url
   token: !secret device_token
   device_id: ${name}
-  # Direct PCM amplitude, followed by the same maximum DAC setting used by formatBCE's
-  # media-player range. Keep these separate because the AIC3204 scale is logarithmic.
+  # Scale PCM only. The AIC3204 volume range is logarithmic and its default is retained.
   output_volume: 0.125
-  dac_volume: 0.85
 
 switch:
   # A 300 ms pulse toggles the XMOS hardware mute latch (USR/MUTE jumper required).
@@ -199,10 +197,10 @@ light:
             static float step = 0.05f;
             static bool increasing = true;
             const auto &values = id(status_led).current_values;
-            const float brightness = values.get_brightness();
-            const Color color(values.get_red() * brightness * 255,
-                              values.get_green() * brightness * 255,
-                              values.get_blue() * brightness * 255);
+            // AddressableLight applies values.get_brightness() as its output correction.
+            // Writing it into the pixel here would attenuate the effect a second time.
+            const Color color(values.get_red() * 255, values.get_green() * 255,
+                              values.get_blue() * 255);
             it[0].set_rgb(color.red * fraction, color.green * fraction, color.blue * fraction);
             fraction += step * (increasing ? 1.0f : -1.0f);
             if (fraction > 1.0f) {
@@ -220,10 +218,8 @@ light:
             static float step = 0.05f;
             static bool increasing = true;
             const auto &values = id(status_led).current_values;
-            const float brightness = values.get_brightness();
-            const Color color(values.get_red() * brightness * 255,
-                              values.get_green() * brightness * 255,
-                              values.get_blue() * brightness * 255);
+            const Color color(values.get_red() * 255, values.get_green() * 255,
+                              values.get_blue() * 255);
             it[0].set_rgb(color.red * fraction, color.green * fraction, color.blue * fraction);
             fraction += step * (increasing ? 1.0f : -1.0f);
             if (fraction > 1.0f) {
@@ -274,8 +270,8 @@ interval:
             return;
           }
           auto call = id(status_led).turn_on();
-          // RGB values select hue; ESPHome normalizes their largest channel to 1.0. Actual
-          // intensity belongs in brightness, including for the custom pulse effects above.
+          // RGB values select hue; ESPHome normalizes their largest channel to 1.0.
+          // The strip driver applies this brightness to both static and effect output.
           call.set_brightness(0.05f);
           switch (mode) {
             case INIT_SLOW:
