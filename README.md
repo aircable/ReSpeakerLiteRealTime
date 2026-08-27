@@ -35,6 +35,10 @@ the browser interface. `BARGE_IN_ENABLED` defaults to `false`, gating microphone
 gateway during assistant playback to prevent an acoustic echo loop. Enable it after confirming
 that the hardware AEC sufficiently suppresses playback at the microphone.
 
+The gateway accepts device PCM into a bounded five-second queue while the billed OpenAI session
+connects, then forwards it in order from a separate task. This preserves speech immediately after
+the wake word and prevents OpenAI latency from backpressuring the device WebSocket.
+
 `IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; raw
 microphone frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye”
 to end a session immediately. The firmware's `output_volume` scales direct Realtime PCM before the

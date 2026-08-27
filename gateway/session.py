@@ -20,6 +20,7 @@ from .realtime import RealtimeConnection
 logger = logging.getLogger(__name__)
 PLAYBACK_FRAME_SECONDS = 0.020
 MAX_QUEUED_PLAYBACK_FRAMES = 1500
+MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
 
 
 @dataclass
@@ -66,6 +67,14 @@ class DeviceSession:
             maxsize=MAX_QUEUED_PLAYBACK_FRAMES
         )
         self.playback_task: asyncio.Task[None] | None = None
+        self.input_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=MAX_QUEUED_INPUT_FRAMES
+        )
+        self.input_task: asyncio.Task[None] | None = None
+        self.start_task: asyncio.Task[None] | None = None
+        self.accepting_audio = False
+        self.cloud_ready = False
+        self.input_dropped_frames = 0
         self.assistant_text = ""
         self.usage: dict[str, Any] = {}
         self.started_monotonic = 0.0
@@ -122,10 +131,41 @@ class DeviceSession:
         self.state = state
         await self.send_json("state", state=state.value)
 
+    async def request_start(self, requested_project_id: int | None) -> None:
+        """Begin cloud startup without blocking the device WebSocket receive loop."""
+        if self.cloud is not None or (
+            self.start_task is not None and not self.start_task.done()
+        ):
+            await self.send_json(
+                "session.active",
+                session_id=self.session_id,
+                project_id=self.project_id,
+            )
+            return
+        self._clear_input_queue()
+        self.input_dropped_frames = 0
+        self.accepting_audio = True
+        self.start_task = asyncio.create_task(
+            self._run_start(requested_project_id),
+            name=f"session-start-{self.device_id}",
+        )
+
+    async def _run_start(self, requested_project_id: int | None) -> None:
+        try:
+            await self.start(requested_project_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Session startup failed device=%s", self.device_id)
+        finally:
+            if self.start_task is asyncio.current_task():
+                self.start_task = None
+
     async def start(self, requested_project_id: int | None) -> None:
         if self.cloud is not None:
             await self.send_json("session.active", session_id=self.session_id, project_id=self.project_id)
             return
+        self.accepting_audio = True
         project = self.db.get_project(requested_project_id)
         self.project_id = project["id"]
         self.session_id = self.db.start_session(self.project_id, self.device_id, self.settings.realtime_model)
@@ -153,9 +193,14 @@ class DeviceSession:
                     recording.close()
             self.diagnostic_input = self.diagnostic_output = None
             self.cloud = None
+            self.accepting_audio = False
+            self.cloud_ready = False
+            self._clear_input_queue()
             await self.set_state(DeviceState.ERROR)
             raise
         self.started_monotonic = self.last_activity = time.monotonic()
+        self.cloud_ready = True
+        self._start_input_sender()
         self._start_playback_sender()
         self.timer_task = asyncio.create_task(self._watch_timeouts(), name=f"session-timer-{self.device_id}")
         await self.set_state(DeviceState.LISTENING)
@@ -163,8 +208,6 @@ class DeviceSession:
         logger.info("Session ready for device audio device=%s session=%s", self.device_id, self.session_id)
 
     async def receive_audio(self, pcm: bytes) -> None:
-        if self.cloud is None:
-            return
         if len(pcm) != FRAME_BYTES:
             await self.send_json(
                 "error", code="bad_audio_frame", detail=f"expected {FRAME_BYTES} bytes, got {len(pcm)}"
@@ -216,7 +259,61 @@ class DeviceSession:
             )
             self.echo_gate_active = False
             self.echo_suppressed_frames = 0
-        await self.cloud.append_audio(pcm)
+        if not self.accepting_audio:
+            return
+        if self.cloud_ready:
+            self._start_input_sender()
+        try:
+            self.input_queue.put_nowait(pcm)
+        except asyncio.QueueFull:
+            # Preserve the most recent speech if OpenAI startup or the LAN stalls beyond
+            # the five-second budget. Never backpressure the device receive loop.
+            self.input_queue.get_nowait()
+            self.input_queue.put_nowait(pcm)
+            self.input_dropped_frames += 1
+            if self.input_dropped_frames == 1 or self.input_dropped_frames % 50 == 0:
+                logger.warning(
+                    "OpenAI input queue full device=%s dropped_frames=%d",
+                    self.device_id,
+                    self.input_dropped_frames,
+                )
+
+    def _clear_input_queue(self) -> None:
+        while True:
+            try:
+                self.input_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+    def _start_input_sender(self) -> None:
+        if self.input_task is None or self.input_task.done():
+            self.input_task = asyncio.create_task(
+                self._input_sender(), name=f"input-sender-{self.device_id}"
+            )
+
+    async def _stop_input_sender(self) -> None:
+        task, self.input_task = self.input_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._clear_input_queue()
+
+    async def _input_sender(self) -> None:
+        """Forward queued PCM without coupling device reads to OpenAI write latency."""
+        try:
+            while True:
+                pcm = await self.input_queue.get()
+                cloud = self.cloud
+                if cloud is None or not self.cloud_ready:
+                    continue
+                await cloud.append_audio(pcm)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("OpenAI audio forwarding failed device=%s", self.device_id)
+            await self.handle_openai_event(
+                {"type": "gateway.transport_error", "error": str(exc)}
+            )
 
     async def playback_progress(self, stream_id: str, played_ms: int) -> None:
         if self.output and self.output.stream_id == stream_id:
@@ -430,6 +527,9 @@ class DeviceSession:
         self.stopping = True
         session_id, project_id = self.session_id, self.project_id
         try:
+            self.accepting_audio = False
+            self.cloud_ready = False
+            await self._stop_input_sender()
             if self.output:
                 notify_device = await self.send_optional(
                     "playback.flush", notify_device, stream_id=self.output.stream_id
@@ -507,5 +607,12 @@ class DeviceSession:
         await self.set_state(DeviceState.LISTENING)
 
     async def close(self) -> None:
+        self.accepting_audio = False
+        start_task, self.start_task = self.start_task, None
+        if start_task is not None and start_task is not asyncio.current_task():
+            start_task.cancel()
+            await asyncio.gather(start_task, return_exceptions=True)
         if self.cloud is not None:
             await self.stop("device_disconnect", notify_device=False)
+        else:
+            await self._stop_input_sender()

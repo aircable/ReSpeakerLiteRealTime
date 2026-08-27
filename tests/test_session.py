@@ -6,7 +6,11 @@ from gateway.config import Settings
 from gateway.db import Database
 from gateway.planner import Planner
 from gateway.protocol import FRAME_BYTES, DeviceState
-from gateway.session import DeviceSession, OutputStream
+from gateway.session import (
+    MAX_QUEUED_INPUT_FRAMES,
+    DeviceSession,
+    OutputStream,
+)
 
 
 class FakeWebSocket:
@@ -66,6 +70,8 @@ def make_session(tmp_path):
     session.session_id = db.start_session(db.get_project()["id"], "device", "test")
     session.project_id = db.get_project()["id"]
     session.cloud = FakeCloud()
+    session.accepting_audio = True
+    session.cloud_ready = True
     return session, ws
 
 
@@ -74,7 +80,9 @@ async def test_frame_boundaries_are_enforced(tmp_path):
     await session.receive_audio(b"bad")
     await session.receive_audio(bytes(FRAME_BYTES))
     assert ws.messages[0][1]["code"] == "bad_audio_frame"
+    await wait_for(lambda: len(session.cloud.audio) == 1)
     assert session.cloud.audio == [bytes(FRAME_BYTES)]
+    await session._stop_input_sender()
 
 
 async def test_silent_audio_transport_does_not_reset_idle_timer(tmp_path):
@@ -84,6 +92,7 @@ async def test_silent_audio_transport_does_not_reset_idle_timer(tmp_path):
     await session.receive_audio(bytes(FRAME_BYTES))
 
     assert session.last_activity == previous_activity
+    await session._stop_input_sender()
 
 
 async def test_echo_guard_withholds_playback_audio_then_releases(tmp_path):
@@ -98,8 +107,67 @@ async def test_echo_guard_withholds_playback_audio_then_releases(tmp_path):
     session.output = None
     session.echo_gate_until = 0
     await session.receive_audio(frame)
+    await wait_for(lambda: len(session.cloud.audio) == 1)
     assert session.cloud.audio == [frame]
     assert not session.echo_gate_active
+    await session._stop_input_sender()
+
+
+async def test_audio_is_buffered_until_cloud_is_ready_and_keeps_order(tmp_path):
+    session, _ = make_session(tmp_path)
+    await session._stop_input_sender()
+    cloud = session.cloud
+    session.cloud_ready = False
+    first = b"\x01" + bytes(FRAME_BYTES - 1)
+    second = b"\x02" + bytes(FRAME_BYTES - 1)
+
+    await session.receive_audio(first)
+    await session.receive_audio(second)
+
+    assert cloud.audio == []
+    assert session.input_queue.qsize() == 2
+    session.cloud_ready = True
+    session._start_input_sender()
+    await wait_for(lambda: len(cloud.audio) == 2)
+    assert cloud.audio == [first, second]
+    await session._stop_input_sender()
+
+
+async def test_input_queue_is_bounded_and_retains_newest_audio(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.cloud_ready = False
+
+    for index in range(MAX_QUEUED_INPUT_FRAMES + 2):
+        frame = bytes([index % 256]) + bytes(FRAME_BYTES - 1)
+        await session.receive_audio(frame)
+
+    assert session.input_queue.qsize() == MAX_QUEUED_INPUT_FRAMES
+    assert session.input_dropped_frames == 2
+    oldest_retained = session.input_queue.get_nowait()
+    assert oldest_retained[0] == 2
+    await session._stop_input_sender()
+
+
+async def test_request_start_does_not_block_device_ingestion(tmp_path):
+    session, _ = make_session(tmp_path)
+    await session._stop_input_sender()
+    session.cloud = None
+    session.cloud_ready = False
+    gate = asyncio.Event()
+
+    async def delayed_start(_project_id):
+        await gate.wait()
+
+    session.start = delayed_start
+    await session.request_start(None)
+    frame = bytes(FRAME_BYTES)
+    await session.receive_audio(frame)
+
+    assert session.start_task is not None
+    assert not session.start_task.done()
+    assert session.input_queue.get_nowait() == frame
+    await session.close()
+    assert session.start_task is None
 
 
 async def wait_for(predicate):

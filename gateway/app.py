@@ -224,7 +224,9 @@ async def device_socket(websocket: WebSocket) -> None:
             message = parse_device_message(json.loads(text))
             if isinstance(message, SessionStart):
                 logger.info("Device requested session start device=%s project=%s", auth.device_id, message.project_id)
-                await session.start(message.project_id)
+                # Opening a Realtime session can take seconds. Keep consuming device audio
+                # while that happens so the ESP32 never backs up on its WebSocket writes.
+                await session.request_start(message.project_id)
             elif isinstance(message, SessionStop):
                 await session.stop(message.reason)
             elif isinstance(message, PlaybackProgress):
@@ -233,8 +235,19 @@ async def device_socket(websocket: WebSocket) -> None:
                 await session.set_state(message.state)
             elif isinstance(message, Heartbeat):
                 await session.send_json("heartbeat.ack", monotonic_ms=message.monotonic_ms)
-    except (WebSocketDisconnect, RuntimeError):
-        pass
+    except WebSocketDisconnect as exc:
+        logger.warning(
+            "Device WebSocket disconnected device=%s code=%s reason=%s",
+            session.device_id if session is not None else "unauthenticated",
+            exc.code,
+            exc.reason or "none",
+        )
+    except RuntimeError as exc:
+        logger.warning(
+            "Device WebSocket runtime close device=%s detail=%s",
+            session.device_id if session is not None else "unauthenticated",
+            exc,
+        )
     except Exception as exc:
         logger.exception("device connection failed")
         try:
