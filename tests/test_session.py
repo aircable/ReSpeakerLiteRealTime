@@ -47,6 +47,17 @@ class FakeCloud:
         self.closed = True
 
 
+class FakeRealtime(FakeCloud):
+    def __init__(self, settings, instructions, on_event):
+        super().__init__()
+        self.settings = settings
+        self.instructions = instructions
+        self.on_event = on_event
+
+    async def connect(self):
+        pass
+
+
 class FakePlanner:
     def __init__(self):
         self.updates = []
@@ -168,6 +179,36 @@ async def test_request_start_does_not_block_device_ingestion(tmp_path):
     assert session.input_queue.get_nowait() == frame
     await session.close()
     assert session.start_task is None
+
+
+async def test_session_reloads_diagnostic_setting_and_creates_recordings(
+    tmp_path, monkeypatch
+):
+    settings = Settings(
+        device_token="device-secret",
+        ui_token="browser-secret",
+        database_path=tmp_path / "test.db",
+        diagnostic_audio=False,
+    )
+    db = Database(settings.database_path)
+    db.initialize()
+    db.update_settings({"diagnostic_audio": True})
+    ws = FakeWebSocket()
+    planner = FakePlanner()
+    session = DeviceSession(ws, "device", settings, db, planner)
+    monkeypatch.setattr("gateway.session.RealtimeConnection", FakeRealtime)
+
+    await session.start(None)
+
+    assert session.settings.diagnostic_audio is True
+    assert session.diagnostic_input is not None
+    assert session.diagnostic_output is not None
+    session_id = session.session_id
+    await session.stop("test")
+    await asyncio.sleep(0)
+    diagnostic_dir = settings.database_path.parent / "diagnostic-audio"
+    assert (diagnostic_dir / f"session-{session_id}-input.pcm").exists()
+    assert (diagnostic_dir / f"session-{session_id}-output.pcm").exists()
 
 
 async def wait_for(predicate):

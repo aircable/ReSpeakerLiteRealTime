@@ -165,6 +165,10 @@ class DeviceSession:
         if self.cloud is not None:
             await self.send_json("session.active", session_id=self.session_id, project_id=self.project_id)
             return
+        # The device WebSocket is persistent, so reload UI overrides for every
+        # billed voice session rather than only when the device authenticates.
+        self.settings = self.settings.model_copy(update=self.db.setting_overrides())
+        self.planner.settings = self.settings
         self.accepting_audio = True
         project = self.db.get_project(requested_project_id)
         self.project_id = project["id"]
@@ -178,9 +182,30 @@ class DeviceSession:
         )
         if self.settings.diagnostic_audio:
             diagnostic_dir = self.settings.database_path.parent / "diagnostic-audio"
-            diagnostic_dir.mkdir(parents=True, exist_ok=True)
-            self.diagnostic_input = (diagnostic_dir / f"session-{self.session_id}-input.pcm").open("wb")
-            self.diagnostic_output = (diagnostic_dir / f"session-{self.session_id}-output.pcm").open("wb")
+            input_path = diagnostic_dir / f"session-{self.session_id}-input.pcm"
+            output_path = diagnostic_dir / f"session-{self.session_id}-output.pcm"
+            try:
+                diagnostic_dir.mkdir(parents=True, exist_ok=True)
+                self.diagnostic_input = input_path.open("wb")
+                self.diagnostic_output = output_path.open("wb")
+                logger.info(
+                    "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s",
+                    self.device_id,
+                    self.session_id,
+                    input_path,
+                    output_path,
+                )
+            except OSError:
+                logger.exception(
+                    "Diagnostic audio recording unavailable device=%s session=%s directory=%s",
+                    self.device_id,
+                    self.session_id,
+                    diagnostic_dir,
+                )
+                for recording in (self.diagnostic_input, self.diagnostic_output):
+                    if recording is not None:
+                        recording.close()
+                self.diagnostic_input = self.diagnostic_output = None
         context = build_instructions(project, self.db.recent_turns(self.project_id, 12))
         self.cloud = RealtimeConnection(self.settings, context, self.handle_openai_event)
         await self.set_state(DeviceState.CONNECTING)

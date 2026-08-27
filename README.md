@@ -48,7 +48,7 @@ changing its logarithmic control in addition to PCM scaling compounds the attenu
 Set `OPENAI_TRACE=true` (or enable **OpenAI trace** in the web UI) to log Realtime lifecycle,
 audio-duration counters, first-audio latency, response status, token usage, and post-session planner
 calls. Trace logging omits API keys, raw/base64 audio, instructions, and transcript text. UI changes
-apply on the next device connection.
+apply on the next voice session.
 
 Home Assistant OS normally manages containers as Apps (formerly add-ons). Running this command
 directly requires host-level SSH access and is not managed by Supervisor; packaging the image as a
