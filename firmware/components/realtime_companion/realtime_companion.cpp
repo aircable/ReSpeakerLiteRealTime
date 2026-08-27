@@ -104,9 +104,15 @@ void RealtimeCompanion::run_audio_sender() {
         !esp_websocket_client_is_connected(this->client_)) {
       continue;
     }
-    const int sent = esp_websocket_client_send_bin(
-        this->client_, reinterpret_cast<const char *>(captured.data.data()), captured.data.size(),
-        pdMS_TO_TICKS(50));
+    int sent = -1;
+    {
+      std::lock_guard<std::mutex> lock(this->websocket_send_mutex_);
+      if (this->client_ == nullptr || !esp_websocket_client_is_connected(this->client_))
+        continue;
+      sent = esp_websocket_client_send_bin(
+          this->client_, reinterpret_cast<const char *>(captured.data.data()), captured.data.size(),
+          pdMS_TO_TICKS(100));
+    }
     if (sent == static_cast<int>(captured.data.size())) {
       this->sent_frames_.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -136,6 +142,7 @@ void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_e
     this->auth_pending_.store(false, std::memory_order_release);
     this->session_start_pending_.store(false, std::memory_order_release);
     xQueueReset(this->capture_queue_);
+    this->flush_playback();
     if (this->session_active_)
       this->update_state(CompanionState::CONNECTING);
   } else if (event_id == WEBSOCKET_EVENT_DATA && event->payload_offset == 0 &&
@@ -144,8 +151,10 @@ void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_e
       OutputFrame output{};
       auto *mono = reinterpret_cast<const int16_t *>(event->data_ptr);
       auto *stereo = reinterpret_cast<int16_t *>(output.data.data());
-      for (size_t i = 0; i < INPUT_FRAME_BYTES / 2; i++)
-        stereo[2 * i] = stereo[2 * i + 1] = mono[i];
+      for (size_t i = 0; i < INPUT_FRAME_BYTES / 2; i++) {
+        const int16_t scaled = static_cast<int16_t>(mono[i] * this->output_volume_);
+        stereo[2 * i] = stereo[2 * i + 1] = scaled;
+      }
       if (xQueueSend(this->playback_queue_, &output, 0) != pdTRUE)
         ESP_LOGW(TAG, "Playback queue full; dropping frame");
     } else if (event->op_code == 0x1) {
@@ -424,9 +433,11 @@ void RealtimeCompanion::flush_playback() {
 }
 
 bool RealtimeCompanion::send_json(const std::string &json) {
+  std::lock_guard<std::mutex> lock(this->websocket_send_mutex_);
   if (this->client_ == nullptr || !esp_websocket_client_is_connected(this->client_))
     return false;
-  const int sent = esp_websocket_client_send_text(this->client_, json.c_str(), json.size(), pdMS_TO_TICKS(20));
+  const int sent = esp_websocket_client_send_text(this->client_, json.c_str(), json.size(),
+                                                   pdMS_TO_TICKS(100));
   if (sent != static_cast<int>(json.size())) {
     ESP_LOGW(TAG, "WebSocket control send failed: sent %d of %u bytes", sent,
              static_cast<unsigned>(json.size()));
@@ -445,6 +456,7 @@ void RealtimeCompanion::dump_config() {
   ESP_LOGCONFIG(TAG, "Realtime Thinking Companion:");
   ESP_LOGCONFIG(TAG, "  Gateway: %s", this->url_.c_str());
   ESP_LOGCONFIG(TAG, "  Device ID: %s", this->device_id_.c_str());
+  ESP_LOGCONFIG(TAG, "  Assistant output volume: %.0f%%", this->output_volume_ * 100.0f);
   ESP_LOGCONFIG(TAG, "  Capture queue: 6 x 20 ms; playback queue: 10 x 20 ms");
 }
 

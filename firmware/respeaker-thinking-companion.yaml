@@ -153,6 +153,7 @@ realtime_companion:
   url: !secret gateway_ws_url
   token: !secret device_token
   device_id: ${name}
+  output_volume: 0.5
 
 switch:
   # A 300 ms pulse toggles the XMOS hardware mute latch (USR/MUTE jumper required).
