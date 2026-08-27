@@ -354,9 +354,12 @@ void RealtimeCompanion::loop() {
     }
     if (!stream_id.empty()) {
       const uint32_t played_ms = this->played_frames_.load(std::memory_order_relaxed) / 24;
-      this->send_json("{\"v\":1,\"type\":\"playback.progress\",\"stream_id\":\"" +
-                      stream_id + "\",\"played_ms\":" + std::to_string(played_ms) + "}");
-      if (expected_duration_ms != 0 && played_ms >= expected_duration_ms) {
+      const bool progress_sent =
+          this->send_json("{\"v\":1,\"type\":\"playback.progress\",\"stream_id\":\"" +
+                          stream_id + "\",\"played_ms\":" + std::to_string(played_ms) + "}");
+      // Do not discard the final progress locally until the gateway has received it. Otherwise a
+      // single failed control write leaves the gateway permanently in its speaking state.
+      if (progress_sent && expected_duration_ms != 0 && played_ms >= expected_duration_ms) {
         std::lock_guard<std::mutex> lock(this->playback_mutex_);
         if (this->stream_id_ == stream_id) {
           this->stream_id_.clear();

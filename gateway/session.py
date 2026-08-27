@@ -168,7 +168,6 @@ class DeviceSession:
                 "error", code="bad_audio_frame", detail=f"expected {FRAME_BYTES} bytes, got {len(pcm)}"
             )
             return
-        self.last_activity = time.monotonic()
         samples = memoryview(pcm).cast("h")
         frame_peak = max(abs(sample) for sample in samples)
         self.input_frames_total += 1

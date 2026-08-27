@@ -77,6 +77,15 @@ async def test_frame_boundaries_are_enforced(tmp_path):
     assert session.cloud.audio == [bytes(FRAME_BYTES)]
 
 
+async def test_silent_audio_transport_does_not_reset_idle_timer(tmp_path):
+    session, _ = make_session(tmp_path)
+    previous_activity = session.last_activity
+
+    await session.receive_audio(bytes(FRAME_BYTES))
+
+    assert session.last_activity == previous_activity
+
+
 async def test_echo_guard_withholds_playback_audio_then_releases(tmp_path):
     session, _ = make_session(tmp_path)
     session.output = OutputStream("stream", "response", "item", 0)

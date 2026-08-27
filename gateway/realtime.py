@@ -66,7 +66,7 @@ class RealtimeConnection:
                         {
                             "type": "function",
                             "name": "end_session",
-                            "description": "End the device voice session after an explicit user request.",
+                            "description": "End the device voice session after an explicit request such as go to sleep, stop, goodbye, good night, end session, or that's all.",
                             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
                         }
                     ],

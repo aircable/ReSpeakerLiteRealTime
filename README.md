@@ -35,6 +35,11 @@ the browser interface. `BARGE_IN_ENABLED` defaults to `false`, gating microphone
 gateway during assistant playback to prevent an acoustic echo loop. Enable it after confirming
 that the hardware AEC sufficiently suppresses playback at the microphone.
 
+`IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; raw
+microphone frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye”
+to end a session immediately. The firmware's `output_volume` scales direct Realtime PCM before the
+speaker path (for example, `0.25` is -12 dB relative to full scale).
+
 Home Assistant OS normally manages containers as Apps (formerly add-ons). Running this command
 directly requires host-level SSH access and is not managed by Supervisor; packaging the image as a
 Home Assistant App is the supported long-term HAOS installation path.
