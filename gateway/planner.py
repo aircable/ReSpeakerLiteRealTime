@@ -36,6 +36,13 @@ class Planner:
             },
         }
         try:
+            if self.settings.openai_trace:
+                logger.info(
+                    "OpenAI trace planner_request model=%s session=%d turns=%d",
+                    self.settings.planner_model,
+                    session_id,
+                    len(turns),
+                )
             async with httpx.AsyncClient(timeout=60) as client:
                 response = await client.post(
                     "https://api.openai.com/v1/responses",
@@ -43,10 +50,19 @@ class Planner:
                     json=payload,
                 )
                 response.raise_for_status()
-            update = extract_response_json(response.json())
+            result = response.json()
+            if self.settings.openai_trace:
+                logger.info(
+                    "OpenAI trace planner_response model=%s session=%d response_id=%s status=%s usage=%s",
+                    self.settings.planner_model,
+                    session_id,
+                    result.get("id"),
+                    result.get("status"),
+                    result.get("usage", {}),
+                )
+            update = extract_response_json(result)
             self.db.apply_plan_update(project_id, session_id, update)
             return True
         except Exception:
             logger.exception("post-session planning failed; transcript remains intact")
             return False
-

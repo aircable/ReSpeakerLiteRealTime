@@ -69,6 +69,7 @@ class GatewaySettingsUpdate(BaseModel):
     idle_timeout_seconds: int | None = Field(default=None, ge=5, le=900)
     hard_session_limit_seconds: int | None = Field(default=None, ge=60, le=7200)
     diagnostic_audio: bool | None = None
+    openai_trace: bool | None = None
     barge_in_enabled: bool | None = None
     transcript_retention_days: int | None = Field(default=None, ge=0, le=3650)
 

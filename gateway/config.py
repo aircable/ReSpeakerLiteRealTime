@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     idle_timeout_seconds: int = Field(default=30, ge=5, le=900)
     hard_session_limit_seconds: int = Field(default=3600, ge=60, le=7200)
     diagnostic_audio: bool = False
+    openai_trace: bool = False
     barge_in_enabled: bool = False
     transcript_retention_days: int = Field(default=0, ge=0, le=3650)
 

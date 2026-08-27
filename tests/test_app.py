@@ -30,13 +30,14 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
             saved = await client.patch(
                 "/api/settings",
                 headers={"Authorization": "Bearer browser-secret"},
-                json={"voice": "cedar", "idle_timeout_seconds": 45},
+                json={"voice": "cedar", "idle_timeout_seconds": 45, "openai_trace": True},
             )
             assert saved.status_code == 200
             current = await client.get(
                 "/api/settings", headers={"Authorization": "Bearer browser-secret"}
             )
             assert current.json()["voice"] == "cedar"
+            assert current.json()["openai_trace"] is True
     get_settings.cache_clear()
 
 
