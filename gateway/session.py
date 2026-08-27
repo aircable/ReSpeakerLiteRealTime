@@ -31,6 +31,8 @@ class OutputStream:
     played_ms: int = 0
     sent_ms: int = 0
     ended: bool = False
+    end_queued: bool = False
+    ended_monotonic: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -220,11 +222,7 @@ class DeviceSession:
         if self.output and self.output.stream_id == stream_id:
             self.output.played_ms = min(played_ms, self.output.sent_ms)
             if self.output.ended and self.output.played_ms >= self.output.sent_ms:
-                self.output = None
-                if not self.settings.barge_in_enabled:
-                    self.echo_gate_until = time.monotonic() + 0.3
-                self.last_activity = time.monotonic()
-                await self.set_state(DeviceState.LISTENING)
+                await self._complete_playback("device_progress")
 
     async def interrupt(self) -> None:
         output = self.output
@@ -300,6 +298,9 @@ class DeviceSession:
             return
         if kind == "response.done":
             response = event.get("response", {})
+            # Some event sequences finish the response without a separate output_audio.done.
+            # Queue the final partial frame/end marker exactly once in either case.
+            await self._finish_audio_frame()
             self.usage = response.get("usage", self.usage)
             if self.session_id is not None and self.assistant_text:
                 self.db.add_turn(
@@ -347,7 +348,7 @@ class DeviceSession:
             self._queue_playback(PlaybackPacket(self.output.stream_id, frame))
 
     async def _finish_audio_frame(self) -> None:
-        if self.output is None:
+        if self.output is None or self.output.end_queued:
             return
         if self.output_buffer:
             self.output_buffer.extend(b"\x00" * (FRAME_BYTES - len(self.output_buffer)))
@@ -355,6 +356,7 @@ class DeviceSession:
                 PlaybackPacket(self.output.stream_id, bytes(self.output_buffer))
             )
             self.output_buffer.clear()
+        self.output.end_queued = True
         self._queue_playback(PlaybackPacket(self.output.stream_id, None))
 
     def _queue_playback(self, packet: PlaybackPacket) -> None:
@@ -398,6 +400,14 @@ class DeviceSession:
                     "playback.end", stream_id=output.stream_id, duration_ms=output.sent_ms
                 )
                 output.ended = True
+                output.ended_monotonic = loop.time()
+                logger.info(
+                    "Assistant playback sent device=%s stream=%s duration_ms=%d played_ms=%d",
+                    self.device_id,
+                    output.stream_id,
+                    output.sent_ms,
+                    output.played_ms,
+                )
                 continue
             if active_stream != packet.stream_id:
                 active_stream = packet.stream_id
@@ -453,6 +463,21 @@ class DeviceSession:
         while self.cloud is not None:
             await asyncio.sleep(1)
             current = time.monotonic()
+            if (
+                self.output is not None
+                and self.output.ended
+                and current - self.output.ended_monotonic >= 2.0
+            ):
+                logger.warning(
+                    "Playback completion timed out device=%s stream=%s sent_ms=%d played_ms=%d; recovering",
+                    self.device_id,
+                    self.output.stream_id,
+                    self.output.sent_ms,
+                    self.output.played_ms,
+                )
+                with contextlib.suppress(WebSocketDisconnect, RuntimeError):
+                    await self.send_json("playback.flush", stream_id=self.output.stream_id)
+                await self._complete_playback("watchdog")
             if current - self.started_monotonic >= self.settings.hard_session_limit_seconds:
                 await self.stop("hard_limit")
                 return
@@ -462,6 +487,24 @@ class DeviceSession:
             ):
                 await self.stop("idle_timeout")
                 return
+
+    async def _complete_playback(self, reason: str) -> None:
+        output = self.output
+        if output is None:
+            return
+        logger.info(
+            "Assistant playback complete device=%s stream=%s reason=%s sent_ms=%d played_ms=%d",
+            self.device_id,
+            output.stream_id,
+            reason,
+            output.sent_ms,
+            output.played_ms,
+        )
+        self.output = None
+        if not self.settings.barge_in_enabled:
+            self.echo_gate_until = time.monotonic() + 0.3
+        self.last_activity = time.monotonic()
+        await self.set_state(DeviceState.LISTENING)
 
     async def close(self) -> None:
         if self.cloud is not None:

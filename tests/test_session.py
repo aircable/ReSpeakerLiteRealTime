@@ -162,6 +162,44 @@ async def test_output_is_chunked_and_padded_to_twenty_ms(tmp_path):
     await session._stop_playback_sender()
 
 
+async def test_response_done_finishes_audio_without_audio_done_event(tmp_path):
+    session, ws = make_session(tmp_path)
+    session._start_playback_sender()
+    await session.handle_openai_event(
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "r",
+            "item_id": "i",
+            "content_index": 0,
+            "delta": base64.b64encode(bytes(100)).decode(),
+        }
+    )
+
+    await session.handle_openai_event({"type": "response.done", "response": {}})
+    await wait_for(lambda: session.output.ended)
+
+    assert session.output.end_queued
+    assert any(
+        kind == "json" and value["type"] == "playback.end"
+        for kind, value in ws.messages
+    )
+    await session._stop_playback_sender()
+
+
+async def test_stalled_playback_completion_recovers_listening_state(tmp_path):
+    session, ws = make_session(tmp_path)
+    session.state = DeviceState.SPEAKING
+    session.output = OutputStream(
+        "stream", "response", "item", 0, sent_ms=1000, played_ms=900, ended=True
+    )
+
+    await session._complete_playback("watchdog")
+
+    assert session.output is None
+    assert session.state == DeviceState.LISTENING
+    assert ws.messages[-1][1]["state"] == "listening"
+
+
 async def test_output_frames_are_paced_at_media_rate(tmp_path):
     session, ws = make_session(tmp_path)
     session._start_playback_sender()

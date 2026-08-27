@@ -10,6 +10,7 @@ CONF_URL = "url"
 CONF_TOKEN = "token"
 CONF_DEVICE_ID = "device_id"
 CONF_OUTPUT_VOLUME = "output_volume"
+CONF_DAC_VOLUME = "dac_volume"
 
 companion_ns = cg.esphome_ns.namespace("realtime_companion")
 RealtimeCompanion = companion_ns.class_("RealtimeCompanion", cg.Component)
@@ -23,6 +24,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_TOKEN): cv.string_strict,
         cv.Required(CONF_DEVICE_ID): cv.string_strict,
         cv.Optional(CONF_OUTPUT_VOLUME, default=0.5): cv.float_range(min=0.0, max=1.0),
+        cv.Optional(CONF_DAC_VOLUME, default=0.85): cv.float_range(min=0.0, max=1.0),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -41,3 +43,4 @@ async def to_code(config):
     cg.add(var.set_token(config[CONF_TOKEN]))
     cg.add(var.set_device_id(config[CONF_DEVICE_ID]))
     cg.add(var.set_output_volume(config[CONF_OUTPUT_VOLUME]))
+    cg.add(var.set_dac_volume(config[CONF_DAC_VOLUME]))

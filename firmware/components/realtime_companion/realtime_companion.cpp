@@ -45,6 +45,9 @@ void RealtimeCompanion::setup() {
     return;
   }
   this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 2, 24000));
+  // The direct PCM path bypasses formatBCE's media player, so apply its published maximum
+  // volume to the AIC3204 DAC explicitly instead of leaving the codec at 100%.
+  this->speaker_->set_volume(this->dac_volume_);
   this->speaker_->add_audio_output_callback([this](uint32_t frames, int64_t) {
     if (this->playback_active_.load(std::memory_order_acquire))
       this->played_frames_.fetch_add(frames, std::memory_order_relaxed);
@@ -460,6 +463,7 @@ void RealtimeCompanion::dump_config() {
   ESP_LOGCONFIG(TAG, "  Gateway: %s", this->url_.c_str());
   ESP_LOGCONFIG(TAG, "  Device ID: %s", this->device_id_.c_str());
   ESP_LOGCONFIG(TAG, "  Assistant output volume: %.0f%%", this->output_volume_ * 100.0f);
+  ESP_LOGCONFIG(TAG, "  AIC3204 DAC volume: %.0f%%", this->dac_volume_ * 100.0f);
   ESP_LOGCONFIG(TAG, "  Capture queue: 6 x 20 ms; playback queue: 10 x 20 ms");
 }
 
