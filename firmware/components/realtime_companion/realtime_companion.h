@@ -86,6 +86,7 @@ class RealtimeCompanion : public Component {
   std::mutex playback_mutex_;
   static constexpr size_t RESAMPLER_INPUT_FRAMES = 256;
   static constexpr size_t RESAMPLER_OUTPUT_FRAMES = 384;
+  static constexpr UBaseType_t PLAYBACK_PREBUFFER_FRAMES = 6;
   esp_audio_libs::resampler::Resampler input_resampler_{RESAMPLER_INPUT_FRAMES,
                                                          RESAMPLER_OUTPUT_FRAMES};
   std::array<int16_t, RESAMPLER_INPUT_FRAMES> resampler_input_{};
@@ -97,9 +98,10 @@ class RealtimeCompanion : public Component {
   uint8_t playback_queue_storage_[10 * sizeof(OutputFrame)]{};
   QueueHandle_t capture_queue_{nullptr};
   QueueHandle_t playback_queue_{nullptr};
-  static constexpr uint32_t AUDIO_SENDER_STACK_WORDS = 4096;
+  // ESP-IDF's Xtensa StackType_t is uint8_t, so this count is bytes, not 32-bit words.
+  static constexpr uint32_t AUDIO_SENDER_STACK_BYTES = 8192;
   StaticTask_t audio_sender_task_struct_{};
-  StackType_t audio_sender_task_stack_[AUDIO_SENDER_STACK_WORDS]{};
+  StackType_t audio_sender_task_stack_[AUDIO_SENDER_STACK_BYTES]{};
   TaskHandle_t audio_sender_task_handle_{nullptr};
   InputFrame building_frame_{};
   size_t building_samples_{0};
@@ -111,6 +113,8 @@ class RealtimeCompanion : public Component {
   std::atomic<uint16_t> capture_peak_{0};
   std::atomic<uint32_t> played_frames_{0};
   std::atomic<bool> playback_active_{false};
+  std::atomic<bool> playback_prebuffering_{false};
+  std::atomic<bool> playback_end_received_{false};
   uint32_t expected_duration_ms_{0};
   uint32_t last_progress_ms_{0};
   uint32_t last_audio_stats_ms_{0};

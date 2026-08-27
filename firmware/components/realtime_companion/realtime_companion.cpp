@@ -37,7 +37,7 @@ void RealtimeCompanion::setup() {
     return;
   }
   this->audio_sender_task_handle_ = xTaskCreateStatic(
-      &RealtimeCompanion::audio_sender_task, "realtime_tx", AUDIO_SENDER_STACK_WORDS, this,
+      &RealtimeCompanion::audio_sender_task, "realtime_tx", AUDIO_SENDER_STACK_BYTES, this,
       tskIDLE_PRIORITY + 3, this->audio_sender_task_stack_, &this->audio_sender_task_struct_);
   if (this->audio_sender_task_handle_ == nullptr) {
     ESP_LOGE(TAG, "Could not create audio sender task");
@@ -188,18 +188,21 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     }
   } else if (strcmp(kind, "playback.start") == 0) {
     cJSON *stream = cJSON_GetObjectItemCaseSensitive(root, "stream_id");
+    xQueueReset(this->playback_queue_);
     {
       std::lock_guard<std::mutex> lock(this->playback_mutex_);
       this->stream_id_ = cJSON_IsString(stream) ? stream->valuestring : "";
       this->expected_duration_ms_ = 0;
     }
     this->played_frames_.store(0, std::memory_order_relaxed);
+    this->playback_end_received_.store(false, std::memory_order_release);
+    this->playback_prebuffering_.store(true, std::memory_order_release);
     this->playback_active_.store(true, std::memory_order_release);
-    this->speaker_->start();
   } else if (strcmp(kind, "playback.end") == 0) {
     cJSON *duration = cJSON_GetObjectItemCaseSensitive(root, "duration_ms");
     std::lock_guard<std::mutex> lock(this->playback_mutex_);
     this->expected_duration_ms_ = cJSON_IsNumber(duration) ? duration->valueint : 0;
+    this->playback_end_received_.store(true, std::memory_order_release);
   } else if (strcmp(kind, "playback.flush") == 0) {
     this->flush_playback();
   }
@@ -302,14 +305,26 @@ void RealtimeCompanion::loop() {
     const uint16_t peak = this->capture_peak_.exchange(0, std::memory_order_relaxed);
     const unsigned queued = this->capture_queue_ == nullptr ? 0 : uxQueueMessagesWaiting(this->capture_queue_);
     ESP_LOGI(TAG,
-             "Audio stats/2s: captured=%u sent=%u dropped=%u queued=%u/6 peak=%u ready=%s connected=%s",
+             "Audio stats/2s: captured=%u sent=%u dropped=%u queued=%u/6 peak=%u tx_stack_free=%u ready=%s connected=%s",
              static_cast<unsigned>(captured), static_cast<unsigned>(sent),
              static_cast<unsigned>(dropped), queued, static_cast<unsigned>(peak),
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(this->audio_sender_task_handle_)),
              this->stream_ready_.load(std::memory_order_acquire) ? "yes" : "no",
              this->client_ != nullptr && esp_websocket_client_is_connected(this->client_) ? "yes" : "no");
   }
+  if (this->playback_prebuffering_.load(std::memory_order_acquire)) {
+    const UBaseType_t queued = uxQueueMessagesWaiting(this->playback_queue_);
+    if (queued >= PLAYBACK_PREBUFFER_FRAMES ||
+        (queued > 0 && this->playback_end_received_.load(std::memory_order_acquire))) {
+      ESP_LOGI(TAG, "Playback prebuffer ready: %u frames (%u ms)", static_cast<unsigned>(queued),
+               static_cast<unsigned>(queued * 20));
+      this->speaker_->start();
+      this->playback_prebuffering_.store(false, std::memory_order_release);
+    }
+  }
   OutputFrame playback;
-  if (xQueueReceive(this->playback_queue_, &playback, 0) == pdTRUE) {
+  if (!this->playback_prebuffering_.load(std::memory_order_acquire) &&
+      xQueueReceive(this->playback_queue_, &playback, 0) == pdTRUE) {
     const size_t remaining = playback.data.size() - playback.offset;
     size_t written = this->speaker_->play(playback.data.data() + playback.offset, remaining, 0);
     playback.offset += written;
@@ -338,6 +353,7 @@ void RealtimeCompanion::loop() {
           this->stream_id_.clear();
           this->expected_duration_ms_ = 0;
           this->playback_active_.store(false, std::memory_order_release);
+          this->speaker_->finish();
         }
       }
     }
@@ -400,6 +416,8 @@ void RealtimeCompanion::flush_playback() {
   this->speaker_->stop();
   this->played_frames_.store(0, std::memory_order_relaxed);
   this->playback_active_.store(false, std::memory_order_release);
+  this->playback_prebuffering_.store(false, std::memory_order_release);
+  this->playback_end_received_.store(false, std::memory_order_release);
   std::lock_guard<std::mutex> lock(this->playback_mutex_);
   this->stream_id_.clear();
   this->expected_duration_ms_ = 0;

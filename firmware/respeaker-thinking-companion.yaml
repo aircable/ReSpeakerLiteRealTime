@@ -124,7 +124,8 @@ speaker:
     id: realtime_resampler
     output_speaker: xmos_speaker
     sample_rate: 48000
-    bits_per_sample: 32
+    # Match formatBCE's proven path: retain PCM16 while the I2S driver clocks 32-bit slots.
+    bits_per_sample: 16
     buffer_duration: 100ms
     filters: 16
     taps: 32
