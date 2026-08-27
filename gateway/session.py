@@ -81,6 +81,9 @@ class DeviceSession:
         self.input_square_sum = 0
         self.input_peak = 0
         self.last_input_log = time.monotonic()
+        self.echo_gate_active = False
+        self.echo_gate_until = 0.0
+        self.echo_suppressed_frames = 0
 
     async def send_json(self, message_type: str, **payload: Any) -> None:
         message = server_message(message_type, **{"device_id": self.device_id, **payload})
@@ -192,6 +195,26 @@ class DeviceSession:
             self.last_input_log = current
         if self.diagnostic_input is not None:
             self.diagnostic_input.write(pcm)
+        echo_guarded = not self.settings.barge_in_enabled and (
+            self.output is not None or time.monotonic() < self.echo_gate_until
+        )
+        if echo_guarded:
+            self.echo_suppressed_frames += 1
+            if not self.echo_gate_active:
+                self.echo_gate_active = True
+                logger.info(
+                    "Assistant echo guard active device=%s; microphone capture continues locally",
+                    self.device_id,
+                )
+            return
+        if self.echo_gate_active:
+            logger.info(
+                "Assistant echo guard released device=%s suppressed_frames=%d",
+                self.device_id,
+                self.echo_suppressed_frames,
+            )
+            self.echo_gate_active = False
+            self.echo_suppressed_frames = 0
         await self.cloud.append_audio(pcm)
 
     async def playback_progress(self, stream_id: str, played_ms: int) -> None:
@@ -199,6 +222,8 @@ class DeviceSession:
             self.output.played_ms = min(played_ms, self.output.sent_ms)
             if self.output.ended and self.output.played_ms >= self.output.sent_ms:
                 self.output = None
+                if not self.settings.barge_in_enabled:
+                    self.echo_gate_until = time.monotonic() + 0.3
                 self.last_activity = time.monotonic()
                 await self.set_state(DeviceState.LISTENING)
 
@@ -228,6 +253,9 @@ class DeviceSession:
                 event.get("audio_start_ms"),
                 event.get("item_id"),
             )
+            if self.output is not None and not self.settings.barge_in_enabled:
+                logger.info("Ignoring assistant-echo VAD start device=%s", self.device_id)
+                return
             self.last_activity = time.monotonic()
             await self.interrupt()
             return

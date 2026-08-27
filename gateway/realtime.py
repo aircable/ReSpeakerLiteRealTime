@@ -54,7 +54,7 @@ class RealtimeConnection:
                                 "type": "semantic_vad",
                                 "eagerness": "auto",
                                 "create_response": True,
-                                "interrupt_response": True,
+                                "interrupt_response": self.settings.barge_in_enabled,
                             },
                         },
                         "output": {
@@ -75,10 +75,11 @@ class RealtimeConnection:
             }
         )
         logger.info(
-            "OpenAI session.update sent: voice=%s reasoning=%s vad=semantic_vad transcription=%s",
+            "OpenAI session.update sent: voice=%s reasoning=%s vad=semantic_vad transcription=%s barge_in=%s",
             self.settings.voice,
             self.settings.reasoning_effort,
             self.settings.transcription_model,
+            self.settings.barge_in_enabled,
         )
         self.reader_task = asyncio.create_task(self._reader(), name="openai-realtime-reader")
 

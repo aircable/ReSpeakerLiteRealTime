@@ -31,7 +31,9 @@ docker run -d \
 
 The container needs no Home Assistant token. `OPENAI_API_KEY` is the OpenAI API key,
 `DEVICE_TOKEN` must match the token compiled into the ReSpeaker firmware, and `UI_TOKEN` protects
-the browser interface.
+the browser interface. `BARGE_IN_ENABLED` defaults to `false`, gating microphone frames at the
+gateway during assistant playback to prevent an acoustic echo loop. Enable it after confirming
+that the hardware AEC sufficiently suppresses playback at the microphone.
 
 Home Assistant OS normally manages containers as Apps (formerly add-ons). Running this command
 directly requires host-level SSH access and is not managed by Supervisor; packaging the image as a

@@ -1,14 +1,12 @@
 import asyncio
 import base64
-from dataclasses import replace
-
 from fastapi import WebSocketDisconnect
 
 from gateway.config import Settings
 from gateway.db import Database
 from gateway.planner import Planner
 from gateway.protocol import FRAME_BYTES, DeviceState
-from gateway.session import DeviceSession
+from gateway.session import DeviceSession, OutputStream
 
 
 class FakeWebSocket:
@@ -79,6 +77,22 @@ async def test_frame_boundaries_are_enforced(tmp_path):
     assert session.cloud.audio == [bytes(FRAME_BYTES)]
 
 
+async def test_echo_guard_withholds_playback_audio_then_releases(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.output = OutputStream("stream", "response", "item", 0)
+    frame = bytes(FRAME_BYTES)
+
+    await session.receive_audio(frame)
+    assert session.cloud.audio == []
+    assert session.echo_suppressed_frames == 1
+
+    session.output = None
+    session.echo_gate_until = 0
+    await session.receive_audio(frame)
+    assert session.cloud.audio == [frame]
+    assert not session.echo_gate_active
+
+
 async def wait_for(predicate):
     for _ in range(100):
         if predicate():
@@ -89,6 +103,7 @@ async def wait_for(predicate):
 
 async def test_barge_in_flushes_truncates_and_rejects_late_audio(tmp_path):
     session, ws = make_session(tmp_path)
+    session.settings = session.settings.model_copy(update={"barge_in_enabled": True})
     session._start_playback_sender()
     audio = bytes(FRAME_BYTES)
     event = {
