@@ -1,4 +1,5 @@
 import json
+import logging
 
 import httpx
 from fastapi import WebSocketDisconnect
@@ -38,6 +39,22 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
             )
             assert current.json()["voice"] == "cedar"
             assert current.json()["openai_trace"] is True
+    get_settings.cache_clear()
+
+
+async def test_startup_logs_and_health_identify_build(monkeypatch, tmp_path, caplog):
+    configure(monkeypatch, tmp_path)
+    with caplog.at_level(logging.INFO, logger="gateway.app"):
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                payload = (await client.get("/health")).json()
+
+    assert payload["status"] == "ok"
+    assert payload["version"]
+    assert payload["commit"]
+    assert "Starting ReSpeaker Thinking Companion gateway version=" in caplog.text
+    assert " commit=" in caplog.text
     get_settings.cache_clear()
 
 

@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -27,6 +29,12 @@ from .session import DeviceSession
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
+
+try:
+    GATEWAY_VERSION = distribution_version("respeaker-thinking-companion") or "0.1.0-dev"
+except (PackageNotFoundError, KeyError):
+    GATEWAY_VERSION = "0.1.0-dev"
+GATEWAY_COMMIT = os.environ.get("GATEWAY_COMMIT", "development")
 
 
 class LiveHub:
@@ -94,12 +102,17 @@ async def require_ui_token(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info(
+        "Starting ReSpeaker Thinking Companion gateway version=%s commit=%s",
+        GATEWAY_VERSION,
+        GATEWAY_COMMIT,
+    )
     settings = get_settings()
     Database(settings.database_path).initialize()
     yield
 
 
-app = FastAPI(title="ReSpeaker Thinking Companion", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ReSpeaker Thinking Companion", version=GATEWAY_VERSION, lifespan=lifespan)
 
 
 @app.get("/")
@@ -109,7 +122,11 @@ async def index() -> FileResponse:
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "version": GATEWAY_VERSION,
+        "commit": GATEWAY_COMMIT,
+    }
 
 
 @app.get("/api/projects", dependencies=[Depends(require_ui_token)])
