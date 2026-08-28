@@ -36,6 +36,28 @@ def test_trace_metadata_excludes_content_and_credentials(tmp_path):
     }
 
 
+def test_server_vad_configuration(tmp_path):
+    connection = make_connection(tmp_path)
+    connection.settings = connection.settings.model_copy(
+        update={
+            "vad_mode": "server_vad",
+            "vad_threshold": 0.55,
+            "vad_prefix_padding_ms": 250,
+            "vad_silence_duration_ms": 600,
+            "barge_in_enabled": True,
+        }
+    )
+
+    assert connection._turn_detection_config() == {
+        "type": "server_vad",
+        "threshold": 0.55,
+        "prefix_padding_ms": 250,
+        "silence_duration_ms": 600,
+        "create_response": True,
+        "interrupt_response": True,
+    }
+
+
 def test_trace_counts_audio_and_response_usage_without_logging_audio(tmp_path, caplog):
     connection = make_connection(tmp_path)
     audio = base64.b64encode(bytes(960)).decode()

@@ -36,6 +36,22 @@ class RealtimeConnection:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
+    def _turn_detection_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "type": self.settings.vad_mode,
+            "create_response": True,
+            "interrupt_response": self.settings.barge_in_enabled,
+        }
+        if self.settings.vad_mode == "server_vad":
+            config.update(
+                threshold=self.settings.vad_threshold,
+                prefix_padding_ms=self.settings.vad_prefix_padding_ms,
+                silence_duration_ms=self.settings.vad_silence_duration_ms,
+            )
+        else:
+            config["eagerness"] = self.settings.vad_eagerness
+        return config
+
     async def connect(self) -> None:
         if not self.settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -63,12 +79,7 @@ class RealtimeConnection:
                         "input": {
                             "format": {"type": "audio/pcm", "rate": 24000},
                             "transcription": {"model": self.settings.transcription_model},
-                            "turn_detection": {
-                                "type": "semantic_vad",
-                                "eagerness": "auto",
-                                "create_response": True,
-                                "interrupt_response": self.settings.barge_in_enabled,
-                            },
+                            "turn_detection": self._turn_detection_config(),
                         },
                         "output": {
                             "format": {"type": "audio/pcm", "rate": 24000},
@@ -88,9 +99,10 @@ class RealtimeConnection:
             }
         )
         logger.info(
-            "OpenAI session.update sent: voice=%s reasoning=%s vad=semantic_vad transcription=%s barge_in=%s",
+            "OpenAI session.update sent: voice=%s reasoning=%s vad=%s transcription=%s barge_in=%s",
             self.settings.voice,
             self.settings.reasoning_effort,
+            self.settings.vad_mode,
             self.settings.transcription_model,
             self.settings.barge_in_enabled,
         )
