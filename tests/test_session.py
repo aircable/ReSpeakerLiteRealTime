@@ -9,6 +9,7 @@ from gateway.protocol import FRAME_BYTES, DeviceState
 from gateway.session import (
     MAX_DEVICE_PLAYBACK_LEAD_MS,
     MAX_QUEUED_INPUT_FRAMES,
+    PLAYBACK_FRAMES_PER_SECOND,
     DeviceSession,
     OutputStream,
 )
@@ -68,12 +69,13 @@ class FakePlanner:
         return True
 
 
-def make_session(tmp_path):
+def make_session(tmp_path, **setting_overrides):
     settings = Settings(
         device_token="device-secret",
         ui_token="browser-secret",
         database_path=tmp_path / "test.db",
         idle_timeout_seconds=30,
+        **setting_overrides,
     )
     db = Database(settings.database_path)
     db.initialize()
@@ -85,6 +87,12 @@ def make_session(tmp_path):
     session.accepting_audio = True
     session.cloud_ready = True
     return session, ws
+
+
+def test_playback_queue_uses_configured_bounded_duration(tmp_path):
+    session, _ = make_session(tmp_path, playback_buffer_seconds=45)
+
+    assert session.playback_queue.maxsize == 45 * PLAYBACK_FRAMES_PER_SECOND
 
 
 async def test_frame_boundaries_are_enforced(tmp_path):

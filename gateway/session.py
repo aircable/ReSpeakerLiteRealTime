@@ -20,8 +20,8 @@ from .realtime import RealtimeConnection
 logger = logging.getLogger(__name__)
 PLAYBACK_FRAME_SECONDS = 0.020
 MAX_DEVICE_PLAYBACK_LEAD_MS = 200
-MAX_QUEUED_PLAYBACK_FRAMES = 1500
 MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
+PLAYBACK_FRAMES_PER_SECOND = round(1 / PLAYBACK_FRAME_SECONDS)
 
 
 @dataclass
@@ -65,7 +65,7 @@ class DeviceSession:
         self.output: OutputStream | None = None
         self.output_buffer = bytearray()
         self.playback_queue: asyncio.Queue[PlaybackPacket] = asyncio.Queue(
-            maxsize=MAX_QUEUED_PLAYBACK_FRAMES
+            maxsize=settings.playback_buffer_seconds * PLAYBACK_FRAMES_PER_SECOND
         )
         self.playback_task: asyncio.Task[None] | None = None
         self.playback_progress_event = asyncio.Event()
@@ -489,7 +489,10 @@ class DeviceSession:
         try:
             self.playback_queue.put_nowait(packet)
         except asyncio.QueueFull as exc:
-            raise RuntimeError("assistant playback exceeded the bounded 30-second queue") from exc
+            raise RuntimeError(
+                "assistant playback exceeded the bounded "
+                f"{self.settings.playback_buffer_seconds}-second queue"
+            ) from exc
 
     def _clear_playback_queue(self) -> None:
         while True:

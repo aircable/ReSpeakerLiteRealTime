@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     ui_token: str = Field(default="change-ui-token", min_length=8)
     database_path: Path = Path("data/companion.db")
     realtime_model: str = "gpt-realtime-2.1"
+    realtime_max_output_tokens: int = Field(default=4096, ge=1, le=4096)
     planner_model: str = "gpt-5.6-terra"
     transcription_model: str = "gpt-transcribe"
     voice: str = "marin"
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
     vad_silence_duration_ms: int = Field(default=500, ge=100, le=5000)
     idle_timeout_seconds: int = Field(default=30, ge=5, le=900)
     hard_session_limit_seconds: int = Field(default=3600, ge=60, le=7200)
+    playback_buffer_seconds: int = Field(default=120, ge=30, le=600)
     diagnostic_audio: bool = False
     openai_trace: bool = False
     barge_in_enabled: bool = False

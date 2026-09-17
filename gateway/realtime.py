@@ -73,6 +73,7 @@ class RealtimeConnection:
                 "session": {
                     "type": "realtime",
                     "instructions": self.instructions,
+                    "max_output_tokens": self.settings.realtime_max_output_tokens,
                     "output_modalities": ["audio"],
                     "reasoning": {"effort": self.settings.reasoning_effort},
                     "audio": {
@@ -99,12 +100,14 @@ class RealtimeConnection:
             }
         )
         logger.info(
-            "OpenAI session.update sent: voice=%s reasoning=%s vad=%s transcription=%s barge_in=%s",
+            "OpenAI session.update sent: voice=%s reasoning=%s vad=%s transcription=%s "
+            "barge_in=%s max_output_tokens=%d",
             self.settings.voice,
             self.settings.reasoning_effort,
             self.settings.vad_mode,
             self.settings.transcription_model,
             self.settings.barge_in_enabled,
+            self.settings.realtime_max_output_tokens,
         )
         self.reader_task = asyncio.create_task(self._reader(), name="openai-realtime-reader")
 

@@ -71,6 +71,7 @@ class ProjectUpdate(BaseModel):
 
 class GatewaySettingsUpdate(BaseModel):
     realtime_model: str | None = Field(default=None, min_length=1, max_length=100)
+    realtime_max_output_tokens: int | None = Field(default=None, ge=1, le=4096)
     planner_model: str | None = Field(default=None, min_length=1, max_length=100)
     voice: str | None = Field(default=None, min_length=1, max_length=50)
     reasoning_effort: str | None = Field(default=None, pattern="^(low|medium|high)$")
@@ -81,6 +82,7 @@ class GatewaySettingsUpdate(BaseModel):
     vad_silence_duration_ms: int | None = Field(default=None, ge=100, le=5000)
     idle_timeout_seconds: int | None = Field(default=None, ge=5, le=900)
     hard_session_limit_seconds: int | None = Field(default=None, ge=60, le=7200)
+    playback_buffer_seconds: int | None = Field(default=None, ge=30, le=600)
     diagnostic_audio: bool | None = None
     openai_trace: bool | None = None
     barge_in_enabled: bool | None = None

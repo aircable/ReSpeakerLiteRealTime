@@ -39,7 +39,10 @@ The gateway accepts device PCM into a bounded five-second queue while the billed
 connects, then forwards it in order from a separate task. This preserves speech immediately after
 the wake word and prevents OpenAI latency from backpressuring the device WebSocket. Assistant PCM
 is paced at 20 ms per frame and held to at most 200 ms ahead of device-reported DAC progress, so
-the ESP32's fixed playback queue cannot be overrun by clock drift or scheduler jitter.
+the ESP32's fixed playback queue cannot be overrun by clock drift or scheduler jitter. Generated
+audio waiting behind real-time playback uses a bounded 120-second gateway queue by default;
+`PLAYBACK_BUFFER_SECONDS` accepts 30–600 seconds. `REALTIME_MAX_OUTPUT_TOKENS` defaults to the
+Realtime API's 4096-token per-response ceiling.
 
 `IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; raw
 microphone frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye”

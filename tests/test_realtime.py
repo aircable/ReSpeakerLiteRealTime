@@ -58,6 +58,12 @@ def test_server_vad_configuration(tmp_path):
     }
 
 
+def test_realtime_output_limit_defaults_to_api_ceiling(tmp_path):
+    connection = make_connection(tmp_path)
+
+    assert connection.settings.realtime_max_output_tokens == 4096
+
+
 def test_trace_counts_audio_and_response_usage_without_logging_audio(tmp_path, caplog):
     connection = make_connection(tmp_path)
     audio = base64.b64encode(bytes(960)).decode()
