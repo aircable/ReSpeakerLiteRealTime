@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 *.swp
+*.flac
 data/
 firmware/secrets.yaml
 firmware/.esphome/

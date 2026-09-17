@@ -21,6 +21,7 @@ namespace esphome::realtime_companion {
 
 static constexpr size_t INPUT_FRAME_BYTES = 960;    // 20 ms, 24 kHz, mono, PCM16
 static constexpr size_t OUTPUT_FRAME_BYTES = 1920;  // expanded to stereo before ESPHome resampler
+static constexpr size_t CONTROL_FRAME_BYTES = 512;
 
 enum class CompanionState : uint8_t {
   IDLE,
@@ -39,6 +40,11 @@ struct InputFrame {
 struct OutputFrame {
   std::array<uint8_t, OUTPUT_FRAME_BYTES> data;
   uint16_t offset{0};
+};
+
+struct ControlFrame {
+  std::array<char, CONTROL_FRAME_BYTES> data;
+  uint16_t length{0};
 };
 
 class RealtimeCompanion : public Component {
@@ -84,9 +90,6 @@ class RealtimeCompanion : public Component {
   std::string token_;
   std::string device_id_;
   std::string stream_id_;
-  // esp_websocket_client has its own mutex, but short competing sends can time out before
-  // acquiring it. Serialize our audio and control producers before entering the client.
-  std::mutex websocket_send_mutex_;
   std::mutex playback_mutex_;
   float output_volume_{0.5f};
   static constexpr size_t RESAMPLER_INPUT_FRAMES = 256;
@@ -98,10 +101,13 @@ class RealtimeCompanion : public Component {
   std::array<int16_t, RESAMPLER_OUTPUT_FRAMES> resampler_output_{};
 
   StaticQueue_t capture_queue_struct_{};
+  StaticQueue_t control_queue_struct_{};
   StaticQueue_t playback_queue_struct_{};
   uint8_t capture_queue_storage_[6 * sizeof(InputFrame)]{};
+  uint8_t control_queue_storage_[8 * sizeof(ControlFrame)]{};
   uint8_t playback_queue_storage_[10 * sizeof(OutputFrame)]{};
   QueueHandle_t capture_queue_{nullptr};
+  QueueHandle_t control_queue_{nullptr};
   QueueHandle_t playback_queue_{nullptr};
   // ESP-IDF's Xtensa StackType_t is uint8_t, so this count is bytes, not 32-bit words.
   static constexpr uint32_t AUDIO_SENDER_STACK_BYTES = 8192;
@@ -115,6 +121,7 @@ class RealtimeCompanion : public Component {
   std::atomic<uint32_t> captured_frames_{0};
   std::atomic<uint32_t> sent_frames_{0};
   std::atomic<uint32_t> dropped_frames_{0};
+  std::atomic<uint32_t> playback_dropped_frames_{0};
   std::atomic<uint16_t> capture_peak_{0};
   std::atomic<uint32_t> played_frames_{0};
   std::atomic<bool> playback_active_{false};

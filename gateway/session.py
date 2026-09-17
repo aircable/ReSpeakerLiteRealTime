@@ -19,6 +19,7 @@ from .realtime import RealtimeConnection
 
 logger = logging.getLogger(__name__)
 PLAYBACK_FRAME_SECONDS = 0.020
+MAX_DEVICE_PLAYBACK_LEAD_MS = 200
 MAX_QUEUED_PLAYBACK_FRAMES = 1500
 MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
 
@@ -67,6 +68,7 @@ class DeviceSession:
             maxsize=MAX_QUEUED_PLAYBACK_FRAMES
         )
         self.playback_task: asyncio.Task[None] | None = None
+        self.playback_progress_event = asyncio.Event()
         self.input_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=MAX_QUEUED_INPUT_FRAMES
         )
@@ -343,6 +345,7 @@ class DeviceSession:
     async def playback_progress(self, stream_id: str, played_ms: int) -> None:
         if self.output and self.output.stream_id == stream_id:
             self.output.played_ms = min(played_ms, self.output.sent_ms)
+            self.playback_progress_event.set()
             if self.output.ended and self.output.played_ms >= self.output.sent_ms:
                 await self._complete_playback("device_progress")
 
@@ -359,6 +362,7 @@ class DeviceSession:
             with contextlib.suppress(Exception):
                 await cloud.truncate(output.item_id, output.content_index, output.played_ms)
         self.output = None
+        self.playback_progress_event.set()
         self.output_buffer.clear()
         self._clear_playback_queue()
         await self.set_state(DeviceState.LISTENING)
@@ -508,7 +512,7 @@ class DeviceSession:
         self._clear_playback_queue()
 
     async def _playback_sender(self) -> None:
-        """Pace generated audio at its 20 ms media rate instead of bursting it at the device."""
+        """Pace audio and bound how far transmission can lead physical DAC playback."""
         active_stream = ""
         next_send = 0.0
         loop = asyncio.get_running_loop()
@@ -537,6 +541,7 @@ class DeviceSession:
             delay = next_send - loop.time()
             if delay > 0:
                 await asyncio.sleep(delay)
+            await self._wait_for_playback_capacity(packet.stream_id)
             output = self.output
             if output is None or output.stream_id != packet.stream_id:
                 continue
@@ -545,6 +550,17 @@ class DeviceSession:
                 self.diagnostic_output.write(packet.data)
             output.sent_ms += 20
             next_send = max(next_send, loop.time()) + PLAYBACK_FRAME_SECONDS
+
+    async def _wait_for_playback_capacity(self, stream_id: str) -> None:
+        """Use device DAC progress as flow control for its small fixed playback queue."""
+        while True:
+            output = self.output
+            if output is None or output.stream_id != stream_id:
+                return
+            if output.sent_ms - output.played_ms < MAX_DEVICE_PLAYBACK_LEAD_MS:
+                return
+            self.playback_progress_event.clear()
+            await self.playback_progress_event.wait()
 
     async def stop(self, reason: str, notify_device: bool = True) -> None:
         if self.stopping or self.cloud is None:
@@ -569,6 +585,7 @@ class DeviceSession:
                 self.db.end_session(session_id, reason, self.usage)
             self.session_id = self.project_id = None
             self.output = None
+            self.playback_progress_event.set()
             self.output_buffer.clear()
             for recording in (self.diagnostic_input, self.diagnostic_output):
                 if recording is not None:
@@ -626,6 +643,7 @@ class DeviceSession:
             output.played_ms,
         )
         self.output = None
+        self.playback_progress_event.set()
         if not self.settings.barge_in_enabled:
             self.echo_gate_until = time.monotonic() + 0.3
         self.last_activity = time.monotonic()

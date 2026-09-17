@@ -37,7 +37,9 @@ that the hardware AEC sufficiently suppresses playback at the microphone.
 
 The gateway accepts device PCM into a bounded five-second queue while the billed OpenAI session
 connects, then forwards it in order from a separate task. This preserves speech immediately after
-the wake word and prevents OpenAI latency from backpressuring the device WebSocket.
+the wake word and prevents OpenAI latency from backpressuring the device WebSocket. Assistant PCM
+is paced at 20 ms per frame and held to at most 200 ms ahead of device-reported DAC progress, so
+the ESP32's fixed playback queue cannot be overrun by clock drift or scheduler jitter.
 
 `IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; raw
 microphone frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye”
@@ -69,8 +71,10 @@ codec, 48 kHz 32-bit stereo I²S, hardware AEC, separate wake-word channel, mute
 OTA, and ESPHome's output resampler. The formatBCE microphone fork derives a 16 kHz PCM32 stereo
 callback from the 48 kHz XMOS bus for microWakeWord. The custom component resamples AEC channel 0
 to 24 kHz with ESPHome's sinc resampler, sends fixed 20 ms PCM16 frames from a six-frame static
-FreeRTOS queue, and expands incoming mono PCM before the 24-to-48 kHz speaker resampler. Capture
-stays active during playback.
+FreeRTOS queue, and serializes audio plus fixed-size control messages through one WebSocket writer
+task. Incoming mono PCM is expanded before the 24-to-48 kHz speaker resampler, and capture stays
+active during playback. The wake phrase is **Okay Nabu**, using the pinned
+`okay_nabu_20241226.3` MicroWakeWord model on channel 1 with the proven gain of 4.
 
 The USR-to-D2 and MUTE-to-D3 rear-pad jumpers are required for the physical controls used by the
 configuration. See [PROTOCOL.md](PROTOCOL.md) for the wire contract.

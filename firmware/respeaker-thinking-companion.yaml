@@ -308,6 +308,7 @@ interval:
               break;
             case IDLE:
               call.set_rgb(0.0f, 1.0f, 0.0f);
+              call.set_brightness(0.25f);
               call.set_effect("None");
               break;
             case MUTED: break;
@@ -322,7 +323,7 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    - model: hey_jarvis
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/okay_nabu_20241226.3/okay_nabu.json
   vad:
     probability_cutoff: 0.05
   on_wake_word_detected:

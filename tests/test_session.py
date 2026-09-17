@@ -7,6 +7,7 @@ from gateway.db import Database
 from gateway.planner import Planner
 from gateway.protocol import FRAME_BYTES, DeviceState
 from gateway.session import (
+    MAX_DEVICE_PLAYBACK_LEAD_MS,
     MAX_QUEUED_INPUT_FRAMES,
     DeviceSession,
     OutputStream,
@@ -328,6 +329,20 @@ async def test_output_frames_are_paced_at_media_rate(tmp_path):
     assert elapsed >= 0.035
     assert len([value for kind, value in ws.messages if kind == "bytes"]) == 3
     await session._stop_playback_sender()
+
+
+async def test_output_flow_control_waits_for_device_playback_progress(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.output = OutputStream(
+        "stream", "response", "item", 0, sent_ms=MAX_DEVICE_PLAYBACK_LEAD_MS
+    )
+
+    waiter = asyncio.create_task(session._wait_for_playback_capacity("stream"))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    await session.playback_progress("stream", 20)
+    await waiter
 
 
 async def test_cancel_not_active_race_is_not_fatal(tmp_path):
