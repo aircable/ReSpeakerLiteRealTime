@@ -36,6 +36,9 @@ esp32:
       CONFIG_SPIRAM_RODATA: "y"
       CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      # Microphone audio and gateway control messages are transmitted while the
+      # WebSocket receive task continuously accepts playback audio.
+      CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK: "y"
 
 psram:
   mode: octal

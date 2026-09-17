@@ -110,7 +110,7 @@ void RealtimeCompanion::run_audio_sender() {
       if (this->client_ == nullptr || !esp_websocket_client_is_connected(this->client_))
         continue;
       const int sent = esp_websocket_client_send_text(this->client_, control.data.data(),
-                                                       control.length, pdMS_TO_TICKS(100));
+                                                       control.length, WEBSOCKET_SEND_TIMEOUT);
       if (sent != control.length) {
         ESP_LOGW(TAG, "Control WebSocket send failed: sent %d of %u bytes", sent,
                  static_cast<unsigned>(control.length));
@@ -128,7 +128,7 @@ void RealtimeCompanion::run_audio_sender() {
     }
     const int sent = esp_websocket_client_send_bin(
         this->client_, reinterpret_cast<const char *>(captured.data.data()), captured.data.size(),
-        pdMS_TO_TICKS(100));
+        WEBSOCKET_SEND_TIMEOUT);
     if (sent == static_cast<int>(captured.data.size())) {
       this->sent_frames_.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -147,13 +147,22 @@ void RealtimeCompanion::run_audio_sender() {
 }
 
 void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_event_data_t *event) {
-  if (event_id == WEBSOCKET_EVENT_CONNECTED) {
+  if (event_id == WEBSOCKET_EVENT_ERROR) {
+    ESP_LOGW(TAG,
+             "Gateway WebSocket error: type=%d esp_tls=%s tls_stack=%d socket_errno=%d "
+             "handshake_status=%d",
+             static_cast<int>(event->error_handle.error_type),
+             esp_err_to_name(event->error_handle.esp_tls_last_esp_err),
+             event->error_handle.esp_tls_stack_err, event->error_handle.esp_transport_sock_errno,
+             event->error_handle.esp_ws_handshake_status_code);
+  } else if (event_id == WEBSOCKET_EVENT_CONNECTED) {
     ESP_LOGI(TAG, "Gateway WebSocket connected; authentication pending");
     xQueueReset(this->control_queue_);
     this->authenticated_ = false;
     this->auth_pending_.store(true, std::memory_order_release);
   } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
-    ESP_LOGW(TAG, "Gateway WebSocket disconnected; pausing microphone transport");
+    ESP_LOGW(TAG, "Gateway WebSocket disconnected; close_status=%d; pausing microphone transport",
+             event->close_status_code);
     this->authenticated_ = false;
     this->stream_ready_.store(false, std::memory_order_release);
     this->auth_pending_.store(false, std::memory_order_release);

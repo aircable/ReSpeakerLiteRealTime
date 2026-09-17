@@ -22,6 +22,9 @@ namespace esphome::realtime_companion {
 static constexpr size_t INPUT_FRAME_BYTES = 960;    // 20 ms, 24 kHz, mono, PCM16
 static constexpr size_t OUTPUT_FRAME_BYTES = 1920;  // expanded to stereo before ESPHome resampler
 static constexpr size_t CONTROL_FRAME_BYTES = 512;
+// A short Wi-Fi/TCP backpressure interval must not make esp_websocket_client abort the connection.
+// This is a network-write timeout, not an audio pacing delay; the sender remains queue-driven.
+static constexpr TickType_t WEBSOCKET_SEND_TIMEOUT = pdMS_TO_TICKS(1000);
 
 enum class CompanionState : uint8_t {
   IDLE,
