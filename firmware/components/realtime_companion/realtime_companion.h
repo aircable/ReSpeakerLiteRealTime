@@ -83,6 +83,7 @@ class RealtimeCompanion : public Component {
   void handle_text(const char *data, size_t length);
   void connect();
   bool send_json(const std::string &json);
+  bool send_playback_progress(const std::string &json);
   void flush_playback();
   void update_state(CompanionState state);
 
@@ -105,12 +106,15 @@ class RealtimeCompanion : public Component {
 
   StaticQueue_t capture_queue_struct_{};
   StaticQueue_t control_queue_struct_{};
+  StaticQueue_t progress_queue_struct_{};
   StaticQueue_t playback_queue_struct_{};
   uint8_t capture_queue_storage_[6 * sizeof(InputFrame)]{};
   uint8_t control_queue_storage_[8 * sizeof(ControlFrame)]{};
+  uint8_t progress_queue_storage_[sizeof(ControlFrame)]{};
   uint8_t playback_queue_storage_[10 * sizeof(OutputFrame)]{};
   QueueHandle_t capture_queue_{nullptr};
   QueueHandle_t control_queue_{nullptr};
+  QueueHandle_t progress_queue_{nullptr};
   QueueHandle_t playback_queue_{nullptr};
   // ESP-IDF's Xtensa StackType_t is uint8_t, so this count is bytes, not 32-bit words.
   static constexpr uint32_t AUDIO_SENDER_STACK_BYTES = 8192;
