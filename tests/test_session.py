@@ -35,6 +35,8 @@ class FakeCloud:
         self.cancelled = 0
         self.truncations = []
         self.closed = False
+        self.tool_outputs = []
+        self.response_requests = []
 
     async def append_audio(self, pcm):
         self.audio.append(pcm)
@@ -47,6 +49,12 @@ class FakeCloud:
 
     async def close(self):
         self.closed = True
+
+    async def submit_tool_output(self, call_id, output):
+        self.tool_outputs.append((call_id, output))
+
+    async def request_response(self, instructions=None):
+        self.response_requests.append(instructions)
 
 
 class FakeRealtime(FakeCloud):
@@ -380,6 +388,71 @@ async def test_cancel_not_active_race_is_not_fatal(tmp_path):
         }
     )
     assert session.state == DeviceState.SPEAKING
+
+
+async def test_list_projects_tool_returns_names_and_active_project(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.db.create_project("Second project")
+
+    await session.handle_openai_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "list_projects",
+            "call_id": "call-1",
+            "arguments": "{}",
+        }
+    )
+
+    call_id, output = session.cloud.tool_outputs[0]
+    assert call_id == "call-1"
+    assert output["active_project"] == "First project"
+    assert set(output["projects"]) == {"First project", "Second project"}
+    assert session.cloud.response_requests == [None]
+
+
+async def test_switch_project_opens_clean_context_on_same_device_socket(
+    tmp_path, monkeypatch
+):
+    session, ws = make_session(tmp_path)
+    planner = FakePlanner()
+    session.planner = planner
+    old_cloud = session.cloud
+    old_session_id = session.session_id
+    old_project_id = session.project_id
+    second = session.db.create_project("Second project", "A separate goal")
+    monkeypatch.setattr("gateway.session.RealtimeConnection", FakeRealtime)
+
+    await session.handle_openai_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "switch_project",
+            "call_id": "call-2",
+            "arguments": '{"project_name":"second project"}',
+        }
+    )
+    await asyncio.sleep(0)
+
+    assert old_cloud.closed
+    assert session.db.get_project()["id"] == second["id"]
+    assert session.project_id == second["id"]
+    assert session.session_id != old_session_id
+    assert "Project: Second project" in session.cloud.instructions
+    assert session.cloud.response_requests[0].startswith("Briefly say: Active project")
+    assert planner.updates == [(old_project_id, old_session_id)]
+    assert any(
+        kind == "json" and value["type"] == "session.started"
+        and value["project_id"] == second["id"]
+        for kind, value in ws.messages
+    )
+    with session.db.connect() as connection:
+        old = connection.execute(
+            "SELECT end_reason FROM sessions WHERE id=?", (old_session_id,)
+        ).fetchone()
+    assert old["end_reason"] == "project_switch"
+    session.timer_task.cancel()
+    await asyncio.gather(session.timer_task, return_exceptions=True)
+    await session._stop_input_sender()
+    await session._stop_playback_sender()
 
 
 async def test_disconnect_cleanup_does_not_write_closed_device(tmp_path):

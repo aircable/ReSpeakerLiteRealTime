@@ -93,7 +93,29 @@ class RealtimeConnection:
                             "name": "end_session",
                             "description": "End the device voice session after an explicit request such as go to sleep, stop, goodbye, good night, end session, or that's all.",
                             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-                        }
+                        },
+                        {
+                            "type": "function",
+                            "name": "list_projects",
+                            "description": "List the user's available projects and identify the active project.",
+                            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                        },
+                        {
+                            "type": "function",
+                            "name": "switch_project",
+                            "description": "Switch the active project when the user explicitly asks to work on another project.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "project_name": {
+                                        "type": "string",
+                                        "description": "The project name as spoken by the user.",
+                                    }
+                                },
+                                "required": ["project_name"],
+                                "additionalProperties": False,
+                            },
+                        },
                     ],
                     "tool_choice": "auto",
                 },
@@ -137,6 +159,24 @@ class RealtimeConnection:
 
     async def cancel_response(self) -> None:
         await self.send({"type": "response.cancel"})
+
+    async def submit_tool_output(self, call_id: str, output: dict[str, Any]) -> None:
+        await self.send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps(output),
+                },
+            }
+        )
+
+    async def request_response(self, instructions: str | None = None) -> None:
+        response: dict[str, Any] = {"output_modalities": ["audio"]}
+        if instructions is not None:
+            response.update(instructions=instructions, tool_choice="none")
+        await self.send({"type": "response.create", "response": response})
 
     async def truncate(self, item_id: str, content_index: int, played_ms: int) -> None:
         await self.send(

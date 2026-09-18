@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import time
 import uuid
@@ -233,6 +234,8 @@ class DeviceSession:
         await self.set_state(DeviceState.LISTENING)
         await self.send_json("session.started", session_id=self.session_id, project_id=self.project_id)
         logger.info("Session ready for device audio device=%s session=%s", self.device_id, self.session_id)
+        if self.settings.announce_active_project:
+            await self._announce_project(project["name"])
 
     async def receive_audio(self, pcm: bytes) -> None:
         if len(pcm) != FRAME_BYTES:
@@ -441,12 +444,169 @@ class DeviceSession:
             if self.output is None:
                 await self.set_state(DeviceState.LISTENING)
             return
-        if kind == "response.function_call_arguments.done" and event.get("name") == "end_session":
-            await self.stop("spoken_stop")
+        if kind == "response.function_call_arguments.done":
+            await self._handle_tool_call(event)
             return
         if kind in {"error", "gateway.transport_error"}:
             await self.send_json("error", code="openai", detail=event.get("error", event))
             await self.set_state(DeviceState.ERROR)
+
+    async def _handle_tool_call(self, event: dict[str, Any]) -> None:
+        name = event.get("name")
+        if name == "end_session":
+            await self.stop("spoken_stop")
+            return
+        cloud = self.cloud
+        call_id = event.get("call_id")
+        if cloud is None or not call_id:
+            return
+        if name == "list_projects":
+            projects = self.db.list_projects()
+            await cloud.submit_tool_output(
+                call_id,
+                {
+                    "active_project": next(
+                        (project["name"] for project in projects if project["active"]), None
+                    ),
+                    "projects": [project["name"] for project in projects],
+                },
+            )
+            await cloud.request_response()
+            return
+        if name != "switch_project":
+            return
+        try:
+            arguments = json.loads(event.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            arguments = {}
+        requested_name = str(arguments.get("project_name") or "").strip()
+        project = self.db.find_project(requested_name)
+        if project is None:
+            await cloud.submit_tool_output(
+                call_id,
+                {
+                    "ok": False,
+                    "error": "No unique project matched that name.",
+                    "projects": [p["name"] for p in self.db.list_projects()],
+                },
+            )
+            await cloud.request_response()
+            return
+        if project["id"] == self.project_id:
+            self.db.activate_project(project["id"])
+            await cloud.submit_tool_output(
+                call_id, {"ok": True, "active_project": project["name"], "already_active": True}
+            )
+            await cloud.request_response()
+            return
+        await self._switch_project(project)
+
+    async def _announce_project(self, project_name: str) -> None:
+        cloud = self.cloud
+        if cloud is not None:
+            await cloud.request_response(
+                f"Briefly say: Active project: {project_name}. Then ask what the user wants to work on."
+            )
+
+    def _open_switched_session_recordings(self) -> None:
+        if not self.settings.diagnostic_audio or self.session_id is None:
+            return
+        diagnostic_dir = self.settings.database_path.parent / "diagnostic-audio"
+        input_path = diagnostic_dir / f"session-{self.session_id}-input.pcm"
+        output_path = diagnostic_dir / f"session-{self.session_id}-output.pcm"
+        try:
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            self.diagnostic_input = input_path.open("wb")
+            self.diagnostic_output = output_path.open("wb")
+            logger.info(
+                "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s",
+                self.device_id,
+                self.session_id,
+                input_path,
+                output_path,
+            )
+        except OSError:
+            logger.exception(
+                "Diagnostic audio recording unavailable device=%s session=%s directory=%s",
+                self.device_id,
+                self.session_id,
+                diagnostic_dir,
+            )
+            self.diagnostic_input = self.diagnostic_output = None
+
+    async def _switch_project(self, project: dict[str, Any]) -> None:
+        """Open a clean cloud and transcript context without dropping the device socket."""
+        old_cloud = self.cloud
+        old_session_id, old_project_id = self.session_id, self.project_id
+        logger.info(
+            "Switching project device=%s from_project=%s to_project=%s",
+            self.device_id,
+            old_project_id,
+            project["id"],
+        )
+        self.accepting_audio = False
+        self.cloud_ready = False
+        await self.set_state(DeviceState.CONNECTING)
+        if self.timer_task is not None and self.timer_task is not asyncio.current_task():
+            self.timer_task.cancel()
+            await asyncio.gather(self.timer_task, return_exceptions=True)
+            self.timer_task = None
+        await self._stop_input_sender()
+        if self.output is not None:
+            with contextlib.suppress(WebSocketDisconnect, RuntimeError):
+                await self.send_json("playback.flush", stream_id=self.output.stream_id)
+        await self._stop_playback_sender()
+        self.output = None
+        self.output_buffer.clear()
+        self.playback_progress_event.set()
+        self.cloud = None
+        if old_cloud is not None:
+            await old_cloud.close()
+        if old_session_id is not None:
+            self.db.end_session(old_session_id, "project_switch", self.usage)
+        if old_session_id is not None and old_project_id is not None:
+            asyncio.create_task(self.planner.update_after_session(old_project_id, old_session_id))
+        for recording in (self.diagnostic_input, self.diagnostic_output):
+            if recording is not None:
+                recording.close()
+        self.diagnostic_input = self.diagnostic_output = None
+        self.db.activate_project(project["id"])
+        self.project_id = project["id"]
+        self.session_id = self.db.start_session(
+            self.project_id, self.device_id, self.settings.realtime_model
+        )
+        self.usage = {}
+        self.assistant_text = ""
+        self.cancelled_response_ids.clear()
+        self._open_switched_session_recordings()
+        context = build_instructions(project, self.db.recent_turns(self.project_id, 12))
+        self.cloud = RealtimeConnection(self.settings, context, self.handle_openai_event)
+        try:
+            await self.cloud.connect()
+        except Exception:
+            self.db.end_session(self.session_id, "connect_error", {})
+            self.cloud = None
+            await self.set_state(DeviceState.ERROR)
+            raise
+        self.started_monotonic = self.last_activity = time.monotonic()
+        self.accepting_audio = True
+        self.cloud_ready = True
+        self._start_input_sender()
+        self._start_playback_sender()
+        self.timer_task = asyncio.create_task(
+            self._watch_timeouts(), name=f"session-timer-{self.device_id}"
+        )
+        await self.set_state(DeviceState.LISTENING)
+        await self.send_json(
+            "session.started", session_id=self.session_id, project_id=self.project_id
+        )
+        logger.info(
+            "Project switch complete device=%s session=%s project=%s",
+            self.device_id,
+            self.session_id,
+            self.project_id,
+        )
+        await self._announce_project(project["name"])
 
     async def _audio_delta(self, event: dict[str, Any]) -> None:
         response_id = event.get("response_id", "unknown-response")

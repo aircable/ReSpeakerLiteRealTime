@@ -56,6 +56,12 @@ audio-duration counters, first-audio latency, response status, token usage, and 
 calls. Trace logging omits API keys, raw/base64 audio, instructions, and transcript text. UI changes
 apply on the next voice session.
 
+`ANNOUNCE_ACTIVE_PROJECT` defaults to `true` and can also be changed with **announce active
+project** in the web UI. On wake, the assistant names the active project before asking what to work
+on. “What projects do I have?” lists projects, and “Switch to PROJECT NAME” activates a project.
+A switch closes the old project context and opens a clean Realtime and database session on the
+same device connection, so transcripts and durable project memory remain separated.
+
 Home Assistant OS normally manages containers as Apps (formerly add-ons). Running this command
 directly requires host-level SSH access and is not managed by Supervisor; packaging the image as a
 Home Assistant App is the supported long-term HAOS installation path.

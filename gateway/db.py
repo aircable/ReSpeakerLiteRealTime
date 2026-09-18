@@ -140,6 +140,16 @@ class Database:
             conn.execute("UPDATE projects SET active=0 WHERE active=1")
             conn.execute("UPDATE projects SET active=1, updated_at=? WHERE id=?", (now(), project_id))
 
+    def find_project(self, name: str) -> dict[str, Any] | None:
+        """Resolve a spoken project name without silently choosing an ambiguous match."""
+        requested = " ".join(name.casefold().split())
+        projects = self.list_projects()
+        exact = [p for p in projects if " ".join(p["name"].casefold().split()) == requested]
+        if len(exact) == 1:
+            return exact[0]
+        partial = [p for p in projects if requested and requested in p["name"].casefold()]
+        return partial[0] if len(partial) == 1 else None
+
     def start_session(self, project_id: int, device_id: str, model: str) -> int:
         with self.connect() as conn:
             cursor = conn.execute(

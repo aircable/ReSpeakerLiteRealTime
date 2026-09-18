@@ -35,3 +35,12 @@ def test_only_one_project_can_be_active(tmp_path):
     assert db.get_project()["id"] == second["id"]
     assert sum(project["active"] for project in db.list_projects()) == 1
 
+
+def test_find_project_accepts_case_insensitive_unique_spoken_match(tmp_path):
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    second = db.create_project("Garden Irrigation")
+
+    assert db.find_project("  GARDEN irrigation  ")["id"] == second["id"]
+    assert db.find_project("Irrigation")["id"] == second["id"]
+    assert db.find_project("missing") is None

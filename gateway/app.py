@@ -86,6 +86,7 @@ class GatewaySettingsUpdate(BaseModel):
     diagnostic_audio: bool | None = None
     openai_trace: bool | None = None
     barge_in_enabled: bool | None = None
+    announce_active_project: bool | None = None
     transcript_retention_days: int | None = Field(default=None, ge=0, le=3650)
 
 

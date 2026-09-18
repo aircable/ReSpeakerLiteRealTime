@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     diagnostic_audio: bool = False
     openai_trace: bool = False
     barge_in_enabled: bool = False
+    announce_active_project: bool = True
     transcript_retention_days: int = Field(default=0, ge=0, le=3650)
 
 
