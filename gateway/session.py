@@ -515,7 +515,10 @@ class DeviceSession:
         self._clear_playback_queue()
 
     async def _playback_sender(self) -> None:
-        """Maintain a bounded jitter window ahead of physical DAC playback."""
+        """Pace audio and bound how far transmission can lead physical DAC playback."""
+        active_stream = ""
+        next_send = 0.0
+        loop = asyncio.get_running_loop()
         while True:
             packet = await self.playback_queue.get()
             output = self.output
@@ -526,7 +529,7 @@ class DeviceSession:
                     "playback.end", stream_id=output.stream_id, duration_ms=output.sent_ms
                 )
                 output.ended = True
-                output.ended_monotonic = time.monotonic()
+                output.ended_monotonic = loop.time()
                 logger.info(
                     "Assistant playback sent device=%s stream=%s duration_ms=%d played_ms=%d",
                     self.device_id,
@@ -535,6 +538,12 @@ class DeviceSession:
                     output.played_ms,
                 )
                 continue
+            if active_stream != packet.stream_id:
+                active_stream = packet.stream_id
+                next_send = loop.time()
+            delay = next_send - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
             await self._wait_for_playback_capacity(packet.stream_id)
             output = self.output
             if output is None or output.stream_id != packet.stream_id:
@@ -543,6 +552,7 @@ class DeviceSession:
             if self.diagnostic_output is not None:
                 self.diagnostic_output.write(packet.data)
             output.sent_ms += 20
+            next_send = max(next_send, loop.time()) + PLAYBACK_FRAME_SECONDS
 
     async def _wait_for_playback_capacity(self, stream_id: str) -> None:
         """Use device DAC progress as flow control for its small fixed playback queue."""

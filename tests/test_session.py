@@ -319,10 +319,11 @@ async def test_stalled_playback_completion_recovers_listening_state(tmp_path):
     assert ws.messages[-1][1]["state"] == "listening"
 
 
-async def test_output_sender_fills_jitter_window_then_waits_for_dac_progress(tmp_path):
+async def test_output_frames_are_paced_at_media_rate(tmp_path):
     session, ws = make_session(tmp_path)
     session._start_playback_sender()
-    audio = bytes(FRAME_BYTES * 15)
+    audio = bytes(FRAME_BYTES * 3)
+    started = asyncio.get_running_loop().time()
     await session.handle_openai_event(
         {
             "type": "response.output_audio.delta",
@@ -332,14 +333,10 @@ async def test_output_sender_fills_jitter_window_then_waits_for_dac_progress(tmp
             "delta": base64.b64encode(audio).decode(),
         }
     )
-    await wait_for(lambda: session.output.sent_ms == MAX_DEVICE_PLAYBACK_LEAD_MS)
-    await asyncio.sleep(0.03)
-    assert session.output.sent_ms == MAX_DEVICE_PLAYBACK_LEAD_MS
-    assert len([value for kind, value in ws.messages if kind == "bytes"]) == 10
-
-    await session.playback_progress(session.output.stream_id, 100)
-    await wait_for(lambda: session.output.sent_ms == 300)
-    assert len([value for kind, value in ws.messages if kind == "bytes"]) == 15
+    await wait_for(lambda: session.output.sent_ms == 60)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed >= 0.035
+    assert len([value for kind, value in ws.messages if kind == "bytes"]) == 3
     await session._stop_playback_sender()
 
 
