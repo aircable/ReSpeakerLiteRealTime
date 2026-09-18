@@ -72,6 +72,13 @@ void RealtimeCompanion::connect() {
   config.network_timeout_ms = 5000;
   config.reconnect_timeout_ms = 2000;
   config.disable_auto_reconnect = false;
+  // Docker/Uvicorn normally performs a clean WebSocket close during a gateway update. ESP-IDF
+  // does not reconnect after a clean close unless this is explicitly enabled.
+  config.enable_close_reconnect = true;
+  // Detect a silently replaced or stale NAT connection while idle, before the wake word needs it.
+  config.ping_interval_sec = 5;
+  config.pingpong_timeout_sec = 10;
+  config.disable_pingpong_discon = false;
   config.task_stack = 8192;
   config.buffer_size = 2048;
   this->client_ = esp_websocket_client_init(&config);
