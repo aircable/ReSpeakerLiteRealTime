@@ -467,7 +467,11 @@ async def test_switch_project_opens_clean_context_on_same_device_socket(
     assert session.project_id == second["id"]
     assert session.session_id != old_session_id
     assert "Project: Second project" in session.cloud.instructions
-    assert session.cloud.response_requests[0].startswith("Briefly say: Active project")
+    announcement = session.cloud.response_requests[0]
+    assert announcement == (
+        "Say only: Second project is active. Then stop speaking and wait. "
+        "Do not ask a question or suggest activities."
+    )
     assert planner.updates == [(old_project_id, old_session_id)]
     assert any(
         kind == "json" and value["type"] == "session.started"

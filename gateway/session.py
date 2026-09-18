@@ -559,7 +559,8 @@ class DeviceSession:
         cloud = self.cloud
         if cloud is not None:
             await cloud.request_response(
-                f"Briefly say: Active project: {project_name}. Then ask what the user wants to work on."
+                f"Say only: {project_name} is active. Then stop speaking and wait. "
+                "Do not ask a question or suggest activities."
             )
 
     def _open_switched_session_recordings(self) -> None:
