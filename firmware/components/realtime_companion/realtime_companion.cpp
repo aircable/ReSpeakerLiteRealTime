@@ -3,6 +3,7 @@
 #include "esphome/components/audio/audio.h"
 #include "esphome/components/network/util.h"
 #include "esphome/core/log.h"
+#include "esphome/core/helpers.h"
 
 #include <cJSON.h>
 #include <esp_timer.h>
@@ -16,6 +17,13 @@ static const char *const TAG = "realtime_companion";
 
 void RealtimeCompanion::setup() {
   ESP_LOGI(TAG, "Initializing transport; WebSocket will wait for network readiness");
+  this->volume_preference_ = global_preferences->make_preference<float>(
+      fnv1_hash("realtime_companion_output_volume"));
+  float saved_volume;
+  if (this->volume_preference_.load(&saved_volume) && saved_volume >= 0.0f && saved_volume <= 1.0f) {
+    this->output_volume_ = saved_volume;
+    ESP_LOGI(TAG, "Restored assistant output volume: %.0f%%", this->output_volume_ * 100.0f);
+  }
   this->capture_queue_ = xQueueCreateStatic(6, sizeof(InputFrame), this->capture_queue_storage_,
                                              &this->capture_queue_struct_);
   this->control_queue_ = xQueueCreateStatic(8, sizeof(ControlFrame), this->control_queue_storage_,
@@ -222,6 +230,7 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     this->authenticated_once_ = true;
     if (this->session_active_)
       this->session_start_pending_.store(true, std::memory_order_release);
+    this->report_volume();
   } else if (strcmp(kind, "session.started") == 0) {
     ESP_LOGI(TAG, "Gateway session started; microphone audio transport active");
     this->stream_ready_.store(true, std::memory_order_release);
@@ -261,6 +270,10 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     this->playback_end_received_.store(true, std::memory_order_release);
   } else if (strcmp(kind, "playback.flush") == 0) {
     this->flush_playback();
+  } else if (strcmp(kind, "volume.set") == 0) {
+    cJSON *level = cJSON_GetObjectItemCaseSensitive(root, "level");
+    if (cJSON_IsNumber(level))
+      this->set_runtime_volume(static_cast<float>(level->valuedouble), true);
   }
   cJSON_Delete(root);
 }
@@ -339,7 +352,8 @@ void RealtimeCompanion::loop() {
   if (this->auth_pending_.load(std::memory_order_acquire)) {
     const std::string auth = "{\"v\":1,\"type\":\"auth\",\"token\":\"" + this->token_ +
                              "\",\"device_id\":\"" + this->device_id_ +
-                             "\",\"capabilities\":{\"aec\":true,\"frame_ms\":20}}";
+                             "\",\"capabilities\":{\"aec\":true,\"frame_ms\":20,"
+                             "\"runtime_volume\":true}}";
     if (this->send_json(auth))
       this->auth_pending_.store(false, std::memory_order_release);
   }
@@ -529,6 +543,20 @@ bool RealtimeCompanion::send_playback_progress(const std::string &json) {
 }
 
 bool RealtimeCompanion::is_network_ready() const { return network::is_connected(); }
+
+void RealtimeCompanion::set_runtime_volume(float volume, bool persist) {
+  const float bounded = std::max(0.0f, std::min(1.0f, volume));
+  this->output_volume_ = bounded;
+  if (persist && !this->volume_preference_.save(&this->output_volume_))
+    ESP_LOGW(TAG, "Could not persist assistant output volume");
+  ESP_LOGI(TAG, "Assistant output volume set to %.0f%%", this->output_volume_ * 100.0f);
+  this->report_volume();
+}
+
+void RealtimeCompanion::report_volume() {
+  this->send_json("{\"v\":1,\"type\":\"volume.changed\",\"level\":" +
+                  std::to_string(this->output_volume_) + "}");
+}
 
 void RealtimeCompanion::update_state(CompanionState state) {
   this->state_.store(state, std::memory_order_release);

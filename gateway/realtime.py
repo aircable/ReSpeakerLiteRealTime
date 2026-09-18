@@ -116,6 +116,34 @@ class RealtimeConnection:
                                 "additionalProperties": False,
                             },
                         },
+                        {
+                            "type": "function",
+                            "name": "control_volume",
+                            "description": "Read or change the ReSpeaker playback volume. Use set for an exact percentage, or increase/decrease for relative requests such as louder or quieter.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["get", "set", "increase", "decrease"],
+                                    },
+                                    "level_percent": {
+                                        "type": "number",
+                                        "minimum": 0,
+                                        "maximum": 100,
+                                        "description": "Exact output level for the set action.",
+                                    },
+                                    "change_percent": {
+                                        "type": "number",
+                                        "minimum": 1,
+                                        "maximum": 25,
+                                        "description": "Optional relative change; defaults to 5 percentage points.",
+                                    },
+                                },
+                                "required": ["action"],
+                                "additionalProperties": False,
+                            },
+                        },
                     ],
                     "tool_choice": "auto",
                 },

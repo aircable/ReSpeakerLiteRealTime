@@ -21,6 +21,7 @@ from .protocol import (
     SessionStart,
     SessionStop,
     StateReport,
+    VolumeChanged,
     parse_device_message,
     server_message,
 )
@@ -53,6 +54,7 @@ class LiveHub:
 
 
 live_hub = LiveHub()
+device_sessions: dict[str, DeviceSession] = {}
 
 
 class ProjectCreate(BaseModel):
@@ -88,6 +90,10 @@ class GatewaySettingsUpdate(BaseModel):
     barge_in_enabled: bool | None = None
     announce_active_project: bool | None = None
     transcript_retention_days: int | None = Field(default=None, ge=0, le=3650)
+
+
+class DeviceVolumeUpdate(BaseModel):
+    level_percent: float = Field(ge=0.0, le=100.0)
 
 
 async def settings_dependency() -> Settings:
@@ -160,6 +166,28 @@ async def update_gateway_settings(
     return {"saved": True}
 
 
+@app.get("/api/devices", dependencies=[Depends(require_ui_token)])
+async def connected_devices() -> list[dict[str, Any]]:
+    return [
+        {
+            "device_id": session.device_id,
+            "state": session.state.value,
+            "volume_percent": (
+                round(session.device_volume * 100) if session.device_volume is not None else None
+            ),
+        }
+        for session in device_sessions.values()
+    ]
+
+
+@app.patch("/api/devices/{device_id}/volume", dependencies=[Depends(require_ui_token)])
+async def update_device_volume(device_id: str, body: DeviceVolumeUpdate) -> dict[str, Any]:
+    session = device_sessions.get(device_id)
+    if session is None:
+        raise HTTPException(404, "device is not connected")
+    return await session.control_volume("set", body.level_percent)
+
+
 @app.post("/api/projects", dependencies=[Depends(require_ui_token)])
 async def create_project(
     body: ProjectCreate, db: Annotated[Database, Depends(database)]
@@ -230,6 +258,7 @@ async def device_socket(websocket: WebSocket) -> None:
         session = DeviceSession(
             websocket, auth.device_id, effective_settings, db, planner, live_hub.publish
         )
+        device_sessions[auth.device_id] = session
         logger.info("Device authenticated device=%s", auth.device_id)
         await session.send_json(
             "auth.ok",
@@ -260,6 +289,8 @@ async def device_socket(websocket: WebSocket) -> None:
                 await session.set_state(message.state)
             elif isinstance(message, Heartbeat):
                 await session.send_json("heartbeat.ack", monotonic_ms=message.monotonic_ms)
+            elif isinstance(message, VolumeChanged):
+                await session.report_volume(message.level)
     except WebSocketDisconnect as exc:
         logger.warning(
             "Device WebSocket disconnected device=%s code=%s reason=%s",
@@ -282,6 +313,8 @@ async def device_socket(websocket: WebSocket) -> None:
     finally:
         if session is not None:
             logger.info("Device WebSocket closing device=%s", session.device_id)
+            if device_sessions.get(session.device_id) is session:
+                device_sessions.pop(session.device_id, None)
             await session.close()
 
 

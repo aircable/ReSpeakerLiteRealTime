@@ -98,6 +98,7 @@ class DeviceSession:
         self.echo_gate_active = False
         self.echo_gate_until = 0.0
         self.echo_suppressed_frames = 0
+        self.device_volume: float | None = None
 
     async def send_json(self, message_type: str, **payload: Any) -> None:
         message = server_message(message_type, **{"device_id": self.device_id, **payload})
@@ -112,6 +113,46 @@ class DeviceSession:
             await self.observer(
                 server_message(message_type, **{"device_id": self.device_id, **payload})
             )
+
+    async def report_volume(self, level: float) -> None:
+        self.device_volume = max(0.0, min(1.0, level))
+        await self.publish_json(
+            "volume.changed",
+            level=self.device_volume,
+            level_percent=round(self.device_volume * 100),
+        )
+
+    async def control_volume(
+        self,
+        action: str,
+        level_percent: float | None = None,
+        change_percent: float | None = None,
+    ) -> dict[str, Any]:
+        if self.device_volume is None:
+            return {"ok": False, "error": "The device has not reported its volume yet."}
+        current_percent = self.device_volume * 100.0
+        if action == "get":
+            target_percent = current_percent
+        elif action == "set":
+            if level_percent is None:
+                return {"ok": False, "error": "An exact percentage is required."}
+            target_percent = level_percent
+        elif action in {"increase", "decrease"}:
+            step = 5.0 if change_percent is None else change_percent
+            target_percent = current_percent + (step if action == "increase" else -step)
+        else:
+            return {"ok": False, "error": "Unknown volume action."}
+        target_percent = max(0.0, min(100.0, target_percent))
+        if action != "get":
+            self.device_volume = target_percent / 100.0
+            await self.send_json("volume.set", level=self.device_volume)
+            logger.info(
+                "Device volume requested device=%s level=%.1f%% source=%s",
+                self.device_id,
+                target_percent,
+                action,
+            )
+        return {"ok": True, "level_percent": round(target_percent)}
 
     async def send_optional(
         self, message_type: str, notify_device: bool, **payload: Any
@@ -471,6 +512,19 @@ class DeviceSession:
                     "projects": [project["name"] for project in projects],
                 },
             )
+            await cloud.request_response()
+            return
+        if name == "control_volume":
+            try:
+                arguments = json.loads(event.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            result = await self.control_volume(
+                str(arguments.get("action") or ""),
+                arguments.get("level_percent"),
+                arguments.get("change_percent"),
+            )
+            await cloud.submit_tool_output(call_id, result)
             await cloud.request_response()
             return
         if name != "switch_project":

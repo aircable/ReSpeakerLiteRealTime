@@ -89,6 +89,11 @@ active during playback. The wake phrase is **Okay Nabu**, using the pinned
 The USR-to-D2 and MUTE-to-D3 rear-pad jumpers are required for the physical controls used by the
 configuration. See [PROTOCOL.md](PROTOCOL.md) for the wire contract.
 
+`output_volume` in the firmware YAML is the first-boot default. After flashing, the connected
+device volume can be changed with the Live device slider or by saying, for example, “set volume
+to 20 percent,” “a little louder,” or “quieter.” Runtime changes are stored on the ESP32 and
+survive gateway reconnects and device reboots.
+
 ## Development
 
 ```sh

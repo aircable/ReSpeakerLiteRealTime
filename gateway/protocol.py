@@ -58,6 +58,11 @@ class Heartbeat(Envelope):
     monotonic_ms: int = Field(ge=0)
 
 
+class VolumeChanged(Envelope):
+    type: Literal["volume.changed"] = "volume.changed"
+    level: float = Field(ge=0.0, le=1.0)
+
+
 def parse_device_message(data: dict[str, Any]) -> Envelope:
     message_type = data.get("type")
     models: dict[str, type[Envelope]] = {
@@ -67,6 +72,7 @@ def parse_device_message(data: dict[str, Any]) -> Envelope:
         "playback.progress": PlaybackProgress,
         "state": StateReport,
         "heartbeat": Heartbeat,
+        "volume.changed": VolumeChanged,
     }
     model = models.get(message_type)
     if model is None:
@@ -76,4 +82,3 @@ def parse_device_message(data: dict[str, Any]) -> Envelope:
 
 def server_message(message_type: str, **payload: Any) -> dict[str, Any]:
     return {"v": PROTOCOL_VERSION, "type": message_type, **payload}
-

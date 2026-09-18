@@ -1,6 +1,6 @@
 [project]
 name = "respeaker-thinking-companion"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local OpenAI Realtime gateway for a ReSpeaker Lite thinking companion"
 requires-python = ">=3.12"
 dependencies = [

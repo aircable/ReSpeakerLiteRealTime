@@ -114,6 +114,36 @@ async def test_frame_boundaries_are_enforced(tmp_path):
     await session._stop_input_sender()
 
 
+async def test_runtime_volume_is_reported_and_controlled(tmp_path):
+    session, ws = make_session(tmp_path)
+    await session.report_volume(0.125)
+
+    result = await session.control_volume("increase")
+
+    assert result == {"ok": True, "level_percent": 18}
+    assert session.device_volume == 0.175
+    assert ws.messages[-1][1]["type"] == "volume.set"
+    assert ws.messages[-1][1]["level"] == 0.175
+
+
+async def test_voice_volume_tool_returns_result_to_realtime(tmp_path):
+    session, _ = make_session(tmp_path)
+    await session.report_volume(0.2)
+    cloud = session.cloud
+
+    await session._handle_tool_call(
+        {
+            "name": "control_volume",
+            "call_id": "volume-call",
+            "arguments": '{"action":"set","level_percent":30}',
+        }
+    )
+
+    assert cloud.tool_outputs == [("volume-call", {"ok": True, "level_percent": 30})]
+    assert cloud.response_requests == [None]
+    assert session.device_volume == 0.3
+
+
 async def test_silent_audio_transport_does_not_reset_idle_timer(tmp_path):
     session, _ = make_session(tmp_path)
     previous_activity = session.last_activity

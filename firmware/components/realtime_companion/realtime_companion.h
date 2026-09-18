@@ -3,6 +3,7 @@
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
 #include "esphome/core/component.h"
+#include "esphome/core/preferences.h"
 
 #include <esp_websocket_client.h>
 #include <resampler.h>
@@ -86,6 +87,8 @@ class RealtimeCompanion : public Component {
   bool send_playback_progress(const std::string &json);
   void flush_playback();
   void update_state(CompanionState state);
+  void set_runtime_volume(float volume, bool persist);
+  void report_volume();
 
   microphone::Microphone *microphone_{nullptr};
   speaker::Speaker *speaker_{nullptr};
@@ -96,6 +99,7 @@ class RealtimeCompanion : public Component {
   std::string stream_id_;
   std::mutex playback_mutex_;
   float output_volume_{0.5f};
+  ESPPreferenceObject volume_preference_;
   static constexpr size_t RESAMPLER_INPUT_FRAMES = 256;
   static constexpr size_t RESAMPLER_OUTPUT_FRAMES = 384;
   static constexpr UBaseType_t PLAYBACK_PREBUFFER_FRAMES = 6;

@@ -8,7 +8,8 @@ Do not pretend an action was completed. When the user says "go to sleep", stop, 
 session, good night, "that's all", or an equivalent explicit command, acknowledge briefly and
 call the end_session tool. Use list_projects when the user asks which projects are available. Use
 switch_project only when the user explicitly asks to change the active project. Never claim a
-project was switched until the tool succeeds."""
+project was switched until the tool succeeds. Use control_volume for requests to set, raise,
+lower, or report the device volume. Give only a brief confirmation after a volume change."""
 
 
 def build_instructions(project: dict[str, Any], turns: list[dict[str, Any]]) -> str:
