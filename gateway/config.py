@@ -24,7 +24,8 @@ class Settings(BaseSettings):
     vad_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     vad_prefix_padding_ms: int = Field(default=300, ge=0, le=5000)
     vad_silence_duration_ms: int = Field(default=500, ge=100, le=5000)
-    idle_timeout_seconds: int = Field(default=30, ge=5, le=900)
+    # Zero keeps the Realtime session open until explicit stop or the hard limit.
+    idle_timeout_seconds: int = Field(default=0, ge=0, le=900)
     hard_session_limit_seconds: int = Field(default=3600, ge=60, le=7200)
     playback_buffer_seconds: int = Field(default=120, ge=30, le=600)
     diagnostic_audio: bool = False

@@ -515,10 +515,7 @@ class DeviceSession:
         self._clear_playback_queue()
 
     async def _playback_sender(self) -> None:
-        """Pace audio and bound how far transmission can lead physical DAC playback."""
-        active_stream = ""
-        next_send = 0.0
-        loop = asyncio.get_running_loop()
+        """Maintain a bounded jitter window ahead of physical DAC playback."""
         while True:
             packet = await self.playback_queue.get()
             output = self.output
@@ -529,7 +526,7 @@ class DeviceSession:
                     "playback.end", stream_id=output.stream_id, duration_ms=output.sent_ms
                 )
                 output.ended = True
-                output.ended_monotonic = loop.time()
+                output.ended_monotonic = time.monotonic()
                 logger.info(
                     "Assistant playback sent device=%s stream=%s duration_ms=%d played_ms=%d",
                     self.device_id,
@@ -538,12 +535,6 @@ class DeviceSession:
                     output.played_ms,
                 )
                 continue
-            if active_stream != packet.stream_id:
-                active_stream = packet.stream_id
-                next_send = loop.time()
-            delay = next_send - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
             await self._wait_for_playback_capacity(packet.stream_id)
             output = self.output
             if output is None or output.stream_id != packet.stream_id:
@@ -552,7 +543,6 @@ class DeviceSession:
             if self.diagnostic_output is not None:
                 self.diagnostic_output.write(packet.data)
             output.sent_ms += 20
-            next_send = max(next_send, loop.time()) + PLAYBACK_FRAME_SECONDS
 
     async def _wait_for_playback_capacity(self, stream_id: str) -> None:
         """Use device DAC progress as flow control for its small fixed playback queue."""
@@ -570,6 +560,13 @@ class DeviceSession:
             return
         self.stopping = True
         session_id, project_id = self.session_id, self.project_id
+        logger.info(
+            "Ending session device=%s session=%s reason=%s state=%s",
+            self.device_id,
+            session_id,
+            reason,
+            self.state.value,
+        )
         try:
             self.accepting_audio = False
             self.cloud_ready = False
@@ -626,12 +623,16 @@ class DeviceSession:
             if current - self.started_monotonic >= self.settings.hard_session_limit_seconds:
                 await self.stop("hard_limit")
                 return
-            if (
-                self.state == DeviceState.LISTENING
-                and current - self.last_activity >= self.settings.idle_timeout_seconds
-            ):
+            if self._idle_timeout_expired(current):
                 await self.stop("idle_timeout")
                 return
+
+    def _idle_timeout_expired(self, current: float) -> bool:
+        return (
+            self.settings.idle_timeout_seconds > 0
+            and self.state == DeviceState.LISTENING
+            and current - self.last_activity >= self.settings.idle_timeout_seconds
+        )
 
     async def _complete_playback(self, reason: str) -> None:
         output = self.output

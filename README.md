@@ -44,9 +44,10 @@ audio waiting behind real-time playback uses a bounded 120-second gateway queue 
 `PLAYBACK_BUFFER_SECONDS` accepts 30–600 seconds. `REALTIME_MAX_OUTPUT_TOKENS` defaults to the
 Realtime API's 4096-token per-response ceiling.
 
-`IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; raw
-microphone frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye”
-to end a session immediately. The firmware's `output_volume` scales direct Realtime PCM before the
+`IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; set
+it to `0` to keep the session open until an explicit stop or the hard session limit. Raw microphone
+frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye” to end a
+session immediately. The firmware's `output_volume` scales direct Realtime PCM before the
 speaker path (`0.125` is -18 dB relative to full scale). The AIC3204 remains at its proven default;
 changing its logarithmic control in addition to PCM scaling compounds the attenuation.
 

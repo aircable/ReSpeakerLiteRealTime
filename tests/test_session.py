@@ -70,13 +70,14 @@ class FakePlanner:
 
 
 def make_session(tmp_path, **setting_overrides):
-    settings = Settings(
-        device_token="device-secret",
-        ui_token="browser-secret",
-        database_path=tmp_path / "test.db",
-        idle_timeout_seconds=30,
+    setting_values = {
+        "device_token": "device-secret",
+        "ui_token": "browser-secret",
+        "database_path": tmp_path / "test.db",
+        "idle_timeout_seconds": 30,
         **setting_overrides,
-    )
+    }
+    settings = Settings(**setting_values)
     db = Database(settings.database_path)
     db.initialize()
     ws = FakeWebSocket()
@@ -318,11 +319,10 @@ async def test_stalled_playback_completion_recovers_listening_state(tmp_path):
     assert ws.messages[-1][1]["state"] == "listening"
 
 
-async def test_output_frames_are_paced_at_media_rate(tmp_path):
+async def test_output_sender_fills_jitter_window_then_waits_for_dac_progress(tmp_path):
     session, ws = make_session(tmp_path)
     session._start_playback_sender()
-    audio = bytes(FRAME_BYTES * 3)
-    started = asyncio.get_running_loop().time()
+    audio = bytes(FRAME_BYTES * 15)
     await session.handle_openai_event(
         {
             "type": "response.output_audio.delta",
@@ -332,11 +332,31 @@ async def test_output_frames_are_paced_at_media_rate(tmp_path):
             "delta": base64.b64encode(audio).decode(),
         }
     )
-    await wait_for(lambda: session.output.sent_ms == 60)
-    elapsed = asyncio.get_running_loop().time() - started
-    assert elapsed >= 0.035
-    assert len([value for kind, value in ws.messages if kind == "bytes"]) == 3
+    await wait_for(lambda: session.output.sent_ms == MAX_DEVICE_PLAYBACK_LEAD_MS)
+    await asyncio.sleep(0.03)
+    assert session.output.sent_ms == MAX_DEVICE_PLAYBACK_LEAD_MS
+    assert len([value for kind, value in ws.messages if kind == "bytes"]) == 10
+
+    await session.playback_progress(session.output.stream_id, 100)
+    await wait_for(lambda: session.output.sent_ms == 300)
+    assert len([value for kind, value in ws.messages if kind == "bytes"]) == 15
     await session._stop_playback_sender()
+
+
+def test_zero_idle_timeout_keeps_listening_session_open(tmp_path):
+    session, _ = make_session(tmp_path, idle_timeout_seconds=0)
+    session.state = DeviceState.LISTENING
+    session.last_activity = 0
+
+    assert not session._idle_timeout_expired(10_000)
+
+
+def test_nonzero_idle_timeout_expires_listening_session(tmp_path):
+    session, _ = make_session(tmp_path, idle_timeout_seconds=30)
+    session.state = DeviceState.LISTENING
+    session.last_activity = 100
+
+    assert session._idle_timeout_expired(130)
 
 
 async def test_output_flow_control_waits_for_device_playback_progress(tmp_path):

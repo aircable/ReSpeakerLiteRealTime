@@ -80,7 +80,7 @@ class GatewaySettingsUpdate(BaseModel):
     vad_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     vad_prefix_padding_ms: int | None = Field(default=None, ge=0, le=5000)
     vad_silence_duration_ms: int | None = Field(default=None, ge=100, le=5000)
-    idle_timeout_seconds: int | None = Field(default=None, ge=5, le=900)
+    idle_timeout_seconds: int | None = Field(default=None, ge=0, le=900)
     hard_session_limit_seconds: int | None = Field(default=None, ge=60, le=7200)
     playback_buffer_seconds: int | None = Field(default=None, ge=30, le=600)
     diagnostic_audio: bool | None = None
