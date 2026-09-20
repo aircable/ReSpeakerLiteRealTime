@@ -1,7 +1,14 @@
 import pytest
 from pydantic import ValidationError
 
-from gateway.protocol import FRAME_BYTES, Authenticate, PlaybackProgress, VolumeChanged, parse_device_message
+from gateway.protocol import (
+    FRAME_BYTES,
+    Authenticate,
+    PlaybackProgress,
+    ReadyDetected,
+    VolumeChanged,
+    parse_device_message,
+)
 
 
 def test_audio_frame_is_exactly_twenty_ms_pcm16():
@@ -30,3 +37,8 @@ def test_parse_runtime_volume_report():
     message = parse_device_message({"v": 1, "type": "volume.changed", "level": 0.125})
     assert isinstance(message, VolumeChanged)
     assert message.level == 0.125
+
+
+def test_parse_ready_word_detection():
+    message = parse_device_message({"v": 1, "type": "ready.detected"})
+    assert isinstance(message, ReadyDetected)

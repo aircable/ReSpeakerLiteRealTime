@@ -64,11 +64,16 @@ class RealtimeCompanion : public Component {
   void set_token(const std::string &token) { token_ = token; }
   void set_device_id(const std::string &device_id) { device_id_ = device_id; }
   void set_output_volume(float volume) { output_volume_ = volume; }
+  void set_ready_keyword_enabled(bool enabled) { ready_keyword_enabled_ = enabled; }
 
   void start_session();
   void stop_session(const char *reason = "button");
   void toggle_session();
   void set_muted(bool muted);
+  void ready_detected();
+  bool is_waiting_for_ready() const {
+    return waiting_for_ready_.load(std::memory_order_acquire);
+  }
   CompanionState get_state() const { return state_.load(std::memory_order_acquire); }
   bool is_authenticated() const { return authenticated_.load(std::memory_order_acquire); }
   bool has_authenticated_once() const { return authenticated_once_.load(std::memory_order_acquire); }
@@ -150,6 +155,9 @@ class RealtimeCompanion : public Component {
   std::atomic<bool> session_active_{false};
   std::atomic<bool> stream_ready_{false};
   std::atomic<bool> muted_{false};
+  bool ready_keyword_enabled_{false};
+  std::atomic<bool> waiting_for_ready_{false};
+  std::atomic<bool> ready_signal_sent_{false};
 };
 
 }  // namespace esphome::realtime_companion

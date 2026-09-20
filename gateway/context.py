@@ -11,10 +11,20 @@ switch_project only when the user explicitly asks to change the active project. 
 project was switched until the tool succeeds. Use control_volume for requests to set, raise,
 lower, or report the device volume. Give only a brief confirmation after a volume change."""
 
+READY_KEYWORD_INSTRUCTIONS = """The device has a local 'ready' detector. In a hands-free,
+step-by-step procedure, give exactly one concise step and then call wait_for_ready. Do not say
+that the user is ready before the tool returns. While that tool is pending, ordinary speech is
+intentionally ignored; the physical USER button can still end the session."""
 
-def build_instructions(project: dict[str, Any], turns: list[dict[str, Any]]) -> str:
+
+def build_instructions(
+    project: dict[str, Any],
+    turns: list[dict[str, Any]],
+    ready_keyword_enabled: bool = False,
+) -> str:
     history = "\n".join(f"{turn['role']}: {turn['text']}" for turn in turns)
-    return f"""{BASE_INSTRUCTIONS}
+    ready_instructions = f"\n\n{READY_KEYWORD_INSTRUCTIONS}" if ready_keyword_enabled else ""
+    return f"""{BASE_INSTRUCTIONS}{ready_instructions}
 
 Project: {project['name']}
 Goal: {project['goal']}

@@ -193,6 +193,8 @@ void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_e
     this->stream_ready_.store(false, std::memory_order_release);
     this->auth_pending_.store(false, std::memory_order_release);
     this->session_start_pending_.store(false, std::memory_order_release);
+    this->waiting_for_ready_.store(false, std::memory_order_release);
+    this->ready_signal_sent_.store(false, std::memory_order_release);
     xQueueReset(this->capture_queue_);
     xQueueReset(this->control_queue_);
     xQueueReset(this->progress_queue_);
@@ -234,11 +236,15 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
   } else if (strcmp(kind, "session.started") == 0) {
     ESP_LOGI(TAG, "Gateway session started; microphone audio transport active");
     this->stream_ready_.store(true, std::memory_order_release);
+    this->waiting_for_ready_.store(false, std::memory_order_release);
+    this->ready_signal_sent_.store(false, std::memory_order_release);
     this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::LISTENING);
   } else if (strcmp(kind, "session.ended") == 0) {
     ESP_LOGI(TAG, "Gateway session ended");
     this->session_active_ = false;
     this->stream_ready_.store(false, std::memory_order_release);
+    this->waiting_for_ready_.store(false, std::memory_order_release);
+    this->ready_signal_sent_.store(false, std::memory_order_release);
     xQueueReset(this->capture_queue_);
     this->flush_playback();
     this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::IDLE);
@@ -274,6 +280,13 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     cJSON *level = cJSON_GetObjectItemCaseSensitive(root, "level");
     if (cJSON_IsNumber(level))
       this->set_runtime_volume(static_cast<float>(level->valuedouble), true);
+  } else if (strcmp(kind, "keyword.mode") == 0 && this->ready_keyword_enabled_) {
+    cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "mode");
+    const bool ready = cJSON_IsString(mode) && strcmp(mode->valuestring, "ready") == 0;
+    this->waiting_for_ready_.store(ready, std::memory_order_release);
+    this->ready_signal_sent_.store(false, std::memory_order_release);
+    xQueueReset(this->capture_queue_);
+    ESP_LOGI(TAG, "Keyword mode changed to %s", ready ? "ready" : "wake");
   }
   cJSON_Delete(root);
 }
@@ -281,6 +294,7 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
 void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data) {
   const bool capture_enabled = this->session_active_.load(std::memory_order_acquire) &&
                                this->stream_ready_.load(std::memory_order_acquire) &&
+                               !this->waiting_for_ready_.load(std::memory_order_acquire) &&
                                !this->muted_.load(std::memory_order_acquire);
   if (!capture_enabled) {
     if (this->capture_running_) {
@@ -353,7 +367,8 @@ void RealtimeCompanion::loop() {
     const std::string auth = "{\"v\":1,\"type\":\"auth\",\"token\":\"" + this->token_ +
                              "\",\"device_id\":\"" + this->device_id_ +
                              "\",\"capabilities\":{\"aec\":true,\"frame_ms\":20,"
-                             "\"runtime_volume\":true}}";
+                             "\"runtime_volume\":true,\"ready_keyword\":" +
+                             std::string(this->ready_keyword_enabled_ ? "true" : "false") + "}}";
     if (this->send_json(auth))
       this->auth_pending_.store(false, std::memory_order_release);
   }
@@ -450,6 +465,8 @@ void RealtimeCompanion::start_session() {
     return;
   this->session_active_ = true;
   this->stream_ready_.store(false, std::memory_order_release);
+  this->waiting_for_ready_.store(false, std::memory_order_release);
+  this->ready_signal_sent_.store(false, std::memory_order_release);
   this->captured_frames_.store(0, std::memory_order_relaxed);
   this->sent_frames_.store(0, std::memory_order_relaxed);
   this->dropped_frames_.store(0, std::memory_order_relaxed);
@@ -469,9 +486,24 @@ void RealtimeCompanion::stop_session(const char *reason) {
   this->send_json("{\"v\":1,\"type\":\"session.stop\",\"reason\":\"" + std::string(reason) + "\"}");
   this->session_active_ = false;
   this->stream_ready_.store(false, std::memory_order_release);
+  this->waiting_for_ready_.store(false, std::memory_order_release);
+  this->ready_signal_sent_.store(false, std::memory_order_release);
   xQueueReset(this->capture_queue_);
   this->flush_playback();
   this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::IDLE);
+}
+
+void RealtimeCompanion::ready_detected() {
+  if (!this->ready_keyword_enabled_ ||
+      !this->waiting_for_ready_.load(std::memory_order_acquire) ||
+      this->ready_signal_sent_.exchange(true, std::memory_order_acq_rel))
+    return;
+  if (!this->send_json("{\"v\":1,\"type\":\"ready.detected\"}")) {
+    this->ready_signal_sent_.store(false, std::memory_order_release);
+    ESP_LOGW(TAG, "Could not queue ready-word notification");
+    return;
+  }
+  ESP_LOGI(TAG, "Ready word detected; waiting for gateway acknowledgement");
 }
 
 void RealtimeCompanion::toggle_session() {
@@ -567,6 +599,7 @@ void RealtimeCompanion::dump_config() {
   ESP_LOGCONFIG(TAG, "  Gateway: %s", this->url_.c_str());
   ESP_LOGCONFIG(TAG, "  Device ID: %s", this->device_id_.c_str());
   ESP_LOGCONFIG(TAG, "  Assistant output volume: %.0f%%", this->output_volume_ * 100.0f);
+  ESP_LOGCONFIG(TAG, "  Ready keyword support: %s", this->ready_keyword_enabled_ ? "yes" : "no");
   ESP_LOGCONFIG(TAG,
                 "  TX queues: 8 control + 1 coalesced progress + 6 x 20 ms audio; playback queue: "
                 "10 x 20 ms");

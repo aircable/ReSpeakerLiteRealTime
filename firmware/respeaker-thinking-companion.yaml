@@ -8,7 +8,7 @@ esphome:
   min_version: 2026.6.0
   project:
     name: aircable.respeaker-thinking-companion
-    version: 0.2.0
+    version: 0.3.0
   on_boot:
     - priority: -100
       then:
@@ -327,6 +327,9 @@ micro_wake_word:
   stop_after_detection: false
   models:
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu_model
+      # Runtime switching must not write flash on every cooking step.
+      internal: true
   vad:
     probability_cutoff: 0.05
   on_wake_word_detected:
@@ -334,4 +337,8 @@ micro_wake_word:
         condition:
           lambda: return !id(hardware_mute_state).state;
         then:
-          - lambda: id(realtime).start_session();
+          - lambda: |-
+              if (wake_word == "ready")
+                id(realtime).ready_detected();
+              else
+                id(realtime).start_session();

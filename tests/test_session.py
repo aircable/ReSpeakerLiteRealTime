@@ -58,11 +58,12 @@ class FakeCloud:
 
 
 class FakeRealtime(FakeCloud):
-    def __init__(self, settings, instructions, on_event):
+    def __init__(self, settings, instructions, on_event, ready_keyword_enabled=False):
         super().__init__()
         self.settings = settings
         self.instructions = instructions
         self.on_event = on_event
+        self.ready_keyword_enabled = ready_keyword_enabled
 
     async def connect(self):
         pass
@@ -96,6 +97,59 @@ def make_session(tmp_path, **setting_overrides):
     session.accepting_audio = True
     session.cloud_ready = True
     return session, ws
+
+
+async def test_ready_word_wait_gates_audio_until_local_detection(tmp_path):
+    settings = Settings(
+        device_token="device-secret",
+        ui_token="browser-secret",
+        database_path=tmp_path / "test.db",
+    )
+    db = Database(settings.database_path)
+    db.initialize()
+    ws = FakeWebSocket()
+    session = DeviceSession(
+        ws,
+        "device",
+        settings,
+        db,
+        Planner(settings, db),
+        capabilities={"ready_keyword": True},
+    )
+    session.session_id = db.start_session(db.get_project()["id"], "device", "test")
+    session.project_id = db.get_project()["id"]
+    cloud = FakeCloud()
+    session.cloud = cloud
+    session.accepting_audio = True
+    session.cloud_ready = True
+    session.output = OutputStream("stream", "response", "item", 0)
+
+    await session._handle_tool_call(
+        {"name": "wait_for_ready", "call_id": "ready-call", "arguments": "{}"}
+    )
+
+    assert session.ready_wait_requested
+    assert not session.waiting_for_ready
+    assert not any(value["type"] == "keyword.mode" for kind, value in ws.messages if kind == "json")
+
+    await session._complete_playback("test")
+
+    assert session.waiting_for_ready
+    assert not session.accepting_audio
+    assert ws.messages[-1][1] == {
+        "v": 1,
+        "type": "keyword.mode",
+        "device_id": "device",
+        "mode": "ready",
+    }
+
+    await session.ready_detected()
+
+    assert not session.waiting_for_ready
+    assert session.accepting_audio
+    assert cloud.tool_outputs == [("ready-call", {"ready": True})]
+    assert cloud.response_requests == [None]
+    assert ws.messages[-1][1]["mode"] == "wake"
 
 
 def test_playback_queue_uses_configured_bounded_duration(tmp_path):

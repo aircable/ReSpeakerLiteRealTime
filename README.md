@@ -76,6 +76,19 @@ The XMOS chip must first have the formatBCE/Seeed 48 kHz I²S firmware v1.1.0 or
 `firmware/secrets.example.yaml` to `firmware/secrets.yaml`, point `gateway_ws_url` at the gateway,
 then compile `firmware/respeaker-thinking-companion.yaml` with ESPHome 2026.6 or newer.
 
+### Optional local “ready” model
+
+The standard firmware continues to use only “Okay Nabu”. For hands-free step-by-step workflows,
+copy the trained `ready.json` and the TFLite file it references into `firmware/models/`, then compile
+`firmware/respeaker-thinking-companion-ready.yaml`. The manifest's `wake_word` must be exactly
+`ready`.
+
+The ready variant enables only one classifier at a time: “Okay Nabu” while idle/normal, and
+“ready” while a `wait_for_ready` tool call is pending. During that wait, normal microphone audio is
+not sent to OpenAI. Saying “ready” completes the pending tool call and advances the procedure;
+pressing USER still ends the session. The gateway exposes this tool only after firmware advertises
+the `ready_keyword` capability, so the standard firmware cannot enter an unusable wait state.
+
 The configuration pins the tested formatBCE component revisions. It retains XMOS DFU, the AIC3204
 codec, 48 kHz 32-bit stereo I²S, hardware AEC, separate wake-word channel, mute/button, status LED,
 OTA, and ESPHome's output resampler. The formatBCE microphone fork derives a 16 kHz PCM32 stereo

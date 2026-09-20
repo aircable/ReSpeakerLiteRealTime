@@ -18,6 +18,7 @@ from .protocol import (
     Authenticate,
     Heartbeat,
     PlaybackProgress,
+    ReadyDetected,
     SessionStart,
     SessionStop,
     StateReport,
@@ -256,10 +257,21 @@ async def device_socket(websocket: WebSocket) -> None:
         effective_settings = settings.model_copy(update=db.setting_overrides())
         planner = Planner(effective_settings, db)
         session = DeviceSession(
-            websocket, auth.device_id, effective_settings, db, planner, live_hub.publish
+            websocket,
+            auth.device_id,
+            effective_settings,
+            db,
+            planner,
+            live_hub.publish,
+            capabilities=auth.capabilities,
         )
         device_sessions[auth.device_id] = session
-        logger.info("Device authenticated device=%s", auth.device_id)
+        logger.info(
+            "Device authenticated device=%s ready_keyword=%s capabilities=%s",
+            auth.device_id,
+            bool(auth.capabilities.get("ready_keyword")),
+            sorted(auth.capabilities),
+        )
         await session.send_json(
             "auth.ok",
             device_id=auth.device_id,
@@ -291,6 +303,8 @@ async def device_socket(websocket: WebSocket) -> None:
                 await session.send_json("heartbeat.ack", monotonic_ms=message.monotonic_ms)
             elif isinstance(message, VolumeChanged):
                 await session.report_volume(message.level)
+            elif isinstance(message, ReadyDetected):
+                await session.ready_detected()
     except WebSocketDisconnect as exc:
         logger.warning(
             "Device WebSocket disconnected device=%s code=%s reason=%s",

@@ -1,0 +1,56 @@
+# Build this variant after placing the trained manifest and TFLite file in
+# firmware/models/. The normal firmware remains buildable while the model is trained.
+packages:
+  base: !include respeaker-thinking-companion.yaml
+
+esphome:
+  project:
+    name: aircable.respeaker-thinking-companion
+    version: 0.3.0-ready
+
+realtime_companion:
+  ready_keyword: true
+
+micro_wake_word:
+  models:
+    - model: models/ready.json
+      id: ready_model
+      internal: true
+
+# Keep exactly one classifier enabled. Both models share the same microphone source,
+# frontend/VAD, and inference task; switching avoids the CPU cost of evaluating both.
+interval:
+  - interval: 100ms
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: return id(realtime).is_waiting_for_ready();
+              - micro_wake_word.model_is_enabled: okay_nabu_model
+          then:
+            - micro_wake_word.disable_model: okay_nabu_model
+      - if:
+          condition:
+            and:
+              - lambda: return id(realtime).is_waiting_for_ready();
+              - not:
+                  micro_wake_word.model_is_enabled: ready_model
+          then:
+            - micro_wake_word.enable_model: ready_model
+            - lambda: ESP_LOGI("ready_model", "Activated ready keyword model");
+      - if:
+          condition:
+            and:
+              - lambda: return !id(realtime).is_waiting_for_ready();
+              - micro_wake_word.model_is_enabled: ready_model
+          then:
+            - micro_wake_word.disable_model: ready_model
+      - if:
+          condition:
+            and:
+              - lambda: return !id(realtime).is_waiting_for_ready();
+              - not:
+                  micro_wake_word.model_is_enabled: okay_nabu_model
+          then:
+            - micro_wake_word.enable_model: okay_nabu_model
+            - lambda: ESP_LOGI("ready_model", "Activated Okay Nabu wake model");

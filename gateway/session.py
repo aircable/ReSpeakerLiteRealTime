@@ -53,6 +53,7 @@ class DeviceSession:
         db: Database,
         planner: Planner,
         observer: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        capabilities: dict[str, Any] | None = None,
     ):
         self.websocket = websocket
         self.device_id = device_id
@@ -99,6 +100,10 @@ class DeviceSession:
         self.echo_gate_until = 0.0
         self.echo_suppressed_frames = 0
         self.device_volume: float | None = None
+        self.ready_keyword_enabled = bool((capabilities or {}).get("ready_keyword"))
+        self.ready_wait_requested = False
+        self.waiting_for_ready = False
+        self.pending_ready_call_id: str | None = None
 
     async def send_json(self, message_type: str, **payload: Any) -> None:
         message = server_message(message_type, **{"device_id": self.device_id, **payload})
@@ -250,8 +255,17 @@ class DeviceSession:
                     if recording is not None:
                         recording.close()
                 self.diagnostic_input = self.diagnostic_output = None
-        context = build_instructions(project, self.db.recent_turns(self.project_id, 12))
-        self.cloud = RealtimeConnection(self.settings, context, self.handle_openai_event)
+        context = build_instructions(
+            project,
+            self.db.recent_turns(self.project_id, 12),
+            ready_keyword_enabled=self.ready_keyword_enabled,
+        )
+        self.cloud = RealtimeConnection(
+            self.settings,
+            context,
+            self.handle_openai_event,
+            ready_keyword_enabled=self.ready_keyword_enabled,
+        )
         await self.set_state(DeviceState.CONNECTING)
         try:
             await self.cloud.connect()
@@ -274,6 +288,8 @@ class DeviceSession:
         self.timer_task = asyncio.create_task(self._watch_timeouts(), name=f"session-timer-{self.device_id}")
         await self.set_state(DeviceState.LISTENING)
         await self.send_json("session.started", session_id=self.session_id, project_id=self.project_id)
+        if self.ready_keyword_enabled:
+            await self.send_json("keyword.mode", mode="wake")
         logger.info("Session ready for device audio device=%s session=%s", self.device_id, self.session_id)
         if self.settings.announce_active_project:
             await self._announce_project(project["name"])
@@ -484,6 +500,7 @@ class DeviceSession:
             self.last_activity = time.monotonic()
             if self.output is None:
                 await self.set_state(DeviceState.LISTENING)
+                await self._enter_ready_wait_if_possible()
             return
         if kind == "response.function_call_arguments.done":
             await self._handle_tool_call(event)
@@ -500,6 +517,22 @@ class DeviceSession:
         cloud = self.cloud
         call_id = event.get("call_id")
         if cloud is None or not call_id:
+            return
+        if name == "wait_for_ready":
+            if not self.ready_keyword_enabled:
+                await cloud.submit_tool_output(
+                    call_id, {"ready": False, "error": "The device has no ready-word model."}
+                )
+                await cloud.request_response()
+                return
+            self.pending_ready_call_id = call_id
+            self.ready_wait_requested = True
+            logger.info(
+                "Ready-word wait requested device=%s session=%s",
+                self.device_id,
+                self.session_id,
+            )
+            await self._enter_ready_wait_if_possible()
             return
         if name == "list_projects":
             projects = self.db.list_projects()
@@ -555,6 +588,53 @@ class DeviceSession:
             return
         await self._switch_project(project)
 
+    async def _enter_ready_wait_if_possible(self) -> None:
+        if (
+            not self.ready_wait_requested
+            or self.waiting_for_ready
+            or self.pending_ready_call_id is None
+            or self.output is not None
+        ):
+            return
+        self.ready_wait_requested = False
+        self.waiting_for_ready = True
+        self.accepting_audio = False
+        self._clear_input_queue()
+        self.last_activity = time.monotonic()
+        await self.set_state(DeviceState.LISTENING)
+        await self.send_json("keyword.mode", mode="ready")
+        logger.info(
+            "Waiting for local ready word device=%s session=%s",
+            self.device_id,
+            self.session_id,
+        )
+
+    async def ready_detected(self) -> None:
+        if not self.waiting_for_ready or self.pending_ready_call_id is None:
+            logger.info(
+                "Ignoring unexpected ready word device=%s session=%s",
+                self.device_id,
+                self.session_id,
+            )
+            return
+        call_id = self.pending_ready_call_id
+        self.pending_ready_call_id = None
+        self.waiting_for_ready = False
+        self.ready_wait_requested = False
+        self.accepting_audio = True
+        self.last_activity = time.monotonic()
+        await self.send_json("keyword.mode", mode="wake")
+        cloud = self.cloud
+        if cloud is None:
+            return
+        logger.info(
+            "Local ready word detected device=%s session=%s",
+            self.device_id,
+            self.session_id,
+        )
+        await cloud.submit_tool_output(call_id, {"ready": True})
+        await cloud.request_response()
+
     async def _announce_project(self, project_name: str) -> None:
         cloud = self.cloud
         if cloud is not None:
@@ -601,6 +681,11 @@ class DeviceSession:
         )
         self.accepting_audio = False
         self.cloud_ready = False
+        self.ready_wait_requested = False
+        self.waiting_for_ready = False
+        self.pending_ready_call_id = None
+        if self.ready_keyword_enabled:
+            await self.send_json("keyword.mode", mode="wake")
         await self.set_state(DeviceState.CONNECTING)
         if self.timer_task is not None and self.timer_task is not asyncio.current_task():
             self.timer_task.cancel()
@@ -634,8 +719,17 @@ class DeviceSession:
         self.assistant_text = ""
         self.cancelled_response_ids.clear()
         self._open_switched_session_recordings()
-        context = build_instructions(project, self.db.recent_turns(self.project_id, 12))
-        self.cloud = RealtimeConnection(self.settings, context, self.handle_openai_event)
+        context = build_instructions(
+            project,
+            self.db.recent_turns(self.project_id, 12),
+            ready_keyword_enabled=self.ready_keyword_enabled,
+        )
+        self.cloud = RealtimeConnection(
+            self.settings,
+            context,
+            self.handle_openai_event,
+            ready_keyword_enabled=self.ready_keyword_enabled,
+        )
         try:
             await self.cloud.connect()
         except Exception:
@@ -795,6 +889,13 @@ class DeviceSession:
         try:
             self.accepting_audio = False
             self.cloud_ready = False
+            self.ready_wait_requested = False
+            self.waiting_for_ready = False
+            self.pending_ready_call_id = None
+            if self.ready_keyword_enabled:
+                notify_device = await self.send_optional(
+                    "keyword.mode", notify_device, mode="wake"
+                )
             await self._stop_input_sender()
             if self.output:
                 notify_device = await self.send_optional(
@@ -877,6 +978,7 @@ class DeviceSession:
             self.echo_gate_until = time.monotonic() + 0.3
         self.last_activity = time.monotonic()
         await self.set_state(DeviceState.LISTENING)
+        await self._enter_ready_wait_if_possible()
 
     async def close(self) -> None:
         self.accepting_audio = False

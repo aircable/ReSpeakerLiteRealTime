@@ -63,6 +63,10 @@ class VolumeChanged(Envelope):
     level: float = Field(ge=0.0, le=1.0)
 
 
+class ReadyDetected(Envelope):
+    type: Literal["ready.detected"] = "ready.detected"
+
+
 def parse_device_message(data: dict[str, Any]) -> Envelope:
     message_type = data.get("type")
     models: dict[str, type[Envelope]] = {
@@ -73,6 +77,7 @@ def parse_device_message(data: dict[str, Any]) -> Envelope:
         "state": StateReport,
         "heartbeat": Heartbeat,
         "volume.changed": VolumeChanged,
+        "ready.detected": ReadyDetected,
     }
     model = models.get(message_type)
     if model is None:

@@ -12,6 +12,13 @@ Devices advertising `runtime_volume` report their normalized PCM output multipli
 with `volume.changed`. The gateway sends `volume.set` with the same normalized `level` field.
 The device applies and persists the setting, then confirms it with another `volume.changed`.
 
+Devices with a second local “ready” model advertise `ready_keyword: true`. After the assistant
+calls `wait_for_ready`, the gateway waits until the current step has physically finished playing,
+sends `keyword.mode` with `mode: "ready"`, and stops accepting ordinary microphone audio. The
+device enables only the ready model and sends `ready.detected` when it fires. The gateway replies
+with `keyword.mode` set to `wake`, restores microphone transport, completes the pending tool call,
+and asks Realtime for the next step. The physical USER button remains an out-of-band stop control.
+
 For each assistant output the gateway sends `playback.start` containing `stream_id`,
 `response_id`, and `item_id`, followed by binary frames, then `playback.end`. The device accepts
 binary audio only for the current stream and reports `playback.progress` with the duration that
