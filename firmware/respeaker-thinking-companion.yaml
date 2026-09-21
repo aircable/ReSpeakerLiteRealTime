@@ -243,7 +243,7 @@ interval:
             SPEAKING, ERROR, BUTTON_PRESSED
           };
 
-          LedMode mode;
+          LedMode mode = ERROR;
           const bool initializing = !id(realtime).has_authenticated_once() && millis() < 600000;
           if (initializing) {
             mode = id(realtime).is_network_ready() ? INIT_FAST : INIT_SLOW;

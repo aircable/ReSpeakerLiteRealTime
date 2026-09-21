@@ -226,6 +226,36 @@ async def test_echo_guard_withholds_playback_audio_then_releases(tmp_path):
     await session._stop_input_sender()
 
 
+async def test_project_announcement_cannot_barge_into_itself(tmp_path):
+    session, _ = make_session(tmp_path, barge_in_enabled=True)
+    frame = bytes(FRAME_BYTES)
+
+    await session._announce_project("First project")
+
+    assert session.announcement_echo_guard
+    assert session.cloud.response_requests == [
+        "Say only: First project is active. Then stop speaking and wait. "
+        "Do not ask a question or suggest activities."
+    ]
+    await session.receive_audio(frame)
+    assert session.cloud.audio == []
+
+    session.output = OutputStream("stream", "response", "item", 0)
+    await session.handle_openai_event({"type": "input_audio_buffer.speech_started"})
+    assert session.output is not None
+
+    await session._complete_playback("test")
+    assert not session.announcement_echo_guard
+    await session.receive_audio(frame)
+    assert session.cloud.audio == []
+
+    session.echo_gate_until = 0
+    await session.receive_audio(frame)
+    await wait_for(lambda: len(session.cloud.audio) == 1)
+    assert session.cloud.audio == [frame]
+    await session._stop_input_sender()
+
+
 async def test_audio_is_buffered_until_cloud_is_ready_and_keeps_order(tmp_path):
     session, _ = make_session(tmp_path)
     await session._stop_input_sender()

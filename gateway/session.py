@@ -99,6 +99,7 @@ class DeviceSession:
         self.echo_gate_active = False
         self.echo_gate_until = 0.0
         self.echo_suppressed_frames = 0
+        self.announcement_echo_guard = False
         self.device_volume: float | None = None
         self.ready_keyword_enabled = bool((capabilities or {}).get("ready_keyword"))
         self.ready_wait_requested = False
@@ -282,6 +283,9 @@ class DeviceSession:
             await self.set_state(DeviceState.ERROR)
             raise
         self.started_monotonic = self.last_activity = time.monotonic()
+        self.announcement_echo_guard = self.settings.announce_active_project
+        if self.announcement_echo_guard:
+            self._clear_input_queue()
         self.cloud_ready = True
         self._start_input_sender()
         self._start_playback_sender()
@@ -326,8 +330,10 @@ class DeviceSession:
             self.last_input_log = current
         if self.diagnostic_input is not None:
             self.diagnostic_input.write(pcm)
-        echo_guarded = not self.settings.barge_in_enabled and (
-            self.output is not None or time.monotonic() < self.echo_gate_until
+        echo_guarded = (
+            self.announcement_echo_guard
+            or time.monotonic() < self.echo_gate_until
+            or (not self.settings.barge_in_enabled and self.output is not None)
         )
         if echo_guarded:
             self.echo_suppressed_frames += 1
@@ -436,6 +442,9 @@ class DeviceSession:
                 event.get("audio_start_ms"),
                 event.get("item_id"),
             )
+            if self.announcement_echo_guard:
+                logger.info("Ignoring project-announcement echo VAD start device=%s", self.device_id)
+                return
             if self.output is not None and not self.settings.barge_in_enabled:
                 logger.info("Ignoring assistant-echo VAD start device=%s", self.device_id)
                 return
@@ -499,6 +508,9 @@ class DeviceSession:
             self.assistant_text = ""
             self.last_activity = time.monotonic()
             if self.output is None:
+                if self.announcement_echo_guard:
+                    self.announcement_echo_guard = False
+                    self.echo_gate_until = time.monotonic() + 0.3
                 await self.set_state(DeviceState.LISTENING)
                 await self._enter_ready_wait_if_possible()
             return
@@ -638,10 +650,20 @@ class DeviceSession:
     async def _announce_project(self, project_name: str) -> None:
         cloud = self.cloud
         if cloud is not None:
-            await cloud.request_response(
-                f"Say only: {project_name} is active. Then stop speaking and wait. "
-                "Do not ask a question or suggest activities."
-            )
+            # The project announcement is generated immediately after wake/session setup.
+            # It must not be allowed to barge into itself, even when conversational
+            # responses have barge-in enabled. Keep microphone capture running locally,
+            # but withhold it from OpenAI through playback and its short acoustic tail.
+            self.announcement_echo_guard = True
+            self._clear_input_queue()
+            try:
+                await cloud.request_response(
+                    f"Say only: {project_name} is active. Then stop speaking and wait. "
+                    "Do not ask a question or suggest activities."
+                )
+            except Exception:
+                self.announcement_echo_guard = False
+                raise
 
     def _open_switched_session_recordings(self) -> None:
         if not self.settings.diagnostic_audio or self.session_id is None:
@@ -738,6 +760,8 @@ class DeviceSession:
             await self.set_state(DeviceState.ERROR)
             raise
         self.started_monotonic = self.last_activity = time.monotonic()
+        self.announcement_echo_guard = True
+        self._clear_input_queue()
         self.accepting_audio = True
         self.cloud_ready = True
         self._start_input_sender()
@@ -974,7 +998,10 @@ class DeviceSession:
         )
         self.output = None
         self.playback_progress_event.set()
-        if not self.settings.barge_in_enabled:
+        if self.announcement_echo_guard:
+            self.announcement_echo_guard = False
+            self.echo_gate_until = time.monotonic() + 0.3
+        elif not self.settings.barge_in_enabled:
             self.echo_gate_until = time.monotonic() + 0.3
         self.last_activity = time.monotonic()
         await self.set_state(DeviceState.LISTENING)
