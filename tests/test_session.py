@@ -9,6 +9,7 @@ from gateway.protocol import FRAME_BYTES, DeviceState
 from gateway.session import (
     MAX_DEVICE_PLAYBACK_LEAD_MS,
     MAX_QUEUED_INPUT_FRAMES,
+    PLAYBACK_COMPLETION_TOLERANCE_MS,
     PLAYBACK_FRAMES_PER_SECOND,
     DeviceSession,
     OutputStream,
@@ -490,6 +491,25 @@ async def test_output_flow_control_waits_for_device_playback_progress(tmp_path):
 
     await session.playback_progress("stream", 20)
     await waiter
+
+
+async def test_playback_completes_within_one_transport_frame_tolerance(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.output = OutputStream(
+        "stream",
+        "response",
+        "item",
+        0,
+        sent_ms=2060,
+        ended=True,
+    )
+
+    await session.playback_progress(
+        "stream", 2060 - PLAYBACK_COMPLETION_TOLERANCE_MS
+    )
+
+    assert session.output is None
+    assert session.state == DeviceState.LISTENING
 
 
 async def test_cancel_not_active_race_is_not_fatal(tmp_path):

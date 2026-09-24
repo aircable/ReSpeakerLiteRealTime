@@ -20,6 +20,7 @@ from .realtime import RealtimeConnection
 
 logger = logging.getLogger(__name__)
 PLAYBACK_FRAME_SECONDS = 0.020
+PLAYBACK_COMPLETION_TOLERANCE_MS = round(PLAYBACK_FRAME_SECONDS * 1000)
 MAX_DEVICE_PLAYBACK_LEAD_MS = 200
 MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
 PLAYBACK_FRAMES_PER_SECOND = round(1 / PLAYBACK_FRAME_SECONDS)
@@ -412,7 +413,11 @@ class DeviceSession:
         if self.output and self.output.stream_id == stream_id:
             self.output.played_ms = min(played_ms, self.output.sent_ms)
             self.playback_progress_event.set()
-            if self.output.ended and self.output.played_ms >= self.output.sent_ms:
+            if (
+                self.output.ended
+                and self.output.played_ms + PLAYBACK_COMPLETION_TOLERANCE_MS
+                >= self.output.sent_ms
+            ):
                 await self._complete_playback("device_progress")
 
     async def interrupt(self) -> None:
