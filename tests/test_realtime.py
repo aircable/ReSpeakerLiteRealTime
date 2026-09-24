@@ -58,6 +58,17 @@ def test_server_vad_configuration(tmp_path):
     }
 
 
+def test_far_field_noise_reduction_is_enabled_by_default(tmp_path):
+    connection = make_connection(tmp_path)
+
+    assert connection._noise_reduction_config() == {"type": "far_field"}
+
+    connection.settings = connection.settings.model_copy(
+        update={"input_noise_reduction": "off"}
+    )
+    assert connection._noise_reduction_config() is None
+
+
 def test_realtime_output_limit_defaults_to_api_ceiling(tmp_path):
     connection = make_connection(tmp_path)
 

@@ -59,6 +59,11 @@ class RealtimeConnection:
             config["eagerness"] = self.settings.vad_eagerness
         return config
 
+    def _noise_reduction_config(self) -> dict[str, str] | None:
+        if self.settings.input_noise_reduction == "off":
+            return None
+        return {"type": self.settings.input_noise_reduction}
+
     async def connect(self) -> None:
         if not self.settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is not configured")
@@ -161,6 +166,7 @@ class RealtimeConnection:
                     "audio": {
                         "input": {
                             "format": {"type": "audio/pcm", "rate": 24000},
+                            "noise_reduction": self._noise_reduction_config(),
                             "transcription": {"model": self.settings.transcription_model},
                             "turn_detection": self._turn_detection_config(),
                         },
@@ -176,11 +182,12 @@ class RealtimeConnection:
         )
         logger.info(
             "OpenAI session.update sent: voice=%s reasoning=%s vad=%s transcription=%s "
-            "barge_in=%s max_output_tokens=%d",
+            "noise_reduction=%s barge_in=%s max_output_tokens=%d",
             self.settings.voice,
             self.settings.reasoning_effort,
             self.settings.vad_mode,
             self.settings.transcription_model,
+            self.settings.input_noise_reduction,
             self.settings.barge_in_enabled,
             self.settings.realtime_max_output_tokens,
         )

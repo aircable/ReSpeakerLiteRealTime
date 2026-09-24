@@ -36,6 +36,7 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
                     "idle_timeout_seconds": 45,
                     "openai_trace": True,
                     "vad_mode": "server_vad",
+                    "input_noise_reduction": "far_field",
                     "vad_threshold": 0.55,
                     "vad_silence_duration_ms": 600,
                 },
@@ -47,6 +48,7 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
             assert current.json()["voice"] == "cedar"
             assert current.json()["openai_trace"] is True
             assert current.json()["vad_mode"] == "server_vad"
+            assert current.json()["input_noise_reduction"] == "far_field"
             assert current.json()["vad_threshold"] == 0.55
             assert current.json()["vad_silence_duration_ms"] == 600
     get_settings.cache_clear()
