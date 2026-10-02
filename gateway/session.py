@@ -24,6 +24,8 @@ PLAYBACK_COMPLETION_TOLERANCE_MS = round(PLAYBACK_FRAME_SECONDS * 1000)
 MAX_DEVICE_PLAYBACK_LEAD_MS = 200
 MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
 PLAYBACK_FRAMES_PER_SECOND = round(1 / PLAYBACK_FRAME_SECONDS)
+BARGE_IN_WARMUP_MS = 1000  # Gate speaker onset using reported DAC playback, not generation time.
+SILENT_INPUT_FRAME = bytes(FRAME_BYTES)
 
 
 @dataclass
@@ -100,6 +102,7 @@ class DeviceSession:
         self.echo_gate_active = False
         self.echo_gate_until = 0.0
         self.echo_suppressed_frames = 0
+        self.warmup_vad_items: set[str] = set()
         self.announcement_echo_guard = False
         self.device_volume: float | None = None
         self.ready_keyword_enabled = bool((capabilities or {}).get("ready_keyword"))
@@ -221,6 +224,7 @@ class DeviceSession:
         self.settings = self.settings.model_copy(update=self.db.setting_overrides())
         self.planner.settings = self.settings
         self.accepting_audio = True
+        self.warmup_vad_items.clear()
         project = self.db.get_project(requested_project_id)
         self.project_id = project["id"]
         self.session_id = self.db.start_session(self.project_id, self.device_id, self.settings.realtime_model)
@@ -331,25 +335,33 @@ class DeviceSession:
             self.last_input_log = current
         if self.diagnostic_input is not None:
             self.diagnostic_input.write(pcm)
-        echo_guarded = (
+        warmup_guarded = self._barge_in_warmup_active()
+        fully_guarded = (
             self.announcement_echo_guard
             or time.monotonic() < self.echo_gate_until
             or (not self.settings.barge_in_enabled and self.output is not None)
         )
-        if echo_guarded:
+        if fully_guarded or warmup_guarded:
             self.echo_suppressed_frames += 1
             if not self.echo_gate_active:
                 self.echo_gate_active = True
                 logger.info(
-                    "Assistant echo guard active device=%s; microphone capture continues locally",
+                    "Assistant echo guard active device=%s reason=%s played_ms=%s; microphone capture continues locally",
                     self.device_id,
+                    "barge_in_warmup" if warmup_guarded and not fully_guarded else "playback",
+                    self.output.played_ms if self.output is not None else "-",
                 )
-            return
-        if self.echo_gate_active:
+            if fully_guarded:
+                return
+            # Keep OpenAI's input timeline moving, but do not forward speaker
+            # pickup during the first second of physical playback.
+            pcm = SILENT_INPUT_FRAME
+        elif self.echo_gate_active:
             logger.info(
-                "Assistant echo guard released device=%s suppressed_frames=%d",
+                "Assistant echo guard released device=%s suppressed_frames=%d played_ms=%s",
                 self.device_id,
                 self.echo_suppressed_frames,
+                self.output.played_ms if self.output is not None else "-",
             )
             self.echo_gate_active = False
             self.echo_suppressed_frames = 0
@@ -371,6 +383,13 @@ class DeviceSession:
                     self.device_id,
                     self.input_dropped_frames,
                 )
+
+    def _barge_in_warmup_active(self) -> bool:
+        return (
+            self.settings.barge_in_enabled
+            and self.output is not None
+            and self.output.played_ms < BARGE_IN_WARMUP_MS
+        )
 
     def _clear_input_queue(self) -> None:
         while True:
@@ -450,6 +469,16 @@ class DeviceSession:
             if self.announcement_echo_guard:
                 logger.info("Ignoring project-announcement echo VAD start device=%s", self.device_id)
                 return
+            if self._barge_in_warmup_active():
+                item_id = event.get("item_id")
+                if item_id:
+                    self.warmup_vad_items.add(item_id)
+                logger.info(
+                    "Ignoring VAD start during barge-in warmup device=%s played_ms=%d",
+                    self.device_id,
+                    self.output.played_ms,
+                )
+                return
             if self.output is not None and not self.settings.barge_in_enabled:
                 logger.info("Ignoring assistant-echo VAD start device=%s", self.device_id)
                 return
@@ -463,6 +492,10 @@ class DeviceSession:
                 event.get("audio_end_ms"),
                 event.get("item_id"),
             )
+            if event.get("item_id") in self.warmup_vad_items:
+                self.warmup_vad_items.discard(event["item_id"])
+                logger.info("Ignoring VAD stop from barge-in warmup device=%s", self.device_id)
+                return
             await self.set_state(DeviceState.THINKING)
             return
         if kind == "error":
@@ -711,6 +744,7 @@ class DeviceSession:
         self.ready_wait_requested = False
         self.waiting_for_ready = False
         self.pending_ready_call_id = None
+        self.warmup_vad_items.clear()
         if self.ready_keyword_enabled:
             await self.send_json("keyword.mode", mode="wake")
         await self.set_state(DeviceState.CONNECTING)
@@ -921,6 +955,7 @@ class DeviceSession:
             self.ready_wait_requested = False
             self.waiting_for_ready = False
             self.pending_ready_call_id = None
+            self.warmup_vad_items.clear()
             if self.ready_keyword_enabled:
                 notify_device = await self.send_optional(
                     "keyword.mode", notify_device, mode="wake"
