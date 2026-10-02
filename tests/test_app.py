@@ -39,6 +39,7 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
                     "input_noise_reduction": "far_field",
                     "vad_threshold": 0.55,
                     "vad_silence_duration_ms": 600,
+                    "barge_in_rms_threshold": 8500,
                 },
             )
             assert saved.status_code == 200
@@ -51,6 +52,7 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
             assert current.json()["input_noise_reduction"] == "far_field"
             assert current.json()["vad_threshold"] == 0.55
             assert current.json()["vad_silence_duration_ms"] == 600
+            assert current.json()["barge_in_rms_threshold"] == 8500
     get_settings.cache_clear()
 
 

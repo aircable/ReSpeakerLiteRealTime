@@ -3,10 +3,12 @@ import base64
 import contextlib
 import json
 import logging
+import math
 import time
 import uuid
-from dataclasses import dataclass
+from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, BinaryIO
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -25,6 +27,7 @@ MAX_DEVICE_PLAYBACK_LEAD_MS = 200
 MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
 PLAYBACK_FRAMES_PER_SECOND = round(1 / PLAYBACK_FRAME_SECONDS)
 BARGE_IN_WARMUP_MS = 1000  # Gate speaker onset using reported DAC playback, not generation time.
+BARGE_IN_LEVEL_WINDOW_FRAMES = 20  # 400 ms of 20 ms microphone frames.
 SILENT_INPUT_FRAME = bytes(FRAME_BYTES)
 
 
@@ -103,6 +106,11 @@ class DeviceSession:
         self.echo_gate_until = 0.0
         self.echo_suppressed_frames = 0
         self.warmup_vad_items: set[str] = set()
+        self.barge_gate_stream_id: str | None = None
+        self.barge_gate_frames: deque[tuple[bytes, int]] = deque()
+        self.barge_gate_square_sum = 0
+        self.barge_gate_peak_rms = 0
+        self.barge_gate_open = False
         self.announcement_echo_guard = False
         self.device_volume: float | None = None
         self.ready_keyword_enabled = bool((capabilities or {}).get("ready_keyword"))
@@ -225,6 +233,7 @@ class DeviceSession:
         self.planner.settings = self.settings
         self.accepting_audio = True
         self.warmup_vad_items.clear()
+        self._reset_barge_in_level_gate()
         project = self.db.get_project(requested_project_id)
         self.project_id = project["id"]
         self.session_id = self.db.start_session(self.project_id, self.device_id, self.settings.realtime_model)
@@ -311,10 +320,18 @@ class DeviceSession:
             return
         samples = memoryview(pcm).cast("h")
         frame_peak = max(abs(sample) for sample in samples)
+        frame_square_sum = sum(int(sample) * int(sample) for sample in samples)
+        output = self.output
+        if output is None:
+            if self.barge_gate_stream_id is not None:
+                self._reset_barge_in_level_gate()
+        elif self.barge_gate_stream_id != output.stream_id:
+            self._reset_barge_in_level_gate()
+            self.barge_gate_stream_id = output.stream_id
         self.input_frames_total += 1
         self.input_frames_interval += 1
         self.input_samples_interval += len(samples)
-        self.input_square_sum += sum(int(sample) * int(sample) for sample in samples)
+        self.input_square_sum += frame_square_sum
         self.input_peak = max(self.input_peak, frame_peak)
         current = time.monotonic()
         if self.input_frames_total == 1 or current - self.last_input_log >= 2:
@@ -333,28 +350,62 @@ class DeviceSession:
             self.input_square_sum = 0
             self.input_peak = 0
             self.last_input_log = current
+            if (
+                output is not None
+                and self.settings.barge_in_enabled
+                and self.settings.barge_in_rms_threshold > 0
+                and not self.barge_gate_open
+                and self.barge_gate_frames
+            ):
+                logger.info(
+                    "Barge-in level guard device=%s stream=%s max_rolling_rms=%d threshold=%d played_ms=%d",
+                    self.device_id,
+                    output.stream_id,
+                    self.barge_gate_peak_rms,
+                    self.settings.barge_in_rms_threshold,
+                    output.played_ms,
+                )
+                self.barge_gate_peak_rms = 0
         if self.diagnostic_input is not None:
             self.diagnostic_input.write(pcm)
         warmup_guarded = self._barge_in_warmup_active()
         fully_guarded = (
             self.announcement_echo_guard
             or time.monotonic() < self.echo_gate_until
-            or (not self.settings.barge_in_enabled and self.output is not None)
+            or (not self.settings.barge_in_enabled and output is not None)
         )
-        if fully_guarded or warmup_guarded:
+        pre_roll: list[bytes] | None = None
+        level_guarded = False
+        if (
+            not fully_guarded
+            and not warmup_guarded
+            and output is not None
+            and self.settings.barge_in_enabled
+            and self.settings.barge_in_rms_threshold > 0
+            and not self.barge_gate_open
+        ):
+            pre_roll = self._check_barge_in_level(pcm, frame_square_sum)
+            level_guarded = pre_roll is None
+        if fully_guarded or warmup_guarded or level_guarded:
             self.echo_suppressed_frames += 1
             if not self.echo_gate_active:
                 self.echo_gate_active = True
+                if fully_guarded:
+                    guard_reason = "playback"
+                elif warmup_guarded:
+                    guard_reason = "barge_in_warmup"
+                else:
+                    guard_reason = "barge_in_level"
                 logger.info(
                     "Assistant echo guard active device=%s reason=%s played_ms=%s; microphone capture continues locally",
                     self.device_id,
-                    "barge_in_warmup" if warmup_guarded and not fully_guarded else "playback",
-                    self.output.played_ms if self.output is not None else "-",
+                    guard_reason,
+                    output.played_ms if output is not None else "-",
                 )
             if fully_guarded:
                 return
-            # Keep OpenAI's input timeline moving, but do not forward speaker
-            # pickup during the first second of physical playback.
+            # Keep the OpenAI input timeline moving without forwarding speaker
+            # pickup until the physical-playback and level gates both release.
             pcm = SILENT_INPUT_FRAME
         elif self.echo_gate_active:
             logger.info(
@@ -369,20 +420,21 @@ class DeviceSession:
             return
         if self.cloud_ready:
             self._start_input_sender()
-        try:
-            self.input_queue.put_nowait(pcm)
-        except asyncio.QueueFull:
-            # Preserve the most recent speech if OpenAI startup or the LAN stalls beyond
-            # the five-second budget. Never backpressure the device receive loop.
-            self.input_queue.get_nowait()
-            self.input_queue.put_nowait(pcm)
-            self.input_dropped_frames += 1
-            if self.input_dropped_frames == 1 or self.input_dropped_frames % 50 == 0:
-                logger.warning(
-                    "OpenAI input queue full device=%s dropped_frames=%d",
-                    self.device_id,
-                    self.input_dropped_frames,
-                )
+        for input_frame in pre_roll if pre_roll is not None else (pcm,):
+            try:
+                self.input_queue.put_nowait(input_frame)
+            except asyncio.QueueFull:
+                # Preserve the most recent speech if OpenAI startup or the LAN stalls beyond
+                # the five-second budget. Never backpressure the device receive loop.
+                self.input_queue.get_nowait()
+                self.input_queue.put_nowait(input_frame)
+                self.input_dropped_frames += 1
+                if self.input_dropped_frames == 1 or self.input_dropped_frames % 50 == 0:
+                    logger.warning(
+                        "OpenAI input queue full device=%s dropped_frames=%d",
+                        self.device_id,
+                        self.input_dropped_frames,
+                    )
 
     def _barge_in_warmup_active(self) -> bool:
         return (
@@ -390,6 +442,43 @@ class DeviceSession:
             and self.output is not None
             and self.output.played_ms < BARGE_IN_WARMUP_MS
         )
+
+    def _reset_barge_in_level_gate(self) -> None:
+        self.barge_gate_stream_id = None
+        self.barge_gate_frames.clear()
+        self.barge_gate_square_sum = 0
+        self.barge_gate_peak_rms = 0
+        self.barge_gate_open = False
+
+    def _check_barge_in_level(self, pcm: bytes, frame_square_sum: int) -> list[bytes] | None:
+        if len(self.barge_gate_frames) == BARGE_IN_LEVEL_WINDOW_FRAMES:
+            _, old_square_sum = self.barge_gate_frames.popleft()
+            self.barge_gate_square_sum -= old_square_sum
+        self.barge_gate_frames.append((pcm, frame_square_sum))
+        self.barge_gate_square_sum += frame_square_sum
+        sample_count = len(self.barge_gate_frames) * (FRAME_BYTES // 2)
+        rolling_rms = math.isqrt(self.barge_gate_square_sum // sample_count)
+        self.barge_gate_peak_rms = max(self.barge_gate_peak_rms, rolling_rms)
+        threshold = self.settings.barge_in_rms_threshold
+        if (
+            len(self.barge_gate_frames) < BARGE_IN_LEVEL_WINDOW_FRAMES
+            or self.barge_gate_square_sum < threshold * threshold * sample_count
+        ):
+            return None
+        pre_roll = [frame for frame, _ in self.barge_gate_frames]
+        self.barge_gate_frames.clear()
+        self.barge_gate_square_sum = 0
+        self.barge_gate_open = True
+        logger.info(
+            "Barge-in level qualified device=%s stream=%s rolling_rms=%d threshold=%d pre_roll_ms=%d played_ms=%d",
+            self.device_id,
+            self.barge_gate_stream_id,
+            rolling_rms,
+            threshold,
+            len(pre_roll) * 20,
+            self.output.played_ms if self.output is not None else 0,
+        )
+        return pre_roll
 
     def _clear_input_queue(self) -> None:
         while True:
@@ -452,6 +541,7 @@ class DeviceSession:
             with contextlib.suppress(Exception):
                 await cloud.truncate(output.item_id, output.content_index, output.played_ms)
         self.output = None
+        self._reset_barge_in_level_gate()
         self.playback_progress_event.set()
         self.output_buffer.clear()
         self._clear_playback_queue()
@@ -956,6 +1046,7 @@ class DeviceSession:
             self.waiting_for_ready = False
             self.pending_ready_call_id = None
             self.warmup_vad_items.clear()
+            self._reset_barge_in_level_gate()
             if self.ready_keyword_enabled:
                 notify_device = await self.send_optional(
                     "keyword.mode", notify_device, mode="wake"
@@ -1037,6 +1128,7 @@ class DeviceSession:
             output.played_ms,
         )
         self.output = None
+        self._reset_barge_in_level_gate()
         self.playback_progress_event.set()
         if self.announcement_echo_guard:
             self.announcement_echo_guard = False
