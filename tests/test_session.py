@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 from fastapi import WebSocketDisconnect
 
 from gateway.config import Settings
@@ -7,6 +8,7 @@ from gateway.db import Database
 from gateway.planner import Planner
 from gateway.protocol import FRAME_BYTES, DeviceState
 from gateway.session import (
+    BARGE_IN_WARMUP_MS,
     MAX_DEVICE_PLAYBACK_LEAD_MS,
     MAX_QUEUED_INPUT_FRAMES,
     PLAYBACK_COMPLETION_TOLERANCE_MS,
@@ -227,6 +229,56 @@ async def test_echo_guard_withholds_playback_audio_then_releases(tmp_path):
     await session._stop_input_sender()
 
 
+async def test_barge_in_warmup_sends_silence_until_one_second_played(tmp_path):
+    session, _ = make_session(tmp_path, barge_in_enabled=True)
+    session.output = OutputStream("stream", "response", "item", 0, sent_ms=1200)
+    session.diagnostic_input = io.BytesIO()
+    frame = b"\x01\x02" * (FRAME_BYTES // 2)
+
+    await session.receive_audio(frame)
+    await wait_for(lambda: len(session.cloud.audio) == 1)
+    assert session.cloud.audio == [bytes(FRAME_BYTES)]
+    assert session.diagnostic_input.getvalue() == frame
+
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS - 20)
+    await session.receive_audio(frame)
+    await wait_for(lambda: len(session.cloud.audio) == 2)
+    assert session.cloud.audio[-1] == bytes(FRAME_BYTES)
+
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS)
+    await session.receive_audio(frame)
+    await wait_for(lambda: len(session.cloud.audio) == 3)
+    assert session.cloud.audio[-1] == frame
+    assert session.diagnostic_input.getvalue() == frame * 3
+    await session._stop_input_sender()
+
+
+async def test_barge_in_warmup_ignores_vad_start_and_matching_stop(tmp_path):
+    session, ws = make_session(tmp_path, barge_in_enabled=True)
+    session.output = OutputStream("stream", "response", "item", 0, sent_ms=1200)
+
+    await session.handle_openai_event(
+        {"type": "input_audio_buffer.speech_started", "item_id": "warmup-item"}
+    )
+    assert session.output is not None
+    assert session.cloud.truncations == []
+    await session.handle_openai_event(
+        {"type": "input_audio_buffer.speech_stopped", "item_id": "warmup-item"}
+    )
+    assert session.state == DeviceState.IDLE
+    assert "warmup-item" not in session.warmup_vad_items
+
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS)
+    await session.handle_openai_event(
+        {"type": "input_audio_buffer.speech_started", "item_id": "later-item"}
+    )
+    assert session.output is None
+    assert session.cloud.truncations == [("item", 0, BARGE_IN_WARMUP_MS)]
+    assert any(
+        message[1]["type"] == "playback.flush" for message in ws.messages if message[0] == "json"
+    )
+
+
 async def test_project_announcement_cannot_barge_into_itself(tmp_path):
     session, _ = make_session(tmp_path, barge_in_enabled=True)
     frame = bytes(FRAME_BYTES)
@@ -367,12 +419,13 @@ async def test_barge_in_flushes_truncates_and_rejects_late_audio(tmp_path):
     await session.handle_openai_event(event)
     stream_id = session.output.stream_id
     await wait_for(lambda: session.output.sent_ms == 20)
-    await session.playback_progress(stream_id, 20)
+    session.output.sent_ms = BARGE_IN_WARMUP_MS
+    await session.playback_progress(stream_id, BARGE_IN_WARMUP_MS)
     await session.handle_openai_event({"type": "input_audio_buffer.speech_started"})
 
     assert any(message[1]["type"] == "playback.flush" for message in ws.messages if message[0] == "json")
     assert session.cloud.cancelled == 0
-    assert session.cloud.truncations == [("item-1", 0, 20)]
+    assert session.cloud.truncations == [("item-1", 0, BARGE_IN_WARMUP_MS)]
     assert session.state == DeviceState.LISTENING
 
     binary_count = sum(kind == "bytes" for kind, _ in ws.messages)
