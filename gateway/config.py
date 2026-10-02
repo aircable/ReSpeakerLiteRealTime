@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     diagnostic_audio: bool = False
     openai_trace: bool = False
     barge_in_enabled: bool = False
+    # PCM16 RMS required during assistant playback; 0 disables the local gate.
+    barge_in_rms_threshold: int = Field(default=8000, ge=0, le=32768)
     announce_active_project: bool = True
     transcript_retention_days: int = Field(default=0, ge=0, le=3650)
 

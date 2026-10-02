@@ -8,6 +8,7 @@ from gateway.db import Database
 from gateway.planner import Planner
 from gateway.protocol import FRAME_BYTES, DeviceState
 from gateway.session import (
+    BARGE_IN_LEVEL_WINDOW_FRAMES,
     BARGE_IN_WARMUP_MS,
     MAX_DEVICE_PLAYBACK_LEAD_MS,
     MAX_QUEUED_INPUT_FRAMES,
@@ -230,7 +231,9 @@ async def test_echo_guard_withholds_playback_audio_then_releases(tmp_path):
 
 
 async def test_barge_in_warmup_sends_silence_until_one_second_played(tmp_path):
-    session, _ = make_session(tmp_path, barge_in_enabled=True)
+    session, _ = make_session(
+        tmp_path, barge_in_enabled=True, barge_in_rms_threshold=0
+    )
     session.output = OutputStream("stream", "response", "item", 0, sent_ms=1200)
     session.diagnostic_input = io.BytesIO()
     frame = b"\x01\x02" * (FRAME_BYTES // 2)
@@ -250,6 +253,58 @@ async def test_barge_in_warmup_sends_silence_until_one_second_played(tmp_path):
     await wait_for(lambda: len(session.cloud.audio) == 3)
     assert session.cloud.audio[-1] == frame
     assert session.diagnostic_input.getvalue() == frame * 3
+    await session._stop_input_sender()
+
+
+async def test_barge_in_level_gate_rejects_echo_and_preserves_speech_preroll(tmp_path):
+    session, _ = make_session(tmp_path, barge_in_enabled=True)
+    session.output = OutputStream("stream", "response", "item", 0, sent_ms=2000)
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS)
+    session.diagnostic_input = io.BytesIO()
+    echo = (2000).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    speech = (10000).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+
+    for _ in range(BARGE_IN_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(echo)
+    await wait_for(lambda: len(session.cloud.audio) == BARGE_IN_LEVEL_WINDOW_FRAMES)
+    assert session.cloud.audio == [bytes(FRAME_BYTES)] * BARGE_IN_LEVEL_WINDOW_FRAMES
+    assert not session.barge_gate_open
+
+    for _ in range(BARGE_IN_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(speech)
+    await wait_for(lambda: len(session.cloud.audio) == 3 * BARGE_IN_LEVEL_WINDOW_FRAMES - 1)
+    assert session.cloud.audio[-BARGE_IN_LEVEL_WINDOW_FRAMES:] == [speech] * BARGE_IN_LEVEL_WINDOW_FRAMES
+    assert session.barge_gate_open
+    assert session.diagnostic_input.getvalue() == (
+        echo * BARGE_IN_LEVEL_WINDOW_FRAMES
+        + speech * BARGE_IN_LEVEL_WINDOW_FRAMES
+    )
+
+    await session.receive_audio(echo)
+    await wait_for(lambda: len(session.cloud.audio) == 3 * BARGE_IN_LEVEL_WINDOW_FRAMES)
+    assert session.cloud.audio[-1] == echo  # The gate stays open for this reply.
+
+    await session._complete_playback("test")
+    assert not session.barge_gate_open
+    assert not session.barge_gate_frames
+    await session.receive_audio(echo)
+    await wait_for(lambda: len(session.cloud.audio) == 3 * BARGE_IN_LEVEL_WINDOW_FRAMES + 1)
+    assert session.cloud.audio[-1] == echo  # Normal listening has no level gate.
+    await session._stop_input_sender()
+
+
+async def test_barge_in_level_gate_ignores_a_single_full_scale_spike(tmp_path):
+    session, _ = make_session(tmp_path, barge_in_enabled=True)
+    session.output = OutputStream("stream", "response", "item", 0, sent_ms=2000)
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS)
+    spike = (32767).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    for _ in range(BARGE_IN_LEVEL_WINDOW_FRAMES - 1):
+        await session.receive_audio(bytes(FRAME_BYTES))
+    await session.receive_audio(spike)
+
+    await wait_for(lambda: len(session.cloud.audio) == BARGE_IN_LEVEL_WINDOW_FRAMES)
+    assert not session.barge_gate_open
+    assert session.cloud.audio == [bytes(FRAME_BYTES)] * BARGE_IN_LEVEL_WINDOW_FRAMES
     await session._stop_input_sender()
 
 
