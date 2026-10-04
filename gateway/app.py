@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import secrets
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 from typing import Annotated, Any
@@ -93,6 +93,8 @@ class GatewaySettingsUpdate(BaseModel):
     openai_trace: bool | None = None
     barge_in_enabled: bool | None = None
     barge_in_rms_threshold: int | None = Field(default=None, ge=0, le=32768)
+    xvf_agc_ch0_gain: float | None = Field(default=None, ge=0.0, le=1000.0)
+    listening_rms_threshold: int | None = Field(default=None, ge=0, le=32768)
     announce_active_project: bool | None = None
     transcript_retention_days: int | None = Field(default=None, ge=0, le=3650)
 
@@ -167,7 +169,13 @@ async def gateway_settings(
 async def update_gateway_settings(
     body: GatewaySettingsUpdate, db: Annotated[Database, Depends(database)]
 ) -> dict[str, bool]:
-    db.update_settings(body.model_dump(exclude_none=True))
+    values = body.model_dump(exclude_none=True)
+    db.update_settings(values)
+    if "xvf_agc_ch0_gain" in values:
+        for session in tuple(device_sessions.values()):
+            if session.xvf_agc_ch0_supported:
+                with suppress(WebSocketDisconnect, RuntimeError):
+                    await session.request_xvf_gain(values["xvf_agc_ch0_gain"])
     return {"saved": True}
 
 
@@ -281,6 +289,9 @@ async def device_socket(websocket: WebSocket) -> None:
             device_id=auth.device_id,
             audio={"format": "pcm_s16le", "sample_rate": 24000, "channels": 1, "frame_ms": 20},
         )
+        # Apply before the wake word whenever the device is already online.
+        # start() resends current UI overrides for a persistent connection.
+        await session.request_xvf_gain(effective_settings.xvf_agc_ch0_gain)
         while True:
             incoming = await websocket.receive()
             if incoming.get("bytes") is not None:

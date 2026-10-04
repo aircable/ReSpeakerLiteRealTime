@@ -4,7 +4,7 @@ import logging
 import httpx
 from fastapi import WebSocketDisconnect
 
-from gateway.app import app, device_socket
+from gateway.app import app, device_sessions, device_socket
 from gateway.config import get_settings
 
 
@@ -40,6 +40,8 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
                     "vad_threshold": 0.55,
                     "vad_silence_duration_ms": 600,
                     "barge_in_rms_threshold": 8500,
+                    "xvf_agc_ch0_gain": 25.0,
+                    "listening_rms_threshold": 800,
                 },
             )
             assert saved.status_code == 200
@@ -53,6 +55,8 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
             assert current.json()["vad_threshold"] == 0.55
             assert current.json()["vad_silence_duration_ms"] == 600
             assert current.json()["barge_in_rms_threshold"] == 8500
+            assert current.json()["xvf_agc_ch0_gain"] == 25.0
+            assert current.json()["listening_rms_threshold"] == 800
     get_settings.cache_clear()
 
 
@@ -73,9 +77,10 @@ async def test_startup_logs_and_health_identify_build(monkeypatch, tmp_path, cap
 
 
 class FakeDeviceSocket:
-    def __init__(self):
+    def __init__(self, capabilities=None):
         self.sent = []
         self.received = False
+        self.capabilities = capabilities or {"aec": True}
 
     async def accept(self):
         pass
@@ -86,7 +91,7 @@ class FakeDeviceSocket:
             "type": "auth",
             "token": "device-secret",
             "device_id": "test-unit",
-            "capabilities": {"aec": True},
+            "capabilities": self.capabilities,
         }
 
     async def receive(self):
@@ -110,3 +115,46 @@ async def test_device_websocket_auth_and_heartbeat(monkeypatch, tmp_path):
     assert [message["type"] for message in socket.sent] == ["auth.ok", "heartbeat.ack"]
     assert socket.sent[1]["monotonic_ms"] == 123
     get_settings.cache_clear()
+
+
+async def test_xvf_device_gets_gain_on_authentication(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    async with app.router.lifespan_context(app):
+        socket = FakeDeviceSocket({"aec": True, "xvf_agc_ch0": True})
+        await device_socket(socket)
+    assert [message["type"] for message in socket.sent] == [
+        "auth.ok", "mic_gain.set", "heartbeat.ack"
+    ]
+    assert socket.sent[1]["ch0_gain"] == 25.0
+    assert socket.sent[2]["monotonic_ms"] == 123
+    get_settings.cache_clear()
+
+
+async def test_gain_setting_reaches_connected_xvf_without_new_session(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+
+    class GainSession:
+        xvf_agc_ch0_supported = True
+
+        def __init__(self):
+            self.gains = []
+
+        async def request_xvf_gain(self, gain):
+            self.gains.append(gain)
+
+    device = GainSession()
+    device_sessions["xvf-test"] = device
+    try:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.patch(
+                    "/api/settings",
+                    headers={"Authorization": "Bearer browser-secret"},
+                    json={"xvf_agc_ch0_gain": 12.5},
+                )
+        assert response.status_code == 200
+        assert device.gains == [12.5]
+    finally:
+        del device_sessions["xvf-test"]
+        get_settings.cache_clear()

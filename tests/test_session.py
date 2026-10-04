@@ -10,6 +10,9 @@ from gateway.protocol import FRAME_BYTES, DeviceState
 from gateway.session import (
     BARGE_IN_LEVEL_WINDOW_FRAMES,
     BARGE_IN_WARMUP_MS,
+    LISTENING_LEVEL_MIN_ACTIVE_FRAMES,
+    LISTENING_LEVEL_RELEASE_FRAMES,
+    LISTENING_LEVEL_WINDOW_FRAMES,
     MAX_DEVICE_PLAYBACK_LEAD_MS,
     MAX_QUEUED_INPUT_FRAMES,
     PLAYBACK_COMPLETION_TOLERANCE_MS,
@@ -88,6 +91,7 @@ def make_session(tmp_path, **setting_overrides):
         "ui_token": "browser-secret",
         "database_path": tmp_path / "test.db",
         "idle_timeout_seconds": 30,
+        "listening_rms_threshold": 0,
         **setting_overrides,
     }
     settings = Settings(**setting_values)
@@ -308,6 +312,54 @@ async def test_barge_in_level_gate_ignores_a_single_full_scale_spike(tmp_path):
     await session._stop_input_sender()
 
 
+async def test_listening_gate_rejects_quiet_voice_and_click_then_passes_loud_speech(tmp_path):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    session.diagnostic_input = io.BytesIO()
+    quiet = (300).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    click = (32767).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    speech = (2000).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+
+    for _ in range(LISTENING_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(quiet)
+    await session.receive_audio(click)
+    for _ in range(LISTENING_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(quiet)
+    await wait_for(lambda: len(session.cloud.audio) == 2 * LISTENING_LEVEL_WINDOW_FRAMES + 1)
+    assert not session.listening_gate_open
+    assert session.cloud.audio == [bytes(FRAME_BYTES)] * len(session.cloud.audio)
+
+    for _ in range(LISTENING_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(speech)
+    await wait_for(lambda: len(session.cloud.audio) == 3 * LISTENING_LEVEL_WINDOW_FRAMES + 8)
+    assert session.listening_gate_open
+    assert session.cloud.audio[-LISTENING_LEVEL_WINDOW_FRAMES:] == [speech] * LISTENING_LEVEL_WINDOW_FRAMES
+    assert session.diagnostic_input.getvalue() == (
+        quiet * LISTENING_LEVEL_WINDOW_FRAMES
+        + click
+        + quiet * LISTENING_LEVEL_WINDOW_FRAMES
+        + speech * LISTENING_LEVEL_WINDOW_FRAMES
+    )
+
+    for _ in range(LISTENING_LEVEL_RELEASE_FRAMES):
+        await session.receive_audio(quiet)
+    assert not session.listening_gate_open
+    await session.receive_audio(quiet)
+    await wait_for(lambda: session.cloud.audio[-1] == bytes(FRAME_BYTES))
+    await session._stop_input_sender()
+
+
+async def test_listening_gate_requires_sustained_level_not_peak(tmp_path):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    loud = (2000).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    for _ in range(LISTENING_LEVEL_MIN_ACTIVE_FRAMES - 1):
+        await session.receive_audio(loud)
+    for _ in range(LISTENING_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(bytes(FRAME_BYTES))
+    assert not session.listening_gate_open
+    assert all(frame == bytes(FRAME_BYTES) for frame in session.cloud.audio)
+    await session._stop_input_sender()
+
+
 async def test_barge_in_warmup_ignores_vad_start_and_matching_stop(tmp_path):
     session, ws = make_session(tmp_path, barge_in_enabled=True)
     session.output = OutputStream("stream", "response", "item", 0, sent_ms=1200)
@@ -449,6 +501,42 @@ async def test_session_reloads_diagnostic_setting_and_creates_recordings(
     diagnostic_dir = settings.database_path.parent / "diagnostic-audio"
     assert (diagnostic_dir / f"session-{session_id}-input.pcm").exists()
     assert (diagnostic_dir / f"session-{session_id}-output.pcm").exists()
+
+
+async def test_xvf_gain_is_sent_at_session_start_only_to_supported_device(
+    tmp_path, monkeypatch
+):
+    settings = Settings(
+        device_token="device-secret",
+        ui_token="browser-secret",
+        database_path=tmp_path / "test.db",
+        announce_active_project=False,
+    )
+    db = Database(settings.database_path)
+    db.initialize()
+    db.update_settings({"xvf_agc_ch0_gain": 18.0})
+    monkeypatch.setattr("gateway.session.RealtimeConnection", FakeRealtime)
+
+    supported_socket = FakeWebSocket()
+    supported = DeviceSession(
+        supported_socket, "xvf", settings, db, FakePlanner(),
+        capabilities={"xvf_agc_ch0": True},
+    )
+    await supported.start(None)
+    assert any(
+        value["type"] == "mic_gain.set" and value["ch0_gain"] == 18.0
+        for kind, value in supported_socket.messages if kind == "json"
+    )
+    await supported.stop("test")
+
+    unsupported_socket = FakeWebSocket()
+    unsupported = DeviceSession(unsupported_socket, "seeed", settings, db, FakePlanner())
+    await unsupported.start(None)
+    assert not any(
+        value["type"] == "mic_gain.set"
+        for kind, value in unsupported_socket.messages if kind == "json"
+    )
+    await unsupported.stop("test")
 
 
 async def wait_for(predicate):

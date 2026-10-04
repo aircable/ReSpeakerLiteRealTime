@@ -28,6 +28,9 @@ MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
 PLAYBACK_FRAMES_PER_SECOND = round(1 / PLAYBACK_FRAME_SECONDS)
 BARGE_IN_WARMUP_MS = 1000  # Gate speaker onset using reported DAC playback, not generation time.
 BARGE_IN_LEVEL_WINDOW_FRAMES = 20  # 400 ms of 20 ms microphone frames.
+LISTENING_LEVEL_WINDOW_FRAMES = 8  # 160 ms; a click must not start a turn.
+LISTENING_LEVEL_MIN_ACTIVE_FRAMES = 6  # At least 120 ms above the configured RMS.
+LISTENING_LEVEL_RELEASE_FRAMES = 50  # Return to gated listening after 1 s quiet.
 SILENT_INPUT_FRAME = bytes(FRAME_BYTES)
 
 
@@ -111,9 +114,15 @@ class DeviceSession:
         self.barge_gate_square_sum = 0
         self.barge_gate_peak_rms = 0
         self.barge_gate_open = False
+        self.listening_gate_frames: deque[tuple[bytes, bool]] = deque()
+        self.listening_gate_active_frames = 0
+        self.listening_gate_open = False
+        self.listening_gate_quiet_frames = 0
+        self.listening_gate_peak_rms = 0
         self.announcement_echo_guard = False
         self.device_volume: float | None = None
         self.ready_keyword_enabled = bool((capabilities or {}).get("ready_keyword"))
+        self.xvf_agc_ch0_supported = bool((capabilities or {}).get("xvf_agc_ch0"))
         self.ready_wait_requested = False
         self.waiting_for_ready = False
         self.pending_ready_call_id: str | None = None
@@ -138,6 +147,16 @@ class DeviceSession:
             "volume.changed",
             level=self.device_volume,
             level_percent=round(self.device_volume * 100),
+        )
+
+    async def request_xvf_gain(self, gain: float) -> None:
+        if not self.xvf_agc_ch0_supported:
+            return
+        await self.send_json("mic_gain.set", ch0_gain=gain)
+        logger.info(
+            "XMOS channel-0 AGC requested device=%s gain=%.1f (0=adaptive)",
+            self.device_id,
+            gain,
         )
 
     async def control_volume(
@@ -234,6 +253,7 @@ class DeviceSession:
         self.accepting_audio = True
         self.warmup_vad_items.clear()
         self._reset_barge_in_level_gate()
+        self._reset_listening_level_gate()
         project = self.db.get_project(requested_project_id)
         self.project_id = project["id"]
         self.session_id = self.db.start_session(self.project_id, self.device_id, self.settings.realtime_model)
@@ -283,6 +303,7 @@ class DeviceSession:
         )
         await self.set_state(DeviceState.CONNECTING)
         try:
+            await self.request_xvf_gain(self.settings.xvf_agc_ch0_gain)
             await self.cloud.connect()
         except Exception:
             self.db.end_session(self.session_id, "connect_error", {})
@@ -325,9 +346,11 @@ class DeviceSession:
         if output is None:
             if self.barge_gate_stream_id is not None:
                 self._reset_barge_in_level_gate()
-        elif self.barge_gate_stream_id != output.stream_id:
-            self._reset_barge_in_level_gate()
-            self.barge_gate_stream_id = output.stream_id
+        else:
+            if self.barge_gate_stream_id != output.stream_id:
+                self._reset_barge_in_level_gate()
+                self.barge_gate_stream_id = output.stream_id
+            self._reset_listening_level_gate()
         self.input_frames_total += 1
         self.input_frames_interval += 1
         self.input_samples_interval += len(samples)
@@ -366,6 +389,18 @@ class DeviceSession:
                     output.played_ms,
                 )
                 self.barge_gate_peak_rms = 0
+            if (
+                output is None
+                and self.settings.listening_rms_threshold > 0
+                and not self.listening_gate_open
+            ):
+                logger.info(
+                    "Listening level guard device=%s max_frame_rms=%d threshold=%d",
+                    self.device_id,
+                    self.listening_gate_peak_rms,
+                    self.settings.listening_rms_threshold,
+                )
+                self.listening_gate_peak_rms = 0
         if self.diagnostic_input is not None:
             self.diagnostic_input.write(pcm)
         warmup_guarded = self._barge_in_warmup_active()
@@ -418,6 +453,16 @@ class DeviceSession:
             self.echo_suppressed_frames = 0
         if not self.accepting_audio:
             return
+        if (
+            output is None
+            and not fully_guarded
+            and self.settings.listening_rms_threshold > 0
+        ):
+            listening_frames = self._check_listening_level(pcm, frame_square_sum)
+            if listening_frames is None:
+                pcm = SILENT_INPUT_FRAME
+            else:
+                pre_roll = listening_frames
         if self.cloud_ready:
             self._start_input_sender()
         for input_frame in pre_roll if pre_roll is not None else (pcm,):
@@ -477,6 +522,50 @@ class DeviceSession:
             threshold,
             len(pre_roll) * 20,
             self.output.played_ms if self.output is not None else 0,
+        )
+        return pre_roll
+
+    def _reset_listening_level_gate(self) -> None:
+        self.listening_gate_frames.clear()
+        self.listening_gate_active_frames = 0
+        self.listening_gate_open = False
+        self.listening_gate_quiet_frames = 0
+        self.listening_gate_peak_rms = 0
+
+    def _check_listening_level(self, pcm: bytes, frame_square_sum: int) -> list[bytes] | None:
+        frame_rms = math.isqrt(frame_square_sum // (FRAME_BYTES // 2))
+        threshold = self.settings.listening_rms_threshold
+        if self.listening_gate_open:
+            self.listening_gate_quiet_frames = (
+                0 if frame_rms >= threshold else self.listening_gate_quiet_frames + 1
+            )
+            if self.listening_gate_quiet_frames >= LISTENING_LEVEL_RELEASE_FRAMES:
+                self._reset_listening_level_gate()
+                return None
+            return [pcm]
+        self.listening_gate_peak_rms = max(self.listening_gate_peak_rms, frame_rms)
+        if len(self.listening_gate_frames) == LISTENING_LEVEL_WINDOW_FRAMES:
+            _, was_active = self.listening_gate_frames.popleft()
+            self.listening_gate_active_frames -= int(was_active)
+        active = frame_rms >= threshold
+        self.listening_gate_frames.append((pcm, active))
+        self.listening_gate_active_frames += int(active)
+        if (
+            len(self.listening_gate_frames) < LISTENING_LEVEL_WINDOW_FRAMES
+            or self.listening_gate_active_frames < LISTENING_LEVEL_MIN_ACTIVE_FRAMES
+        ):
+            return None
+        pre_roll = [frame for frame, _ in self.listening_gate_frames]
+        self.listening_gate_frames.clear()
+        self.listening_gate_active_frames = 0
+        self.listening_gate_open = True
+        self.listening_gate_quiet_frames = 0
+        logger.info(
+            "Listening level qualified device=%s threshold=%d active_frames=%d pre_roll_ms=%d",
+            self.device_id,
+            threshold,
+            LISTENING_LEVEL_MIN_ACTIVE_FRAMES,
+            len(pre_roll) * 20,
         )
         return pre_roll
 
@@ -542,6 +631,10 @@ class DeviceSession:
                 await cloud.truncate(output.item_id, output.content_index, output.played_ms)
         self.output = None
         self._reset_barge_in_level_gate()
+        self._reset_listening_level_gate()
+        # The server has already recognized this barge-in; do not hide the
+        # remainder of the same utterance behind the idle listening gate.
+        self.listening_gate_open = True
         self.playback_progress_event.set()
         self.output_buffer.clear()
         self._clear_playback_queue()
@@ -586,6 +679,7 @@ class DeviceSession:
                 self.warmup_vad_items.discard(event["item_id"])
                 logger.info("Ignoring VAD stop from barge-in warmup device=%s", self.device_id)
                 return
+            self._reset_listening_level_gate()
             await self.set_state(DeviceState.THINKING)
             return
         if kind == "error":
@@ -1047,6 +1141,7 @@ class DeviceSession:
             self.pending_ready_call_id = None
             self.warmup_vad_items.clear()
             self._reset_barge_in_level_gate()
+            self._reset_listening_level_gate()
             if self.ready_keyword_enabled:
                 notify_device = await self.send_optional(
                     "keyword.mode", notify_device, mode="wake"
@@ -1129,6 +1224,7 @@ class DeviceSession:
         )
         self.output = None
         self._reset_barge_in_level_gate()
+        self._reset_listening_level_gate()
         self.playback_progress_event.set()
         if self.announcement_echo_guard:
             self.announcement_echo_guard = False
