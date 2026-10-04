@@ -112,13 +112,19 @@ class DeviceSession:
         self.barge_gate_stream_id: str | None = None
         self.barge_gate_frames: deque[tuple[bytes, int]] = deque()
         self.barge_gate_square_sum = 0
-        self.barge_gate_peak_rms = 0
+        self.barge_gate_max_full_rms = 0
+        self.barge_gate_max_partial_rms = 0
+        self.barge_gate_full_windows = 0
+        self.barge_gate_last_played_ms = 0
         self.barge_gate_open = False
-        self.listening_gate_frames: deque[tuple[bytes, bool]] = deque()
+        self.listening_gate_frames: deque[tuple[bytes, int]] = deque()
         self.listening_gate_active_frames = 0
         self.listening_gate_open = False
         self.listening_gate_quiet_frames = 0
-        self.listening_gate_peak_rms = 0
+        self.listening_gate_max_frame_rms = 0
+        self.listening_gate_max_decision_rms = 0
+        self.listening_gate_max_active_frames = 0
+        self.listening_gate_full_windows = 0
         self.announcement_echo_guard = False
         self.device_volume: float | None = None
         self.ready_keyword_enabled = bool((capabilities or {}).get("ready_keyword"))
@@ -380,27 +386,13 @@ class DeviceSession:
                 and not self.barge_gate_open
                 and self.barge_gate_frames
             ):
-                logger.info(
-                    "Barge-in level guard device=%s stream=%s max_rolling_rms=%d threshold=%d played_ms=%d",
-                    self.device_id,
-                    output.stream_id,
-                    self.barge_gate_peak_rms,
-                    self.settings.barge_in_rms_threshold,
-                    output.played_ms,
-                )
-                self.barge_gate_peak_rms = 0
+                self._log_barge_in_level_guard("periodic")
             if (
                 output is None
                 and self.settings.listening_rms_threshold > 0
                 and not self.listening_gate_open
             ):
-                logger.info(
-                    "Listening level guard device=%s max_frame_rms=%d threshold=%d",
-                    self.device_id,
-                    self.listening_gate_peak_rms,
-                    self.settings.listening_rms_threshold,
-                )
-                self.listening_gate_peak_rms = 0
+                self._log_listening_level_guard("periodic")
         if self.diagnostic_input is not None:
             self.diagnostic_input.write(pcm)
         warmup_guarded = self._barge_in_warmup_active()
@@ -489,11 +481,39 @@ class DeviceSession:
         )
 
     def _reset_barge_in_level_gate(self) -> None:
+        if not self.barge_gate_open:
+            self._log_barge_in_level_guard("stream_end")
         self.barge_gate_stream_id = None
         self.barge_gate_frames.clear()
         self.barge_gate_square_sum = 0
-        self.barge_gate_peak_rms = 0
+        self.barge_gate_max_full_rms = 0
+        self.barge_gate_max_partial_rms = 0
+        self.barge_gate_full_windows = 0
+        self.barge_gate_last_played_ms = 0
         self.barge_gate_open = False
+
+    def _log_barge_in_level_guard(self, reason: str) -> None:
+        if not self.barge_gate_full_windows and not self.barge_gate_max_partial_rms:
+            return
+        threshold = self.settings.barge_in_rms_threshold
+        full_rms = (
+            str(self.barge_gate_max_full_rms) if self.barge_gate_full_windows else "n/a"
+        )
+        margin = (
+            f"{self.barge_gate_max_full_rms - threshold:+d}"
+            if self.barge_gate_full_windows else "n/a"
+        )
+        logger.info(
+            "Barge-in level guard device=%s stream=%s max_full_window_rms=%s "
+            "threshold=%d margin=%s full_windows=%d window_ms=%d "
+            "max_partial_rms=%d played_ms=%d reason=%s",
+            self.device_id, self.barge_gate_stream_id, full_rms, threshold, margin,
+            self.barge_gate_full_windows, BARGE_IN_LEVEL_WINDOW_FRAMES * 20,
+            self.barge_gate_max_partial_rms, self.barge_gate_last_played_ms, reason,
+        )
+        self.barge_gate_max_full_rms = 0
+        self.barge_gate_max_partial_rms = 0
+        self.barge_gate_full_windows = 0
 
     def _check_barge_in_level(self, pcm: bytes, frame_square_sum: int) -> list[bytes] | None:
         if len(self.barge_gate_frames) == BARGE_IN_LEVEL_WINDOW_FRAMES:
@@ -503,34 +523,73 @@ class DeviceSession:
         self.barge_gate_square_sum += frame_square_sum
         sample_count = len(self.barge_gate_frames) * (FRAME_BYTES // 2)
         rolling_rms = math.isqrt(self.barge_gate_square_sum // sample_count)
-        self.barge_gate_peak_rms = max(self.barge_gate_peak_rms, rolling_rms)
+        self.barge_gate_last_played_ms = self.output.played_ms if self.output is not None else 0
+        if len(self.barge_gate_frames) < BARGE_IN_LEVEL_WINDOW_FRAMES:
+            self.barge_gate_max_partial_rms = max(self.barge_gate_max_partial_rms, rolling_rms)
+            return None
+        self.barge_gate_full_windows += 1
+        self.barge_gate_max_full_rms = max(self.barge_gate_max_full_rms, rolling_rms)
         threshold = self.settings.barge_in_rms_threshold
-        if (
-            len(self.barge_gate_frames) < BARGE_IN_LEVEL_WINDOW_FRAMES
-            or self.barge_gate_square_sum < threshold * threshold * sample_count
-        ):
+        if self.barge_gate_square_sum < threshold * threshold * sample_count:
             return None
         pre_roll = [frame for frame, _ in self.barge_gate_frames]
         self.barge_gate_frames.clear()
         self.barge_gate_square_sum = 0
         self.barge_gate_open = True
         logger.info(
-            "Barge-in level qualified device=%s stream=%s rolling_rms=%d threshold=%d pre_roll_ms=%d played_ms=%d",
+            "Barge-in level qualified device=%s stream=%s rolling_rms=%d "
+            "threshold=%d margin=%+d window_ms=%d pre_roll_ms=%d played_ms=%d",
             self.device_id,
             self.barge_gate_stream_id,
             rolling_rms,
             threshold,
+            rolling_rms - threshold,
+            BARGE_IN_LEVEL_WINDOW_FRAMES * 20,
             len(pre_roll) * 20,
             self.output.played_ms if self.output is not None else 0,
         )
+        self.barge_gate_max_full_rms = 0
+        self.barge_gate_max_partial_rms = 0
+        self.barge_gate_full_windows = 0
         return pre_roll
 
     def _reset_listening_level_gate(self) -> None:
+        if not self.listening_gate_open:
+            self._log_listening_level_guard("gate_reset")
         self.listening_gate_frames.clear()
         self.listening_gate_active_frames = 0
         self.listening_gate_open = False
         self.listening_gate_quiet_frames = 0
-        self.listening_gate_peak_rms = 0
+        self.listening_gate_max_frame_rms = 0
+        self.listening_gate_max_decision_rms = 0
+        self.listening_gate_max_active_frames = 0
+        self.listening_gate_full_windows = 0
+
+    def _log_listening_level_guard(self, reason: str) -> None:
+        if not self.listening_gate_full_windows and not self.listening_gate_max_frame_rms:
+            return
+        threshold = self.settings.listening_rms_threshold
+        decision_rms = (
+            str(self.listening_gate_max_decision_rms)
+            if self.listening_gate_full_windows else "n/a"
+        )
+        margin = (
+            f"{self.listening_gate_max_decision_rms - threshold:+d}"
+            if self.listening_gate_full_windows else "n/a"
+        )
+        logger.info(
+            "Listening level guard device=%s max_decision_rms=%s threshold=%d "
+            "margin=%s max_active_frames=%d required_active_frames=%d "
+            "window_ms=%d max_frame_rms=%d full_windows=%d reason=%s",
+            self.device_id, decision_rms, threshold, margin,
+            self.listening_gate_max_active_frames, LISTENING_LEVEL_MIN_ACTIVE_FRAMES,
+            LISTENING_LEVEL_WINDOW_FRAMES * 20, self.listening_gate_max_frame_rms,
+            self.listening_gate_full_windows, reason,
+        )
+        self.listening_gate_max_frame_rms = 0
+        self.listening_gate_max_decision_rms = 0
+        self.listening_gate_max_active_frames = 0
+        self.listening_gate_full_windows = 0
 
     def _check_listening_level(self, pcm: bytes, frame_square_sum: int) -> list[bytes] | None:
         frame_rms = math.isqrt(frame_square_sum // (FRAME_BYTES // 2))
@@ -543,28 +602,42 @@ class DeviceSession:
                 self._reset_listening_level_gate()
                 return None
             return [pcm]
-        self.listening_gate_peak_rms = max(self.listening_gate_peak_rms, frame_rms)
+        self.listening_gate_max_frame_rms = max(self.listening_gate_max_frame_rms, frame_rms)
         if len(self.listening_gate_frames) == LISTENING_LEVEL_WINDOW_FRAMES:
-            _, was_active = self.listening_gate_frames.popleft()
-            self.listening_gate_active_frames -= int(was_active)
-        active = frame_rms >= threshold
-        self.listening_gate_frames.append((pcm, active))
-        self.listening_gate_active_frames += int(active)
-        if (
-            len(self.listening_gate_frames) < LISTENING_LEVEL_WINDOW_FRAMES
-            or self.listening_gate_active_frames < LISTENING_LEVEL_MIN_ACTIVE_FRAMES
-        ):
+            _, old_rms = self.listening_gate_frames.popleft()
+            self.listening_gate_active_frames -= int(old_rms >= threshold)
+        self.listening_gate_frames.append((pcm, frame_rms))
+        self.listening_gate_active_frames += int(frame_rms >= threshold)
+        if len(self.listening_gate_frames) < LISTENING_LEVEL_WINDOW_FRAMES:
+            return None
+        # The sixth-highest frame level is the threshold-independent value
+        # which decides this six-of-eight gate; a lone click cannot inflate it.
+        decision_rms = sorted((level for _, level in self.listening_gate_frames), reverse=True)[
+            LISTENING_LEVEL_MIN_ACTIVE_FRAMES - 1
+        ]
+        self.listening_gate_full_windows += 1
+        self.listening_gate_max_decision_rms = max(self.listening_gate_max_decision_rms, decision_rms)
+        self.listening_gate_max_active_frames = max(
+            self.listening_gate_max_active_frames, self.listening_gate_active_frames
+        )
+        if self.listening_gate_active_frames < LISTENING_LEVEL_MIN_ACTIVE_FRAMES:
             return None
         pre_roll = [frame for frame, _ in self.listening_gate_frames]
+        active_frames = self.listening_gate_active_frames
         self.listening_gate_frames.clear()
         self.listening_gate_active_frames = 0
         self.listening_gate_open = True
         self.listening_gate_quiet_frames = 0
         logger.info(
-            "Listening level qualified device=%s threshold=%d active_frames=%d pre_roll_ms=%d",
+            "Listening level qualified device=%s decision_rms=%d threshold=%d "
+            "margin=%+d active_frames=%d required_active_frames=%d window_ms=%d pre_roll_ms=%d",
             self.device_id,
+            decision_rms,
             threshold,
+            decision_rms - threshold,
+            active_frames,
             LISTENING_LEVEL_MIN_ACTIVE_FRAMES,
+            LISTENING_LEVEL_WINDOW_FRAMES * 20,
             len(pre_roll) * 20,
         )
         return pre_roll

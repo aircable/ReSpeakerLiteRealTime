@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import io
+import logging
+import math
 from fastapi import WebSocketDisconnect
 
 from gateway.config import Settings
@@ -312,6 +314,43 @@ async def test_barge_in_level_gate_ignores_a_single_full_scale_spike(tmp_path):
     await session._stop_input_sender()
 
 
+async def test_barge_in_guard_log_distinguishes_partial_peak_from_full_window(tmp_path, caplog):
+    session, _ = make_session(
+        tmp_path, barge_in_enabled=True, barge_in_rms_threshold=12000
+    )
+    session.output = OutputStream("stream", "response", "item", 0, sent_ms=2000)
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS)
+    spike = (32767).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    with caplog.at_level(logging.INFO, logger="gateway.session"):
+        await session.receive_audio(spike)
+        for _ in range(BARGE_IN_LEVEL_WINDOW_FRAMES - 1):
+            await session.receive_audio(bytes(FRAME_BYTES))
+        session._reset_barge_in_level_gate()
+
+    full_window_rms = math.isqrt(32767**2 // BARGE_IN_LEVEL_WINDOW_FRAMES)
+    assert f"max_full_window_rms={full_window_rms}" in caplog.text
+    assert f"margin={full_window_rms - 12000:+d}" in caplog.text
+    assert "full_windows=1 window_ms=400 max_partial_rms=32767" in caplog.text
+    assert "Barge-in level qualified" not in caplog.text
+    await session._stop_input_sender()
+
+
+async def test_barge_in_qualification_log_shows_threshold_margin(tmp_path, caplog):
+    session, _ = make_session(
+        tmp_path, barge_in_enabled=True, barge_in_rms_threshold=12000
+    )
+    session.output = OutputStream("stream", "response", "item", 0, sent_ms=2000)
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS)
+    speech = (13000).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    with caplog.at_level(logging.INFO, logger="gateway.session"):
+        for _ in range(BARGE_IN_LEVEL_WINDOW_FRAMES):
+            await session.receive_audio(speech)
+
+    assert session.barge_gate_open
+    assert "rolling_rms=13000 threshold=12000 margin=+1000 window_ms=400" in caplog.text
+    await session._stop_input_sender()
+
+
 async def test_listening_gate_rejects_quiet_voice_and_click_then_passes_loud_speech(tmp_path):
     session, _ = make_session(tmp_path, listening_rms_threshold=800)
     session.diagnostic_input = io.BytesIO()
@@ -357,6 +396,41 @@ async def test_listening_gate_requires_sustained_level_not_peak(tmp_path):
         await session.receive_audio(bytes(FRAME_BYTES))
     assert not session.listening_gate_open
     assert all(frame == bytes(FRAME_BYTES) for frame in session.cloud.audio)
+    await session._stop_input_sender()
+
+
+async def test_listening_guard_log_uses_sixth_highest_frame_not_click_peak(tmp_path, caplog):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    click = (32767).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    quiet = (300).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    with caplog.at_level(logging.INFO, logger="gateway.session"):
+        await session.receive_audio(click)
+        for _ in range(LISTENING_LEVEL_WINDOW_FRAMES - 1):
+            await session.receive_audio(quiet)
+        session._reset_listening_level_gate()
+
+    assert "max_decision_rms=300 threshold=800 margin=-500" in caplog.text
+    assert "max_active_frames=1 required_active_frames=6" in caplog.text
+    assert "max_frame_rms=32767 full_windows=1" in caplog.text
+    assert "Listening level qualified" not in caplog.text
+    await session._stop_input_sender()
+
+
+async def test_listening_qualification_log_shows_decision_margin(tmp_path, caplog):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    loud = (900).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    quiet = (300).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    with caplog.at_level(logging.INFO, logger="gateway.session"):
+        for _ in range(LISTENING_LEVEL_MIN_ACTIVE_FRAMES):
+            await session.receive_audio(loud)
+        for _ in range(LISTENING_LEVEL_WINDOW_FRAMES - LISTENING_LEVEL_MIN_ACTIVE_FRAMES):
+            await session.receive_audio(quiet)
+
+    assert session.listening_gate_open
+    assert (
+        "decision_rms=900 threshold=800 margin=+100 active_frames=6 "
+        "required_active_frames=6 window_ms=160"
+    ) in caplog.text
     await session._stop_input_sender()
 
 
