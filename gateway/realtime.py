@@ -10,6 +10,7 @@ from urllib.parse import quote
 import websockets
 
 from .config import Settings
+from .voice_commands import tool_specs
 
 logger = logging.getLogger(__name__)
 EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
@@ -79,81 +80,7 @@ class RealtimeConnection:
         logger.info("OpenAI Realtime WebSocket connected")
         self.connected_monotonic = time.monotonic()
         self.last_audio_trace = self.connected_monotonic
-        tools = [
-            {
-                "type": "function",
-                "name": "end_session",
-                "description": "End the device voice session after an explicit request such as go to sleep, stop, goodbye, good night, end session, or that's all.",
-                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-            },
-            {
-                "type": "function",
-                "name": "list_projects",
-                "description": "List the user's available projects and identify the active project.",
-                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-            },
-            {
-                "type": "function",
-                "name": "switch_project",
-                "description": "Switch the active project when the user explicitly asks to work on another project.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "project_name": {
-                            "type": "string",
-                            "description": "The project name as spoken by the user.",
-                        }
-                    },
-                    "required": ["project_name"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "control_volume",
-                "description": "Read or change the ReSpeaker playback volume. Use set for an exact percentage, or increase/decrease for relative requests such as louder or quieter.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["get", "set", "increase", "decrease"],
-                        },
-                        "level_percent": {
-                            "type": "number",
-                            "minimum": 0,
-                            "maximum": 100,
-                            "description": "Exact output level for the set action.",
-                        },
-                        "change_percent": {
-                            "type": "number",
-                            "minimum": 1,
-                            "maximum": 25,
-                            "description": "Optional relative change; defaults to 5 percentage points.",
-                        },
-                    },
-                    "required": ["action"],
-                    "additionalProperties": False,
-                },
-            },
-        ]
-        if self.ready_keyword_enabled:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "wait_for_ready",
-                    "description": (
-                        "After giving one hands-free procedural step, pause until the device's "
-                        "local ready-word detector hears 'ready'. Use only when the user is "
-                        "following a staged procedure and has asked to advance step by step."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": False,
-                    },
-                }
-            )
+        tools = tool_specs({"ready_keyword": self.ready_keyword_enabled})
         await self.send(
             {
                 "type": "session.update",

@@ -162,6 +162,49 @@ async def test_ready_word_wait_gates_audio_until_local_detection(tmp_path):
     assert ws.messages[-1][1]["mode"] == "wake"
 
 
+async def test_unavailable_ready_command_returns_device_capability_error(tmp_path):
+    session, _ = make_session(tmp_path)
+
+    await session._handle_tool_call(
+        {"name": "wait_for_ready", "call_id": "ready-call", "arguments": "{}"}
+    )
+
+    assert session.cloud.tool_outputs == [
+        ("ready-call", {"ready": False, "error": "The device has no ready-word model."})
+    ]
+    assert session.cloud.response_requests == [None]
+    assert not session.waiting_for_ready
+
+
+async def test_unknown_voice_command_is_rejected_without_device_action(tmp_path):
+    session, ws = make_session(tmp_path)
+
+    await session._handle_tool_call(
+        {"name": "nonexistent_command", "call_id": "bad-call", "arguments": "{}"}
+    )
+
+    assert session.cloud.tool_outputs == [
+        ("bad-call", {"ok": False, "error": "Unknown command."})
+    ]
+    assert session.cloud.response_requests == [None]
+    assert ws.messages == []
+
+
+async def test_end_session_voice_command_uses_spoken_stop(tmp_path):
+    session, _ = make_session(tmp_path)
+    reasons = []
+
+    async def record_stop(reason):
+        reasons.append(reason)
+
+    session.stop = record_stop
+    await session._handle_tool_call(
+        {"name": "end_session", "call_id": "stop-call", "arguments": "{}"}
+    )
+
+    assert reasons == ["spoken_stop"]
+
+
 def test_playback_queue_uses_configured_bounded_duration(tmp_path):
     session, _ = make_session(tmp_path, playback_buffer_seconds=45)
 

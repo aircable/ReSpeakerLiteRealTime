@@ -46,7 +46,7 @@ Realtime API's 4096-token per-response ceiling.
 
 `IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; set
 it to `0` to keep the session open until an explicit stop or the hard session limit. Raw microphone
-frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye” to end a
+frames, including room noise, do not reset it. Say “go to sleep”, “end session”, or “goodbye” to end a
 session immediately. The firmware's `output_volume` scales direct Realtime PCM before the
 speaker path (`0.125` is -18 dB relative to full scale). The AIC3204 remains at its proven default;
 changing its logarithmic control in addition to PCM scaling compounds the attenuation.
@@ -61,6 +61,28 @@ project** in the web UI. On wake, the assistant names the active project before 
 on. “What projects do I have?” lists projects, and “Switch to PROJECT NAME” activates a project.
 A switch closes the old project context and opens a clean Realtime and database session on the
 same device connection, so transcripts and durable project memory remain separated.
+
+## Voice commands
+
+The gateway-wide command registry is [gateway/voice_commands.py](gateway/voice_commands.py).
+Each entry records example spoken requests, when to use or avoid the command, its device effect,
+its Realtime argument schema, any required device capability, and the session handler that runs
+it. The gateway derives both the Realtime tool definitions and the voice-command instructions
+from this registry; project instructions only add project-specific policies. Example phrases
+guide the model's intent-based selection; they are not an exact-match speech parser.
+
+| Example request | Function | Effect |
+| --- | --- | --- |
+| “Go to sleep” | `end_session` | Ends the session and resumes wake-word listening |
+| “Which project is active?” | `list_projects` | Read-only lookup |
+| “Switch to Cooking Companion” | `switch_project` | Changes the active project and Realtime context |
+| “Set volume to 40 percent” | `control_volume` | Changes and persists device playback volume |
+| “Pause until ready” | `wait_for_ready` | Stops microphone upload and arms local ready-word detection |
+
+`wait_for_ready` is advertised only when the firmware reports the `ready_keyword` capability.
+To add a new command, add a registry entry and a corresponding `_voice_*` handler on
+`DeviceSession`, then test its capability gate and result. A project instruction cannot add a
+function that is absent from the gateway's registry. Web search is not registered yet.
 
 Home Assistant OS normally manages containers as Apps (formerly add-ons). Running this command
 directly requires host-level SSH access and is not managed by Supervisor; packaging the image as a

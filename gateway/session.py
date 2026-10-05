@@ -19,6 +19,7 @@ from .db import Database
 from .planner import Planner
 from .protocol import FRAME_BYTES, DeviceState, server_message
 from .realtime import RealtimeConnection
+from .voice_commands import COMMANDS_BY_NAME
 
 logger = logging.getLogger(__name__)
 PLAYBACK_FRAME_SECONDS = 0.020
@@ -818,61 +819,81 @@ class DeviceSession:
 
     async def _handle_tool_call(self, event: dict[str, Any]) -> None:
         name = event.get("name")
-        if name == "end_session":
-            await self.stop("spoken_stop")
-            return
+        command = COMMANDS_BY_NAME.get(name) if isinstance(name, str) else None
         cloud = self.cloud
         call_id = event.get("call_id")
-        if cloud is None or not call_id:
+        if command is None:
+            logger.warning("Ignoring unknown voice tool device=%s name=%s", self.device_id, name)
+            if cloud is not None and call_id:
+                await cloud.submit_tool_output(call_id, {"ok": False, "error": "Unknown command."})
+                await cloud.request_response()
             return
-        if name == "wait_for_ready":
-            if not self.ready_keyword_enabled:
+        if command.call_id_required and (cloud is None or not call_id):
+            return
+        if not command.available({"ready_keyword": self.ready_keyword_enabled}):
+            if cloud is not None and call_id:
                 await cloud.submit_tool_output(
-                    call_id, {"ready": False, "error": "The device has no ready-word model."}
+                    call_id,
+                    command.unavailable_result
+                    or {"ok": False, "error": "This device does not support that command."},
                 )
                 await cloud.request_response()
-                return
-            self.pending_ready_call_id = call_id
-            self.ready_wait_requested = True
-            logger.info(
-                "Ready-word wait requested device=%s session=%s",
-                self.device_id,
-                self.session_id,
-            )
-            await self._enter_ready_wait_if_possible()
-            return
-        if name == "list_projects":
-            projects = self.db.list_projects()
-            await cloud.submit_tool_output(
-                call_id,
-                {
-                    "active_project": next(
-                        (project["name"] for project in projects if project["active"]), None
-                    ),
-                    "projects": [project["name"] for project in projects],
-                },
-            )
-            await cloud.request_response()
-            return
-        if name == "control_volume":
-            try:
-                arguments = json.loads(event.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-            result = await self.control_volume(
-                str(arguments.get("action") or ""),
-                arguments.get("level_percent"),
-                arguments.get("change_percent"),
-            )
-            await cloud.submit_tool_output(call_id, result)
-            await cloud.request_response()
-            return
-        if name != "switch_project":
             return
         try:
             arguments = json.loads(event.get("arguments") or "{}")
-        except json.JSONDecodeError:
+        except (TypeError, json.JSONDecodeError):
             arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        logger.info("Voice command requested device=%s command=%s", self.device_id, command.name)
+        await getattr(self, command.handler)(cloud, call_id, arguments)
+
+    async def _voice_end_session(
+        self, _cloud: RealtimeConnection | None, _call_id: str | None, _arguments: dict[str, Any]
+    ) -> None:
+        await self.stop("spoken_stop")
+
+    async def _voice_wait_for_ready(
+        self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
+    ) -> None:
+        self.pending_ready_call_id = call_id
+        self.ready_wait_requested = True
+        logger.info(
+            "Ready-word wait requested device=%s session=%s",
+            self.device_id,
+            self.session_id,
+        )
+        await self._enter_ready_wait_if_possible()
+
+    async def _voice_list_projects(
+        self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
+    ) -> None:
+        projects = self.db.list_projects()
+        await cloud.submit_tool_output(
+            call_id,
+            {
+                "active_project": next(
+                    (project["name"] for project in projects if project["active"]), None
+                ),
+                "projects": [project["name"] for project in projects],
+            },
+        )
+        await cloud.request_response()
+
+    async def _voice_control_volume(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        result = await self.control_volume(
+            str(arguments.get("action") or ""),
+            arguments.get("level_percent"),
+            arguments.get("change_percent"),
+        )
+        await cloud.submit_tool_output(call_id, result)
+        await cloud.request_response()
+
+    async def _voice_switch_project(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
         requested_name = str(arguments.get("project_name") or "").strip()
         project = self.db.find_project(requested_name)
         if project is None:

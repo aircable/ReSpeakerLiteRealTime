@@ -1,20 +1,11 @@
 import json
 from typing import Any
 
+from .voice_commands import command_instructions
+
 
 BASE_INSTRUCTIONS = """You are a Socratic thinking companion. Help the user clarify goals,
-surface assumptions, compare options, and decide concrete next actions. Be concise in speech.
-Do not pretend an action was completed. When the user says "go to sleep", stop, goodbye, end
-session, good night, "that's all", or an equivalent explicit command, acknowledge briefly and
-call the end_session tool. Use list_projects when the user asks which projects are available. Use
-switch_project only when the user explicitly asks to change the active project. Never claim a
-project was switched until the tool succeeds. Use control_volume for requests to set, raise,
-lower, or report the device volume. Give only a brief confirmation after a volume change."""
-
-READY_KEYWORD_INSTRUCTIONS = """The device has a local 'ready' detector. In a hands-free,
-step-by-step procedure, give exactly one concise step and then call wait_for_ready. Do not say
-that the user is ready before the tool returns. While that tool is pending, ordinary speech is
-intentionally ignored; the physical USER button can still end the session."""
+surface assumptions, compare options, and decide concrete next actions. Be concise in speech."""
 
 
 def build_instructions(
@@ -23,8 +14,10 @@ def build_instructions(
     ready_keyword_enabled: bool = False,
 ) -> str:
     history = "\n".join(f"{turn['role']}: {turn['text']}" for turn in turns)
-    ready_instructions = f"\n\n{READY_KEYWORD_INSTRUCTIONS}" if ready_keyword_enabled else ""
-    return f"""{BASE_INSTRUCTIONS}{ready_instructions}
+    commands = command_instructions({"ready_keyword": ready_keyword_enabled})
+    return f"""{BASE_INSTRUCTIONS}
+
+{commands}
 
 Project: {project['name']}
 Goal: {project['goal']}
