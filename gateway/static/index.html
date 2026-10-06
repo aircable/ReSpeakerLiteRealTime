@@ -14,6 +14,7 @@
     label{display:block;color:var(--muted);margin:.8rem 0 .3rem}.projects button{margin:.2rem}.active{outline:2px solid var(--accent)}
     .status{color:var(--muted)}@media(max-width:650px){main{padding:1rem}}
     #transcript{white-space:pre-wrap;max-height:260px;overflow:auto}
+    #searchResults[hidden]{display:none}#searchResults p{white-space:pre-wrap}#searchResults a{color:var(--accent)}
   </style>
 </head>
 <body><main>
@@ -29,23 +30,98 @@
     <label>Markdown plan</label><textarea id="plan"></textarea>
     <div class="bar"><button class="primary" onclick="save()">Save</button><button onclick="activate()">Make active</button><button onclick="showHistory()">Plan history</button><button onclick="exportPlan()">Export Markdown</button><span id="saved" class="status"></span></div><pre id="history" class="status"></pre>
   </section>
-  <section class="panel"><div class="bar"><strong>Live device</strong><span id="deviceState" class="status">offline</span><label for="deviceVolume">Volume</label><input id="deviceVolume" type="range" min="0" max="100" step="1" disabled><span id="deviceVolumeValue" class="status">--</span></div><div id="transcript" class="status">No transcript yet.</div></section>
+  <section class="panel"><div class="bar"><strong>Live device</strong><label for="deviceSelect">Device</label><select id="deviceSelect" disabled><option value="">No connected devices</option></select><span id="deviceState" class="status">offline</span><label for="deviceVolume">Volume</label><input id="deviceVolume" type="range" min="0" max="100" step="1" disabled><span id="deviceVolumeValue" class="status">--</span></div><p class="status">Selection filters this transcript and volume control. Speak to the board you want to use; voice settings and the active project are shared.</p><div id="transcript" class="status">Select a device to view its transcript.</div><div id="searchResults" hidden><h3>Latest web search</h3><p id="searchQuery" class="status"></p><p id="searchAnswer"></p></div></section>
 </main><script>
-let token=localStorage.uiToken||'', current=null, all=[], live=null, liveDevice=null;
+let token=localStorage.uiToken||'', current=null, all=[], live=null;
+let selectedDeviceId=localStorage.selectedDeviceId||'', connectedDevices=[], transcriptRole=null;
 async function loadVersion(){try{const h=await (await fetch('/health')).json();const label=`Thinking Companion V${h.version}`;document.getElementById('appTitle').textContent=label;document.title=label}catch(e){}}
 function setToken(){token=prompt('UI token',token)||'';localStorage.uiToken=token;load();connectLive()}
 async function api(path,options={}){options.headers={...(options.headers||{}),Authorization:`Bearer ${token}`,'Content-Type':'application/json'};const r=await fetch(path,options);if(!r.ok)throw Error(await r.text());return r}
-async function load(){try{all=await (await api('/api/projects')).json();const s=await (await api('/api/settings')).json();const devices=await (await api('/api/devices')).json();rtModel.value=s.realtime_model;voice.value=s.voice;effort.value=s.reasoning_effort;noiseReduction.value=s.input_noise_reduction;vadMode.value=s.vad_mode;vadEagerness.value=s.vad_eagerness;vadThreshold.value=s.vad_threshold;vadSilence.value=s.vad_silence_duration_ms;idle.value=s.idle_timeout_seconds;announceProject.checked=s.announce_active_project;bargeIn.checked=s.barge_in_enabled;bargeInRms.value=s.barge_in_rms_threshold;xvfGain.value=s.xvf_agc_ch0_gain;listeningRms.value=s.listening_rms_threshold;openaiTrace.checked=s.openai_trace;diagnostic.checked=s.diagnostic_audio;status.textContent='Gateway connected';projects.innerHTML='';all.forEach(p=>{const b=document.createElement('button');b.textContent=p.name+(p.active?' ●':'');b.className=p.active?'active':'';b.onclick=()=>select(p.id);projects.append(b)});if(devices.length){setDeviceVolume(devices[0].device_id,devices[0].volume_percent);deviceState.textContent=`${devices[0].device_id}: ${devices[0].state}`}if(current)select(current)}catch(e){status.textContent='Authentication required'}}
-async function select(id){current=id;const p=await (await api(`/api/projects/${id}`)).json();editor.hidden=false;name.value=p.name;goal.value=p.goal;instructions.value=p.instructions;notes.value=p.pinned_notes;summary.value=p.summary;plan.value=p.plan_markdown;const turns=await (await api(`/api/projects/${id}/turns`)).json();transcript.textContent=turns.map(t=>`${t.role}: ${t.text}`).join('\n')||'No transcript yet.'}
+async function load(){try{all=await (await api('/api/projects')).json();const s=await (await api('/api/settings')).json();const devices=await (await api('/api/devices')).json();rtModel.value=s.realtime_model;voice.value=s.voice;effort.value=s.reasoning_effort;noiseReduction.value=s.input_noise_reduction;vadMode.value=s.vad_mode;vadEagerness.value=s.vad_eagerness;vadThreshold.value=s.vad_threshold;vadSilence.value=s.vad_silence_duration_ms;idle.value=s.idle_timeout_seconds;announceProject.checked=s.announce_active_project;bargeIn.checked=s.barge_in_enabled;bargeInRms.value=s.barge_in_rms_threshold;xvfGain.value=s.xvf_agc_ch0_gain;listeningRms.value=s.listening_rms_threshold;openaiTrace.checked=s.openai_trace;diagnostic.checked=s.diagnostic_audio;status.textContent='Gateway connected';projects.innerHTML='';all.forEach(p=>{const b=document.createElement('button');b.textContent=p.name+(p.active?' ●':'');b.className=p.active?'active':'';b.onclick=()=>select(p.id);projects.append(b)});renderDevices(devices);if(current)await select(current)}catch(e){status.textContent='Authentication required'}}
+async function select(id){current=id;const p=await (await api(`/api/projects/${id}`)).json();editor.hidden=false;name.value=p.name;goal.value=p.goal;instructions.value=p.instructions;notes.value=p.pinned_notes;summary.value=p.summary;plan.value=p.plan_markdown;await loadTranscript()}
 async function save(){await api(`/api/projects/${current}`,{method:'PATCH',body:JSON.stringify({name:name.value,goal:goal.value,instructions:instructions.value,pinned_notes:notes.value,summary:summary.value,plan_markdown:plan.value})});saved.textContent='Saved';setTimeout(()=>saved.textContent='',1500);load()}
 async function activate(){await api(`/api/projects/${current}/activate`,{method:'POST'});load()}
 async function createProject(){if(!newName.value)return;const p=await (await api('/api/projects',{method:'POST',body:JSON.stringify({name:newName.value})})).json();newName.value='';await load();select(p.id)}
 function exportPlan(){window.open(`/api/projects/${current}/export.md?token=${encodeURIComponent(token)}`)}
 async function saveSettings(){await api('/api/settings',{method:'PATCH',body:JSON.stringify({realtime_model:rtModel.value,voice:voice.value,reasoning_effort:effort.value,input_noise_reduction:noiseReduction.value,vad_mode:vadMode.value,vad_eagerness:vadEagerness.value,vad_threshold:Number(vadThreshold.value),vad_silence_duration_ms:Number(vadSilence.value),idle_timeout_seconds:Number(idle.value),announce_active_project:announceProject.checked,barge_in_enabled:bargeIn.checked,barge_in_rms_threshold:Number(bargeInRms.value),xvf_agc_ch0_gain:Number(xvfGain.value),listening_rms_threshold:Number(listeningRms.value),openai_trace:openaiTrace.checked,diagnostic_audio:diagnostic.checked})});status.textContent='XMOS gain applies now; other settings apply next session'}
 async function showHistory(){const h=await (await api(`/api/projects/${current}/history`)).json();history.textContent=h.map(x=>`${x.created_at}\n${x.plan_markdown}`).join('\n\n')||'No automatic revisions yet.'}
-function setDeviceVolume(id,percent){liveDevice=id;if(percent!=null){deviceVolume.value=percent;deviceVolumeValue.textContent=`${Math.round(percent)}%`}deviceVolume.disabled=false}
-deviceVolume.onchange=async()=>{if(!liveDevice)return;await api(`/api/devices/${encodeURIComponent(liveDevice)}/volume`,{method:'PATCH',body:JSON.stringify({level_percent:Number(deviceVolume.value)})})}
-function connectLive(){if(live)live.close();const scheme=location.protocol==='https:'?'wss':'ws';live=new WebSocket(`${scheme}://${location.host}/ws/ui?token=${encodeURIComponent(token)}`);live.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='state')deviceState.textContent=`${m.device_id}: ${m.state}`;if(m.type==='volume.changed')setDeviceVolume(m.device_id,m.level_percent??m.level*100);if(m.type==='transcript.delta'){if(transcript.textContent==='No transcript yet.')transcript.textContent='';transcript.textContent+=m.text;transcript.scrollTop=transcript.scrollHeight}if(m.type==='session.ended'&&current)select(current)};live.onclose=()=>{deviceState.textContent='offline';liveDevice=null;deviceVolume.disabled=true}}
+function renderDevices(devices){
+  connectedDevices=devices;
+  if(!selectedDeviceId&&devices.length===1){selectedDeviceId=devices[0].device_id;localStorage.selectedDeviceId=selectedDeviceId}
+  deviceSelect.replaceChildren();
+  if(!selectedDeviceId){const option=new Option(devices.length?'Select a device':'No connected devices','');deviceSelect.add(option)}
+  if(selectedDeviceId&&!devices.some(d=>d.device_id===selectedDeviceId)){deviceSelect.add(new Option(`${selectedDeviceId} (offline)`,selectedDeviceId))}
+  for(const d of devices){const label=d.name&&d.name!==d.device_id?`${d.name} (${d.device_id})`:d.device_id;deviceSelect.add(new Option(`${label} — ${d.state}`,d.device_id))}
+  deviceSelect.value=selectedDeviceId||'';
+  deviceSelect.disabled=!devices.length;
+  showSelectedDevice();
+}
+function showSelectedDevice(){
+  const device=connectedDevices.find(d=>d.device_id===selectedDeviceId);
+  deviceState.textContent=device?device.state:'offline';
+  deviceVolume.disabled=!device||device.volume_percent==null;
+  deviceVolumeValue.textContent=device&&device.volume_percent!=null?`${Math.round(device.volume_percent)}%`:'--';
+  if(device&&device.volume_percent!=null)deviceVolume.value=device.volume_percent;
+}
+async function refreshDevices(){const devices=await (await api('/api/devices')).json();if(JSON.stringify(devices)!==JSON.stringify(connectedDevices))renderDevices(devices)}
+async function loadTranscript(){
+  transcriptRole=null;
+  if(!current||!selectedDeviceId){transcript.textContent='Select a device to view its transcript.';return}
+  const projectId=current,deviceId=selectedDeviceId;
+  const turns=await (await api(`/api/projects/${projectId}/turns?device_id=${encodeURIComponent(deviceId)}`)).json();
+  if(projectId!==current||deviceId!==selectedDeviceId)return;
+  transcript.textContent=turns.map(t=>`${t.role}: ${t.text}`).join('\n')||'No transcript yet.';
+}
+function appendTranscript(role,text){
+  if(transcript.textContent==='No transcript yet.')transcript.textContent='';
+  if(transcriptRole!==role){transcript.textContent+=(transcript.textContent?'\n':'')+`${role}: `;transcriptRole=role}
+  transcript.textContent+=text;
+  transcript.scrollTop=transcript.scrollHeight;
+}
+function sourceLink(url,text,title){
+  try{const parsed=new URL(url);if(!['https:','http:'].includes(parsed.protocol))return document.createTextNode(text);
+    const link=document.createElement('a');link.href=parsed.href;link.textContent=text;link.title=title||url;link.target='_blank';link.rel='noopener noreferrer';return link}
+  catch(e){return document.createTextNode(text)}
+}
+function showSearchResult(message){
+  searchResults.hidden=false;searchQuery.textContent=message.query;searchAnswer.replaceChildren();
+  const chars=Array.from(message.answer||'');let position=0;
+  const citations=(message.citations||[]).slice().sort((a,b)=>a.start-b.start);
+  for(const citation of citations){
+    if(!Number.isInteger(citation.start)||!Number.isInteger(citation.end)||citation.start<position||citation.end>chars.length||citation.end<=citation.start)continue;
+    searchAnswer.append(document.createTextNode(chars.slice(position,citation.start).join('')));
+    searchAnswer.append(sourceLink(citation.url,chars.slice(citation.start,citation.end).join(''),citation.title));
+    position=citation.end;
+  }
+  searchAnswer.append(document.createTextNode(chars.slice(position).join('')));
+}
+deviceSelect.onchange=async()=>{selectedDeviceId=deviceSelect.value;localStorage.selectedDeviceId=selectedDeviceId;searchResults.hidden=true;showSelectedDevice();await loadTranscript()};
+deviceVolume.onchange=async()=>{if(!selectedDeviceId||deviceVolume.disabled)return;await api(`/api/devices/${encodeURIComponent(selectedDeviceId)}/volume`,{method:'PATCH',body:JSON.stringify({level_percent:Number(deviceVolume.value)})})};
+function connectLive(){
+  if(live)live.close();
+  const scheme=location.protocol==='https:'?'wss':'ws';
+  const socket=new WebSocket(`${scheme}://${location.host}/ws/ui?token=${encodeURIComponent(token)}`);
+  live=socket;
+  socket.onmessage=e=>{
+    const m=JSON.parse(e.data);
+    if(m.type==='auth.ok')refreshDevices().catch(()=>{});
+    const device=connectedDevices.find(d=>d.device_id===m.device_id);
+    if(m.type==='state'&&device){device.state=m.state;renderDevices(connectedDevices)}
+    if(m.type==='volume.changed'&&device){device.volume_percent=m.level_percent??m.level*100;showSelectedDevice()}
+    if(m.device_id!==selectedDeviceId)return;
+    if(current&&m.project_id!=null&&m.project_id!==current)return;
+    if(m.type==='transcript.delta')appendTranscript(m.role,m.text);
+    if(m.type==='transcript.committed')appendTranscript(m.role,m.text);
+    if(m.type==='search.result')showSearchResult(m);
+    if(m.type==='session.ended'&&current)loadTranscript().catch(()=>{});
+  };
+  socket.onclose=e=>{
+    if(live!==socket)return;
+    status.textContent='Live updates disconnected';
+    if(token&&e.code!==1008)setTimeout(()=>{if(live===socket)connectLive()},2000);
+  };
+}
+setInterval(()=>{if(token)refreshDevices().catch(()=>{})},3000);
 loadVersion();
 if(token){load();connectLive()}else setToken();
 </script></body></html>

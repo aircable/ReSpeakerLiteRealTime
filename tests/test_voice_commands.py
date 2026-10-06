@@ -27,7 +27,7 @@ def test_ready_tool_is_advertised_only_with_device_capability():
     with_ready = tool_specs({"ready_keyword": True})
 
     assert {tool["name"] for tool in without_ready} == {
-        "end_session", "list_projects", "switch_project", "control_volume"
+        "end_session", "list_projects", "switch_project", "control_volume", "search_web"
     }
     assert {tool["name"] for tool in with_ready} == {
         tool["name"] for tool in without_ready

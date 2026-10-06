@@ -44,3 +44,20 @@ def test_find_project_accepts_case_insensitive_unique_spoken_match(tmp_path):
     assert db.find_project("  GARDEN irrigation  ")["id"] == second["id"]
     assert db.find_project("Irrigation")["id"] == second["id"]
     assert db.find_project("missing") is None
+
+
+def test_project_turns_can_be_filtered_to_one_device(tmp_path):
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    project_id = db.get_project()["id"]
+    first = db.start_session(project_id, "kitchen", "test-model")
+    second = db.start_session(project_id, "office", "test-model")
+    db.add_turn(first, "user", "Kitchen question")
+    db.add_turn(second, "user", "Office question")
+
+    assert [turn["text"] for turn in db.project_turns(project_id)] == [
+        "Kitchen question", "Office question"
+    ]
+    assert [turn["text"] for turn in db.project_turns(project_id, device_id="office")] == [
+        "Office question"
+    ]

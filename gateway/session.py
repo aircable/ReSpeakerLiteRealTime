@@ -20,6 +20,7 @@ from .planner import Planner
 from .protocol import FRAME_BYTES, DeviceState, server_message
 from .realtime import RealtimeConnection
 from .voice_commands import COMMANDS_BY_NAME
+from .web_search import WebSearchError, search_web
 
 logger = logging.getLogger(__name__)
 PLAYBACK_FRAME_SECONDS = 0.020
@@ -64,9 +65,11 @@ class DeviceSession:
         planner: Planner,
         observer: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         capabilities: dict[str, Any] | None = None,
+        device_name: str | None = None,
     ):
         self.websocket = websocket
         self.device_id = device_id
+        self.device_name = device_name or device_id
         self.settings = settings
         self.db = db
         self.planner = planner
@@ -133,6 +136,7 @@ class DeviceSession:
         self.ready_wait_requested = False
         self.waiting_for_ready = False
         self.pending_ready_call_id: str | None = None
+        self.search_tasks: set[asyncio.Task[None]] = set()
 
     async def send_json(self, message_type: str, **payload: Any) -> None:
         message = server_message(message_type, **{"device_id": self.device_id, **payload})
@@ -775,14 +779,20 @@ class DeviceSession:
                 self.db.add_turn(
                     self.session_id, "user", transcript, event.get("item_id")
                 )
-                await self.send_json("transcript.committed", role="user", text=transcript)
+                await self.send_json(
+                    "transcript.committed", role="user", text=transcript,
+                    project_id=self.project_id,
+                )
             return
         if kind in {"response.output_audio.delta", "response.audio.delta"}:
             await self._audio_delta(event)
             return
         if kind in {"response.output_audio_transcript.delta", "response.audio_transcript.delta"}:
             self.assistant_text += event.get("delta", "")
-            await self.send_json("transcript.delta", role="assistant", text=event.get("delta", ""))
+            await self.send_json(
+                "transcript.delta", role="assistant", text=event.get("delta", ""),
+                project_id=self.project_id,
+            )
             return
         if kind in {"response.output_audio.done", "response.audio.done"}:
             await self._finish_audio_frame()
@@ -890,6 +900,68 @@ class DeviceSession:
         )
         await cloud.submit_tool_output(call_id, result)
         await cloud.request_response()
+
+    async def _voice_search_web(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        query = arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            await cloud.submit_tool_output(call_id, {"ok": False, "error": "A search query is required."})
+            await cloud.request_response()
+            return
+        if self.search_tasks:
+            await cloud.submit_tool_output(call_id, {"ok": False, "error": "A web search is already running."})
+            await cloud.request_response()
+            return
+        task = asyncio.create_task(
+            self._run_web_search(cloud, call_id, query.strip()[:500], self.session_id, self.project_id),
+            name=f"web-search-{self.device_id}",
+        )
+        self.search_tasks.add(task)
+        task.add_done_callback(self.search_tasks.discard)
+
+    async def _run_web_search(
+        self, cloud: RealtimeConnection, call_id: str, query: str,
+        session_id: int | None, project_id: int | None,
+    ) -> None:
+        logger.info("Web search started device=%s session=%s", self.device_id, session_id)
+        try:
+            result = await search_web(self.settings, query)
+            output = {"ok": True, "answer": result["answer"], "sources": [
+                {"title": citation["title"], "url": citation["url"]}
+                for citation in result["citations"]
+            ]}
+        except asyncio.CancelledError:
+            raise
+        except WebSearchError as exc:
+            result = None
+            output = {"ok": False, "error": str(exc)}
+        except Exception:
+            logger.exception("Web search failed device=%s session=%s", self.device_id, session_id)
+            result = None
+            output = {"ok": False, "error": "Web search failed. Please try again."}
+        if self.cloud is not cloud or self.session_id != session_id or self.stopping:
+            return
+        if result is not None:
+            await self.publish_json(
+                "search.result", project_id=project_id, query=query,
+                answer=result["answer"], citations=result["citations"],
+            )
+        try:
+            await cloud.submit_tool_output(call_id, output)
+            await cloud.request_response()
+        except Exception:
+            logger.exception("Web search result delivery failed device=%s session=%s", self.device_id, session_id)
+            return
+        logger.info("Web search finished device=%s session=%s ok=%s", self.device_id, session_id, output["ok"])
+
+    async def _cancel_search_tasks(self) -> None:
+        tasks = tuple(self.search_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.search_tasks.clear()
 
     async def _voice_switch_project(
         self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
@@ -1018,6 +1090,7 @@ class DeviceSession:
             project["id"],
         )
         self.accepting_audio = False
+        await self._cancel_search_tasks()
         self.cloud_ready = False
         self.ready_wait_requested = False
         self.waiting_for_ready = False
@@ -1228,6 +1301,7 @@ class DeviceSession:
             self.state.value,
         )
         try:
+            await self._cancel_search_tasks()
             self.accepting_audio = False
             self.cloud_ready = False
             self.ready_wait_requested = False

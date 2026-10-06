@@ -21,6 +21,21 @@ def test_parse_versioned_authentication():
     )
     assert isinstance(message, Authenticate)
     assert message.device_id == "desk"
+    assert message.name is None
+
+
+def test_authentication_can_report_friendly_name():
+    message = parse_device_message(
+        {
+            "v": 1,
+            "type": "auth",
+            "token": "secret",
+            "device_id": "kitchen",
+            "name": "Kitchen Companion",
+        }
+    )
+    assert isinstance(message, Authenticate)
+    assert message.name == "Kitchen Companion"
 
 
 def test_rejects_wrong_protocol_version():

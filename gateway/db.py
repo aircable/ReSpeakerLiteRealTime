@@ -179,12 +179,19 @@ class Database:
             )
             return ordinal
 
-    def recent_turns(self, project_id: int, limit: int = 12) -> list[dict[str, Any]]:
+    def recent_turns(
+        self, project_id: int, limit: int = 12, device_id: str | None = None
+    ) -> list[dict[str, Any]]:
         with self.connect() as conn:
+            where = "WHERE s.project_id=?"
+            values: tuple[Any, ...] = (project_id,)
+            if device_id is not None:
+                where += " AND s.device_id=?"
+                values += (device_id,)
             rows = conn.execute(
                 "SELECT t.* FROM turns t JOIN sessions s ON s.id=t.session_id "
-                "WHERE s.project_id=? ORDER BY t.id DESC LIMIT ?",
-                (project_id, limit),
+                f"{where} ORDER BY t.id DESC LIMIT ?",
+                (*values, limit),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
@@ -221,8 +228,10 @@ class Database:
                 )
             ]
 
-    def project_turns(self, project_id: int, limit: int = 100) -> list[dict[str, Any]]:
-        return self.recent_turns(project_id, min(max(limit, 1), 500))
+    def project_turns(
+        self, project_id: int, limit: int = 100, device_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self.recent_turns(project_id, min(max(limit, 1), 500), device_id)
 
     def setting_overrides(self) -> dict[str, Any]:
         with self.connect() as conn:

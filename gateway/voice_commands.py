@@ -134,6 +134,27 @@ VOICE_COMMANDS = (
         response_rule="After a change, confirm briefly.",
     ),
     VoiceCommand(
+        name="search_web",
+        handler="_voice_search_web",
+        purpose="Search the live web and return a short sourced answer.",
+        examples=("search the web for today's weather", "look up the latest news about XMOS"),
+        use_when="the user asks to search or needs current information beyond your knowledge.",
+        avoid_when="the request can be answered from the current conversation or project context.",
+        effect="Runs a paid OpenAI web search; the web UI displays clickable source citations.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The specific web search question, retaining key names and context.",
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        response_rule="Summarize the result briefly in speech; do not read URLs aloud.",
+    ),
+    VoiceCommand(
         name="wait_for_ready",
         handler="_voice_wait_for_ready",
         purpose=(

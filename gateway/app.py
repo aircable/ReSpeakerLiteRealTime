@@ -184,6 +184,7 @@ async def connected_devices() -> list[dict[str, Any]]:
     return [
         {
             "device_id": session.device_id,
+            "name": session.device_name,
             "state": session.state.value,
             "volume_percent": (
                 round(session.device_volume * 100) if session.device_volume is not None else None
@@ -241,9 +242,10 @@ async def project_history(
 
 @app.get("/api/projects/{project_id}/turns", dependencies=[Depends(require_ui_token)])
 async def project_turns(
-    project_id: int, db: Annotated[Database, Depends(database)], limit: int = 100
+    project_id: int, db: Annotated[Database, Depends(database)], limit: int = 100,
+    device_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    return db.project_turns(project_id, limit)
+    return db.project_turns(project_id, limit, device_id)
 
 
 @app.get("/api/projects/{project_id}/export.md", dependencies=[Depends(require_ui_token)])
@@ -276,6 +278,7 @@ async def device_socket(websocket: WebSocket) -> None:
             planner,
             live_hub.publish,
             capabilities=auth.capabilities,
+            device_name=auth.name,
         )
         device_sessions[auth.device_id] = session
         logger.info(

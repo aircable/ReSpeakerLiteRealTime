@@ -28,6 +28,7 @@ class Authenticate(Envelope):
     type: Literal["auth"] = "auth"
     token: str
     device_id: str = Field(min_length=1, max_length=80)
+    name: str | None = Field(default=None, min_length=1, max_length=80)
     capabilities: dict[str, Any] = Field(default_factory=dict)
 
 

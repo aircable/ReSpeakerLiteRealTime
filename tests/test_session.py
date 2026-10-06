@@ -251,6 +251,98 @@ async def test_voice_volume_tool_returns_result_to_realtime(tmp_path):
     assert session.device_volume == 0.3
 
 
+async def test_web_search_runs_off_realtime_reader_and_publishes_sources(monkeypatch, tmp_path):
+    session, ws = make_session(tmp_path)
+    published = []
+
+    async def observer(message):
+        published.append(message)
+
+    async def fake_search(_settings, query):
+        assert query == "weather today"
+        await asyncio.sleep(0)
+        return {"answer": "Sunny [1]", "citations": [
+            {"start": 6, "end": 9, "url": "https://weather.example", "title": "Forecast"}
+        ]}
+
+    monkeypatch.setattr("gateway.session.search_web", fake_search)
+    session.observer = observer
+    cloud = session.cloud
+    await session._handle_tool_call({
+        "name": "search_web", "call_id": "search-call",
+        "arguments": '{"query":"weather today"}',
+    })
+    assert not cloud.tool_outputs  # The reader has already returned to receiving events.
+    await asyncio.gather(*tuple(session.search_tasks))
+
+    assert cloud.tool_outputs == [("search-call", {
+        "ok": True, "answer": "Sunny [1]",
+        "sources": [{"url": "https://weather.example", "title": "Forecast"}],
+    })]
+    assert cloud.response_requests == [None]
+    assert ws.messages == []
+    assert published[-1]["type"] == "search.result"
+    assert published[-1]["citations"][0]["start"] == 6
+
+
+async def test_web_search_is_cancelled_on_session_stop(monkeypatch, tmp_path):
+    session, _ = make_session(tmp_path)
+    started = asyncio.Event()
+
+    async def slow_search(_settings, _query):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("gateway.session.search_web", slow_search)
+    cloud = session.cloud
+    await session._handle_tool_call({
+        "name": "search_web", "call_id": "search-call", "arguments": '{"query":"latest news"}',
+    })
+    await started.wait()
+    await session.stop("button")
+
+    assert not session.search_tasks
+    assert cloud.closed
+    assert cloud.tool_outputs == []
+
+
+async def test_web_search_error_returns_to_realtime_without_ui_result(monkeypatch, tmp_path):
+    from gateway.web_search import WebSearchError
+
+    session, _ = make_session(tmp_path)
+    published = []
+
+    async def observer(message):
+        published.append(message)
+
+    async def failed_search(_settings, _query):
+        raise WebSearchError("No sourced answer was found.")
+
+    monkeypatch.setattr("gateway.session.search_web", failed_search)
+    session.observer = observer
+    await session._handle_tool_call({
+        "name": "search_web", "call_id": "search-call", "arguments": '{"query":"obscure query"}',
+    })
+    await asyncio.gather(*tuple(session.search_tasks))
+
+    assert session.cloud.tool_outputs == [
+        ("search-call", {"ok": False, "error": "No sourced answer was found."})
+    ]
+    assert session.cloud.response_requests == [None]
+    assert published == []
+
+
+async def test_web_search_rejects_missing_query_without_network(tmp_path):
+    session, _ = make_session(tmp_path)
+    await session._handle_tool_call({
+        "name": "search_web", "call_id": "search-call", "arguments": '{}',
+    })
+    assert not session.search_tasks
+    assert session.cloud.tool_outputs == [
+        ("search-call", {"ok": False, "error": "A search query is required."})
+    ]
+
+
 async def test_silent_audio_transport_does_not_reset_idle_timer(tmp_path):
     session, _ = make_session(tmp_path)
     previous_activity = session.last_activity

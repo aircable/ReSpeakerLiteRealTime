@@ -77,10 +77,12 @@ async def test_startup_logs_and_health_identify_build(monkeypatch, tmp_path, cap
 
 
 class FakeDeviceSocket:
-    def __init__(self, capabilities=None):
+    def __init__(self, capabilities=None, device_id="test-unit", name=None):
         self.sent = []
         self.received = False
         self.capabilities = capabilities or {"aec": True}
+        self.device_id = device_id
+        self.name = name
 
     async def accept(self):
         pass
@@ -90,7 +92,8 @@ class FakeDeviceSocket:
             "v": 1,
             "type": "auth",
             "token": "device-secret",
-            "device_id": "test-unit",
+            "device_id": self.device_id,
+            "name": self.name,
             "capabilities": self.capabilities,
         }
 
@@ -115,6 +118,50 @@ async def test_device_websocket_auth_and_heartbeat(monkeypatch, tmp_path):
     assert [message["type"] for message in socket.sent] == ["auth.ok", "heartbeat.ack"]
     assert socket.sent[1]["monotonic_ms"] == 123
     get_settings.cache_clear()
+
+
+async def test_connected_devices_show_names_and_transcripts_filter_by_device(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+
+    class ConnectedDevice:
+        def __init__(self, device_id, device_name):
+            self.device_id = device_id
+            self.device_name = device_name
+            self.state = type("State", (), {"value": "listening"})()
+            self.device_volume = 0.25
+
+    device_sessions["kitchen"] = ConnectedDevice("kitchen", "Kitchen Companion")
+    device_sessions["office"] = ConnectedDevice("office", "Office Companion")
+    try:
+        async with app.router.lifespan_context(app):
+            from gateway.db import Database
+
+            db = Database(tmp_path / "app.db")
+            project_id = db.get_project()["id"]
+            kitchen = db.start_session(project_id, "kitchen", "test-model")
+            office = db.start_session(project_id, "office", "test-model")
+            db.add_turn(kitchen, "user", "Kitchen question")
+            db.add_turn(office, "user", "Office question")
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                headers = {"Authorization": "Bearer browser-secret"}
+                devices = (await client.get("/api/devices", headers=headers)).json()
+                turns = (
+                    await client.get(
+                        f"/api/projects/{project_id}/turns",
+                        headers=headers,
+                        params={"device_id": "office"},
+                    )
+                ).json()
+        assert {(device["device_id"], device["name"]) for device in devices} == {
+            ("kitchen", "Kitchen Companion"),
+            ("office", "Office Companion"),
+        }
+        assert [turn["text"] for turn in turns] == ["Office question"]
+    finally:
+        device_sessions.pop("kitchen", None)
+        device_sessions.pop("office", None)
+        get_settings.cache_clear()
 
 
 async def test_xvf_device_gets_gain_on_authentication(monkeypatch, tmp_path):

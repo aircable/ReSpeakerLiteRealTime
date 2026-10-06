@@ -77,12 +77,15 @@ guide the model's intent-based selection; they are not an exact-match speech par
 | “Which project is active?” | `list_projects` | Read-only lookup |
 | “Switch to Cooking Companion” | `switch_project` | Changes the active project and Realtime context |
 | “Set volume to 40 percent” | `control_volume` | Changes and persists device playback volume |
+| “Search the web for today's weather” | `search_web` | Runs OpenAI web search and shows clickable citations in the Live device UI |
 | “Pause until ready” | `wait_for_ready` | Stops microphone upload and arms local ready-word detection |
 
 `wait_for_ready` is advertised only when the firmware reports the `ready_keyword` capability.
 To add a new command, add a registry entry and a corresponding `_voice_*` handler on
 `DeviceSession`, then test its capability gate and result. A project instruction cannot add a
-function that is absent from the gateway's registry. Web search is not registered yet.
+function that is absent from the gateway's registry. `search_web` uses the existing API key and
+configured planner model; each invocation is billed as a Responses web-search request. It needs no
+firmware change. Sources appear in the live UI, but search results are not stored in the project plan.
 
 Home Assistant OS normally manages containers as Apps (formerly add-ons). Running this command
 directly requires host-level SSH access and is not managed by Supervisor; packaging the image as a
