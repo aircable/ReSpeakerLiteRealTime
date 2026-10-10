@@ -1,5 +1,6 @@
 import json
 import logging
+import wave
 
 import httpx
 from fastapi import WebSocketDisconnect
@@ -73,6 +74,70 @@ async def test_startup_logs_and_health_identify_build(monkeypatch, tmp_path, cap
     assert payload["commit"]
     assert "Starting ReSpeaker Thinking Companion gateway version=" in caplog.text
     assert " commit=" in caplog.text
+    get_settings.cache_clear()
+
+
+async def test_ffva_mic_capture_saves_authenticated_wav_without_realtime_session(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    sample = (1234).to_bytes(2, "little", signed=True)
+    pcm = sample * 16_000
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = {"Content-Type": "application/octet-stream", "X-Device-Token": "device-secret"}
+            assert (await client.post("/api/diagnostics/ffva-mic", headers=headers, content=pcm)).status_code == 403
+            saved = await client.patch(
+                "/api/settings", headers={"Authorization": "Bearer browser-secret"},
+                json={"diagnostic_audio": True},
+            )
+            assert saved.status_code == 200
+            assert (await client.post("/api/diagnostics/ffva-mic", content=pcm)).status_code == 401
+            assert (
+                await client.post(
+                    "/api/diagnostics/ffva-mic", headers={**headers, "X-Device-Token": "wrong"},
+                    content=pcm,
+                )
+            ).status_code == 401
+            response = await client.post("/api/diagnostics/ffva-mic", headers=headers, content=pcm)
+            assert response.status_code == 200
+            assert response.json()["seconds"] == 1.0
+            assert response.json()["file"].startswith("ffva-mic-")
+            assert not device_sessions
+
+    path = tmp_path / "diagnostic-audio" / response.json()["file"]
+    with wave.open(str(path), "rb") as recording:
+        assert recording.getnchannels() == 1
+        assert recording.getsampwidth() == 2
+        assert recording.getframerate() == 16_000
+        assert recording.readframes(16_000) == pcm
+    get_settings.cache_clear()
+
+
+async def test_ffva_mic_capture_rejects_bad_and_oversized_audio(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    headers = {"Content-Type": "application/octet-stream", "X-Device-Token": "device-secret"}
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.patch(
+                "/api/settings", headers={"Authorization": "Bearer browser-secret"},
+                json={"diagnostic_audio": True},
+            )
+            assert (
+                await client.post("/api/diagnostics/ffva-mic", headers=headers, content=b"\0")
+            ).status_code == 400
+            assert (
+                await client.post(
+                    "/api/diagnostics/ffva-mic", headers=headers, content=b"\0" * 320_002
+                )
+            ).status_code == 413
+            assert (
+                await client.post(
+                    "/api/diagnostics/ffva-mic", headers={"X-Device-Token": "device-secret"},
+                    content=b"\0" * 32_000,
+                )
+            ).status_code == 415
+    assert not (tmp_path / "diagnostic-audio").exists()
     get_settings.cache_clear()
 
 

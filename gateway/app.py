@@ -2,12 +2,14 @@ import asyncio
 import logging
 import os
 import secrets
+import wave
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -135,6 +137,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ReSpeaker Thinking Companion", version=GATEWAY_VERSION, lifespan=lifespan)
 
+FFVA_CAPTURE_RATE = 16_000
+FFVA_CAPTURE_MAX_BYTES = FFVA_CAPTURE_RATE * 2 * 10  # Ten seconds of mono PCM16.
+
 
 @app.get("/")
 async def index() -> FileResponse:
@@ -148,6 +153,43 @@ async def health() -> dict[str, str]:
         "version": GATEWAY_VERSION,
         "commit": GATEWAY_COMMIT,
     }
+
+
+@app.post("/api/diagnostics/ffva-mic")
+async def ffva_mic_capture(
+    request: Request,
+    device_token: Annotated[str | None, Header(alias="X-Device-Token")] = None,
+) -> dict[str, Any]:
+    """Save a short, isolated FFVA ASR-channel test; no Realtime session is opened."""
+    settings = get_settings()
+    if not device_token or not secrets.compare_digest(device_token, settings.device_token):
+        raise HTTPException(status_code=401, detail="invalid device token")
+    settings = settings.model_copy(update=Database(settings.database_path).setting_overrides())
+    if not settings.diagnostic_audio:
+        raise HTTPException(status_code=403, detail="enable diagnostic audio in gateway settings")
+    if request.headers.get("content-type", "").split(";", 1)[0] != "application/octet-stream":
+        raise HTTPException(status_code=415, detail="expected mono 16 kHz PCM16")
+
+    pcm = bytearray()
+    async for chunk in request.stream():
+        if len(pcm) + len(chunk) > FFVA_CAPTURE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="capture exceeds 10 seconds")
+        pcm.extend(chunk)
+    if len(pcm) < FFVA_CAPTURE_RATE * 2 or len(pcm) % 2:
+        raise HTTPException(status_code=400, detail="capture must contain 1-10 seconds of PCM16")
+
+    diagnostic_dir = settings.database_path.parent / "diagnostic-audio"
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    filename = f"ffva-mic-{stamp}-{secrets.token_hex(4)}.wav"
+    path = diagnostic_dir / filename
+    with wave.open(str(path), "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(2)
+        recording.setframerate(FFVA_CAPTURE_RATE)
+        recording.writeframes(pcm)
+    logger.info("FFVA mic diagnostic saved path=%s seconds=%.2f", path, len(pcm) / (FFVA_CAPTURE_RATE * 2))
+    return {"file": filename, "seconds": len(pcm) / (FFVA_CAPTURE_RATE * 2)}
 
 
 @app.get("/api/projects", dependencies=[Depends(require_ui_token)])
