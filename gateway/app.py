@@ -164,9 +164,6 @@ async def ffva_mic_capture(
     settings = get_settings()
     if not device_token or not secrets.compare_digest(device_token, settings.device_token):
         raise HTTPException(status_code=401, detail="invalid device token")
-    settings = settings.model_copy(update=Database(settings.database_path).setting_overrides())
-    if not settings.diagnostic_audio:
-        raise HTTPException(status_code=403, detail="enable diagnostic audio in gateway settings")
     if request.headers.get("content-type", "").split(";", 1)[0] != "application/octet-stream":
         raise HTTPException(status_code=415, detail="expected mono 16 kHz PCM16")
 

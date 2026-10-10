@@ -85,12 +85,7 @@ async def test_ffva_mic_capture_saves_authenticated_wav_without_realtime_session
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             headers = {"Content-Type": "application/octet-stream", "X-Device-Token": "device-secret"}
-            assert (await client.post("/api/diagnostics/ffva-mic", headers=headers, content=pcm)).status_code == 403
-            saved = await client.patch(
-                "/api/settings", headers={"Authorization": "Bearer browser-secret"},
-                json={"diagnostic_audio": True},
-            )
-            assert saved.status_code == 200
+            # Manual authenticated capture works with normal diagnostic recording disabled.
             assert (await client.post("/api/diagnostics/ffva-mic", content=pcm)).status_code == 401
             assert (
                 await client.post(
@@ -119,10 +114,6 @@ async def test_ffva_mic_capture_rejects_bad_and_oversized_audio(monkeypatch, tmp
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            await client.patch(
-                "/api/settings", headers={"Authorization": "Bearer browser-secret"},
-                json={"diagnostic_audio": True},
-            )
             assert (
                 await client.post("/api/diagnostics/ffva-mic", headers=headers, content=b"\0")
             ).status_code == 400
