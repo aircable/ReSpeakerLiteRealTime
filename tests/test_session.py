@@ -46,6 +46,7 @@ class FakeCloud:
         self.closed = False
         self.tool_outputs = []
         self.response_requests = []
+        self.barge_in_updates = []
 
     async def append_audio(self, pcm):
         self.audio.append(pcm)
@@ -64,6 +65,9 @@ class FakeCloud:
 
     async def request_response(self, instructions=None):
         self.response_requests.append(instructions)
+
+    async def set_barge_in(self, enabled):
+        self.barge_in_updates.append(enabled)
 
 
 class FakeRealtime(FakeCloud):
@@ -174,6 +178,35 @@ async def test_unavailable_ready_command_returns_device_capability_error(tmp_pat
     ]
     assert session.cloud.response_requests == [None]
     assert not session.waiting_for_ready
+
+
+async def test_voice_command_enables_barge_in_live_and_saves_setting(tmp_path):
+    session, _ = make_session(tmp_path, barge_in_enabled=False)
+    events = []
+
+    async def observe(event):
+        events.append(event)
+
+    session.observer = observe
+    await session._handle_tool_call(
+        {"name": "set_barge_in", "call_id": "barge-call", "arguments": '{"enabled": true}'}
+    )
+
+    assert session.cloud.barge_in_updates == [True]
+    assert session.settings.barge_in_enabled is True
+    assert session.db.setting_overrides()["barge_in_enabled"] is True
+    assert session.cloud.tool_outputs == [("barge-call", {"ok": True, "barge_in_enabled": True})]
+    assert session.cloud.response_requests == [None]
+    assert any(event["type"] == "settings.changed" and event["barge_in_enabled"] for event in events)
+
+
+async def test_voice_command_rejects_missing_barge_in_state(tmp_path):
+    session, _ = make_session(tmp_path)
+    await session._handle_tool_call(
+        {"name": "set_barge_in", "call_id": "barge-call", "arguments": "{}"}
+    )
+    assert session.cloud.barge_in_updates == []
+    assert session.cloud.tool_outputs[0][1]["ok"] is False
 
 
 async def test_unknown_voice_command_is_rejected_without_device_action(tmp_path):
@@ -896,6 +929,16 @@ async def test_output_flow_control_waits_for_device_playback_progress(tmp_path):
 
     await session.playback_progress("stream", 20)
     await waiter
+
+
+def test_extended_playback_lead_requires_device_queue_capability(tmp_path):
+    legacy, ws = make_session(tmp_path)
+    assert legacy.max_device_playback_lead_ms == MAX_DEVICE_PLAYBACK_LEAD_MS
+    extended = DeviceSession(
+        ws, "new-device", legacy.settings, legacy.db, legacy.planner,
+        capabilities={"playback_queue_ms": 320},
+    )
+    assert extended.max_device_playback_lead_ms == 320
 
 
 async def test_playback_completes_within_one_transport_frame_tolerance(tmp_path):

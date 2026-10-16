@@ -134,6 +134,30 @@ VOICE_COMMANDS = (
         response_rule="After a change, confirm briefly.",
     ),
     VoiceCommand(
+        name="set_barge_in",
+        handler="_voice_set_barge_in",
+        purpose="Enable or disable spoken interruption of the assistant on this ReSpeaker.",
+        examples=("enable barge-in", "turn off barge-in", "let me interrupt you"),
+        use_when="the user explicitly asks to turn spoken barge-in on or off.",
+        avoid_when="the user merely interrupts, says 'stop', or discusses barge-in without requesting a setting change.",
+        effect=(
+            "Updates this live Realtime session immediately and saves the shared gateway setting "
+            "for future sessions; the existing barge-in level and warmup guards still apply."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "True to allow spoken interruption; false to disable it.",
+                }
+            },
+            "required": ["enabled"],
+            "additionalProperties": False,
+        },
+        response_rule="Confirm the resulting on/off state briefly after the tool succeeds.",
+    ),
+    VoiceCommand(
         name="search_web",
         handler="_voice_search_web",
         purpose="Search the live web and return a short sourced answer.",

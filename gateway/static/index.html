@@ -105,6 +105,7 @@ function connectLive(){
   socket.onmessage=e=>{
     const m=JSON.parse(e.data);
     if(m.type==='auth.ok')refreshDevices().catch(()=>{});
+    if(m.type==='settings.changed'&&typeof m.barge_in_enabled==='boolean')bargeIn.checked=m.barge_in_enabled;
     const device=connectedDevices.find(d=>d.device_id===m.device_id);
     if(m.type==='state'&&device){device.state=m.state;renderDevices(connectedDevices)}
     if(m.type==='volume.changed'&&device){device.volume_percent=m.level_percent??m.level*100;showSelectedDevice()}

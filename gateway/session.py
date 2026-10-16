@@ -25,7 +25,8 @@ from .web_search import WebSearchError, search_web
 logger = logging.getLogger(__name__)
 PLAYBACK_FRAME_SECONDS = 0.020
 PLAYBACK_COMPLETION_TOLERANCE_MS = round(PLAYBACK_FRAME_SECONDS * 1000)
-MAX_DEVICE_PLAYBACK_LEAD_MS = 200
+MAX_DEVICE_PLAYBACK_LEAD_MS = 200  # Legacy 10-frame device queue.
+MAX_EXTENDED_PLAYBACK_LEAD_MS = 320  # New 16-frame queue.
 MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
 PLAYBACK_FRAMES_PER_SECOND = round(1 / PLAYBACK_FRAME_SECONDS)
 BARGE_IN_WARMUP_MS = 1000  # Gate speaker onset using reported DAC playback, not generation time.
@@ -132,6 +133,13 @@ class DeviceSession:
         self.announcement_echo_guard = False
         self.device_volume: float | None = None
         self.ready_keyword_enabled = bool((capabilities or {}).get("ready_keyword"))
+        queue_ms = (capabilities or {}).get("playback_queue_ms")
+        self.max_device_playback_lead_ms = (
+            min(queue_ms, MAX_EXTENDED_PLAYBACK_LEAD_MS)
+            if isinstance(queue_ms, int) and not isinstance(queue_ms, bool)
+            and queue_ms >= MAX_DEVICE_PLAYBACK_LEAD_MS
+            else MAX_DEVICE_PLAYBACK_LEAD_MS
+        )
         self.xvf_agc_ch0_supported = bool((capabilities or {}).get("xvf_agc_ch0"))
         self.ready_wait_requested = False
         self.waiting_for_ready = False
@@ -901,6 +909,28 @@ class DeviceSession:
         await cloud.submit_tool_output(call_id, result)
         await cloud.request_response()
 
+    async def _voice_set_barge_in(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        enabled = arguments.get("enabled")
+        if not isinstance(enabled, bool):
+            result = {"ok": False, "error": "Specify whether barge-in should be on or off."}
+        else:
+            try:
+                if self.settings.barge_in_enabled != enabled:
+                    await cloud.set_barge_in(enabled)
+                self.settings.barge_in_enabled = enabled
+                self._reset_barge_in_level_gate()
+                self.db.update_settings({"barge_in_enabled": enabled})
+                await self.publish_json("settings.changed", barge_in_enabled=enabled)
+                logger.info("Voice barge-in changed device=%s enabled=%s", self.device_id, enabled)
+                result = {"ok": True, "barge_in_enabled": enabled}
+            except Exception:
+                logger.exception("Voice barge-in update failed device=%s", self.device_id)
+                result = {"ok": False, "error": "Could not change barge-in right now."}
+        await cloud.submit_tool_output(call_id, result)
+        await cloud.request_response()
+
     async def _voice_search_web(
         self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
     ) -> None:
@@ -1283,7 +1313,7 @@ class DeviceSession:
             output = self.output
             if output is None or output.stream_id != stream_id:
                 return
-            if output.sent_ms - output.played_ms < MAX_DEVICE_PLAYBACK_LEAD_MS:
+            if output.sent_ms - output.played_ms < self.max_device_playback_lead_ms:
                 return
             self.playback_progress_event.clear()
             await self.playback_progress_event.wait()

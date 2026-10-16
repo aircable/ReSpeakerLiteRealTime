@@ -147,6 +147,18 @@ class RealtimeConnection:
     async def cancel_response(self) -> None:
         await self.send({"type": "response.cancel"})
 
+    async def set_barge_in(self, enabled: bool) -> None:
+        turn_detection = self._turn_detection_config()
+        turn_detection["interrupt_response"] = enabled
+        await self.send(
+            {
+                "type": "session.update",
+                "session": {"audio": {"input": {"turn_detection": turn_detection}}},
+            }
+        )
+        self.settings.barge_in_enabled = enabled
+        logger.info("OpenAI barge-in update sent: enabled=%s", enabled)
+
     async def submit_tool_output(self, call_id: str, output: dict[str, Any]) -> None:
         await self.send(
             {
