@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -8,7 +9,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -48,6 +49,9 @@ class OutputStream:
     ended: bool = False
     end_queued: bool = False
     ended_monotonic: float = 0.0
+    source_bytes: int = 0
+    source_hash: Any = field(default_factory=hashlib.sha256, repr=False)
+    sent_hash: Any = field(default_factory=hashlib.sha256, repr=False)
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,10 @@ class DeviceSession:
         self.observer = observer
         self.diagnostic_input: BinaryIO | None = None
         self.diagnostic_output: BinaryIO | None = None
+        self.diagnostic_source_output: BinaryIO | None = None
+        self.end_session_pending = False
+        self.end_session_response_id: str | None = None
+        self.end_session_response_done = False
         self.input_frames_total = 0
         self.input_frames_interval = 0
         self.input_samples_interval = 0
@@ -270,6 +278,9 @@ class DeviceSession:
         self.settings = self.settings.model_copy(update=self.db.setting_overrides())
         self.planner.settings = self.settings
         self.accepting_audio = True
+        self.end_session_pending = False
+        self.end_session_response_id = None
+        self.end_session_response_done = False
         self.warmup_vad_items.clear()
         self._reset_barge_in_level_gate()
         self._reset_listening_level_gate()
@@ -287,16 +298,19 @@ class DeviceSession:
             diagnostic_dir = self.settings.database_path.parent / "diagnostic-audio"
             input_path = diagnostic_dir / f"session-{self.session_id}-input.pcm"
             output_path = diagnostic_dir / f"session-{self.session_id}-output.pcm"
+            source_path = diagnostic_dir / f"session-{self.session_id}-output-source.pcm"
             try:
                 diagnostic_dir.mkdir(parents=True, exist_ok=True)
                 self.diagnostic_input = input_path.open("wb")
                 self.diagnostic_output = output_path.open("wb")
+                self.diagnostic_source_output = source_path.open("wb")
                 logger.info(
-                    "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s",
+                    "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s source=%s",
                     self.device_id,
                     self.session_id,
                     input_path,
                     output_path,
+                    source_path,
                 )
             except OSError:
                 logger.exception(
@@ -305,10 +319,10 @@ class DeviceSession:
                     self.session_id,
                     diagnostic_dir,
                 )
-                for recording in (self.diagnostic_input, self.diagnostic_output):
+                for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
                     if recording is not None:
                         recording.close()
-                self.diagnostic_input = self.diagnostic_output = None
+                self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
         context = build_instructions(
             project,
             self.db.recent_turns(self.project_id, 12),
@@ -326,10 +340,10 @@ class DeviceSession:
             await self.cloud.connect()
         except Exception:
             self.db.end_session(self.session_id, "connect_error", {})
-            for recording in (self.diagnostic_input, self.diagnostic_output):
+            for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
                 if recording is not None:
                     recording.close()
-            self.diagnostic_input = self.diagnostic_output = None
+            self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
             self.cloud = None
             self.accepting_audio = False
             self.cloud_ready = False
@@ -716,6 +730,9 @@ class DeviceSession:
             with contextlib.suppress(Exception):
                 await cloud.truncate(output.item_id, output.content_index, output.played_ms)
         self.output = None
+        self.end_session_pending = False
+        self.end_session_response_id = None
+        self.end_session_response_done = False
         self._reset_barge_in_level_gate()
         self._reset_listening_level_gate()
         # The server has already recognized this barge-in; do not hide the
@@ -821,6 +838,14 @@ class DeviceSession:
                 )
             self.assistant_text = ""
             self.last_activity = time.monotonic()
+            if self.end_session_pending and (
+                self.end_session_response_id is None
+                or response.get("id") == self.end_session_response_id
+            ):
+                self.end_session_response_done = True
+                if self.output is None:
+                    await self.stop("spoken_stop")
+                    return
             if self.output is None:
                 if self.announcement_echo_guard:
                     self.announcement_echo_guard = False
@@ -864,12 +889,23 @@ class DeviceSession:
         if not isinstance(arguments, dict):
             arguments = {}
         logger.info("Voice command requested device=%s command=%s", self.device_id, command.name)
+        if command.name == "end_session":
+            self.end_session_response_id = event.get("response_id")
         await getattr(self, command.handler)(cloud, call_id, arguments)
 
     async def _voice_end_session(
         self, _cloud: RealtimeConnection | None, _call_id: str | None, _arguments: dict[str, Any]
     ) -> None:
-        await self.stop("spoken_stop")
+        # A Realtime response can contain spoken audio followed by a function
+        # call. The function arguments arrive before the device has played the
+        # queued audio, so stopping here clips the final spoken sentence.
+        self.end_session_pending = True
+        self.end_session_response_done = False
+        logger.info(
+            "Voice end requested device=%s response=%s; waiting for final playback",
+            self.device_id,
+            self.end_session_response_id,
+        )
 
     async def _voice_wait_for_ready(
         self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
@@ -1089,16 +1125,19 @@ class DeviceSession:
         diagnostic_dir = self.settings.database_path.parent / "diagnostic-audio"
         input_path = diagnostic_dir / f"session-{self.session_id}-input.pcm"
         output_path = diagnostic_dir / f"session-{self.session_id}-output.pcm"
+        source_path = diagnostic_dir / f"session-{self.session_id}-output-source.pcm"
         try:
             diagnostic_dir.mkdir(parents=True, exist_ok=True)
             self.diagnostic_input = input_path.open("wb")
             self.diagnostic_output = output_path.open("wb")
+            self.diagnostic_source_output = source_path.open("wb")
             logger.info(
-                "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s",
+                "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s source=%s",
                 self.device_id,
                 self.session_id,
                 input_path,
                 output_path,
+                source_path,
             )
         except OSError:
             logger.exception(
@@ -1107,7 +1146,10 @@ class DeviceSession:
                 self.session_id,
                 diagnostic_dir,
             )
-            self.diagnostic_input = self.diagnostic_output = None
+            for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
+                if recording is not None:
+                    recording.close()
+            self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
 
     async def _switch_project(self, project: dict[str, Any]) -> None:
         """Open a clean cloud and transcript context without dropping the device socket."""
@@ -1120,6 +1162,9 @@ class DeviceSession:
             project["id"],
         )
         self.accepting_audio = False
+        self.end_session_pending = False
+        self.end_session_response_id = None
+        self.end_session_response_done = False
         await self._cancel_search_tasks()
         self.cloud_ready = False
         self.ready_wait_requested = False
@@ -1148,10 +1193,10 @@ class DeviceSession:
             self.db.end_session(old_session_id, "project_switch", self.usage)
         if old_session_id is not None and old_project_id is not None:
             asyncio.create_task(self.planner.update_after_session(old_project_id, old_session_id))
-        for recording in (self.diagnostic_input, self.diagnostic_output):
+        for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
             if recording is not None:
                 recording.close()
-        self.diagnostic_input = self.diagnostic_output = None
+        self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
         self.db.activate_project(project["id"])
         self.project_id = project["id"]
         self.session_id = self.db.start_session(
@@ -1176,6 +1221,10 @@ class DeviceSession:
             await self.cloud.connect()
         except Exception:
             self.db.end_session(self.session_id, "connect_error", {})
+            for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
+                if recording is not None:
+                    recording.close()
+            self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
             self.cloud = None
             await self.set_state(DeviceState.ERROR)
             raise
@@ -1208,6 +1257,18 @@ class DeviceSession:
         item_id = event.get("item_id", "unknown-item")
         content_index = int(event.get("content_index", 0))
         if self.output is None or self.output.response_id != response_id or self.output.item_id != item_id:
+            if self.output is not None:
+                logger.warning(
+                    "Assistant audio stream superseded before playback completed device=%s old_stream=%s "
+                    "old_response=%s source_bytes=%d sent_ms=%d played_ms=%d queued_frames=%d",
+                    self.device_id,
+                    self.output.stream_id,
+                    self.output.response_id,
+                    self.output.source_bytes,
+                    self.output.sent_ms,
+                    self.output.played_ms,
+                    self.playback_queue.qsize(),
+                )
             stream_id = uuid.uuid4().hex
             self.output = OutputStream(stream_id, response_id, item_id, content_index)
             self.output_buffer.clear()
@@ -1220,7 +1281,12 @@ class DeviceSession:
                 format="pcm_s16le",
             )
             await self.set_state(DeviceState.SPEAKING)
-        self.output_buffer.extend(base64.b64decode(event["delta"]))
+        audio = base64.b64decode(event["delta"])
+        self.output.source_bytes += len(audio)
+        self.output.source_hash.update(audio)
+        if self.diagnostic_source_output is not None:
+            self.diagnostic_source_output.write(audio)
+        self.output_buffer.extend(audio)
         while len(self.output_buffer) >= FRAME_BYTES and self.output is not None:
             frame = bytes(self.output_buffer[:FRAME_BYTES])
             del self.output_buffer[:FRAME_BYTES]
@@ -1230,7 +1296,11 @@ class DeviceSession:
         if self.output is None or self.output.end_queued:
             return
         if self.output_buffer:
-            self.output_buffer.extend(b"\x00" * (FRAME_BYTES - len(self.output_buffer)))
+            padding = b"\x00" * (FRAME_BYTES - len(self.output_buffer))
+            self.output_buffer.extend(padding)
+            self.output.source_hash.update(padding)
+            if self.diagnostic_source_output is not None:
+                self.diagnostic_source_output.write(padding)
             self._queue_playback(
                 PlaybackPacket(self.output.stream_id, bytes(self.output_buffer))
             )
@@ -1302,6 +1372,7 @@ class DeviceSession:
             if output is None or output.stream_id != packet.stream_id:
                 continue
             await self.send_bytes(packet.data)
+            output.sent_hash.update(packet.data)
             if self.diagnostic_output is not None:
                 self.diagnostic_output.write(packet.data)
             output.sent_ms += 20
@@ -1322,6 +1393,9 @@ class DeviceSession:
         if self.stopping or self.cloud is None:
             return
         self.stopping = True
+        self.end_session_pending = False
+        self.end_session_response_id = None
+        self.end_session_response_done = False
         session_id, project_id = self.session_id, self.project_id
         logger.info(
             "Ending session device=%s session=%s reason=%s state=%s",
@@ -1361,10 +1435,10 @@ class DeviceSession:
             self.output = None
             self.playback_progress_event.set()
             self.output_buffer.clear()
-            for recording in (self.diagnostic_input, self.diagnostic_output):
+            for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
                 if recording is not None:
                     recording.close()
-            self.diagnostic_input = self.diagnostic_output = None
+            self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
             self.state = DeviceState.IDLE
             notify_device = await self.send_optional(
                 "state", notify_device, state=DeviceState.IDLE.value
@@ -1412,14 +1486,31 @@ class DeviceSession:
         output = self.output
         if output is None:
             return
+        source_frames = (output.source_bytes + FRAME_BYTES - 1) // FRAME_BYTES
+        sent_bytes = output.sent_ms * (FRAME_BYTES // 20)
+        audio_match = (
+            output.end_queued
+            and source_frames * FRAME_BYTES == sent_bytes
+            and output.source_hash.digest() == output.sent_hash.digest()
+        )
         logger.info(
-            "Assistant playback complete device=%s stream=%s reason=%s sent_ms=%d played_ms=%d",
+            "Assistant playback complete device=%s stream=%s reason=%s source_bytes=%d sent_ms=%d played_ms=%d audio_match=%s",
             self.device_id,
             output.stream_id,
             reason,
+            output.source_bytes,
             output.sent_ms,
             output.played_ms,
+            audio_match,
         )
+        if output.end_queued and not audio_match:
+            logger.warning(
+                "Assistant audio differs from Realtime source device=%s stream=%s source_bytes=%d sent_bytes=%d",
+                self.device_id,
+                output.stream_id,
+                output.source_bytes,
+                sent_bytes,
+            )
         self.output = None
         self._reset_barge_in_level_gate()
         self._reset_listening_level_gate()
@@ -1430,6 +1521,9 @@ class DeviceSession:
         elif not self.settings.barge_in_enabled:
             self.echo_gate_until = time.monotonic() + 0.3
         self.last_activity = time.monotonic()
+        if self.end_session_pending and self.end_session_response_done:
+            await self.stop("spoken_stop")
+            return
         await self.set_state(DeviceState.LISTENING)
         await self._enter_ready_wait_if_possible()
 

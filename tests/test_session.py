@@ -223,7 +223,32 @@ async def test_unknown_voice_command_is_rejected_without_device_action(tmp_path)
     assert ws.messages == []
 
 
-async def test_end_session_voice_command_uses_spoken_stop(tmp_path):
+async def test_end_session_voice_command_waits_for_final_playback(tmp_path):
+    session, _ = make_session(tmp_path)
+    reasons = []
+
+    async def record_stop(reason):
+        reasons.append(reason)
+
+    session.stop = record_stop
+    session.output = OutputStream("stream", "response-1", "item-1", 0, sent_ms=100)
+    await session._handle_tool_call(
+        {
+            "name": "end_session", "call_id": "stop-call", "arguments": "{}",
+            "response_id": "response-1",
+        }
+    )
+    assert reasons == []
+    await session.handle_openai_event(
+        {"type": "response.done", "response": {"id": "response-1", "status": "completed"}}
+    )
+    assert reasons == []
+    await session._complete_playback("device_progress")
+
+    assert reasons == ["spoken_stop"]
+
+
+async def test_end_session_voice_command_without_audio_stops_after_response_done(tmp_path):
     session, _ = make_session(tmp_path)
     reasons = []
 
@@ -232,10 +257,54 @@ async def test_end_session_voice_command_uses_spoken_stop(tmp_path):
 
     session.stop = record_stop
     await session._handle_tool_call(
-        {"name": "end_session", "call_id": "stop-call", "arguments": "{}"}
+        {
+            "name": "end_session", "call_id": "stop-call", "arguments": "{}",
+            "response_id": "response-2",
+        }
+    )
+    assert reasons == []
+    await session.handle_openai_event(
+        {"type": "response.done", "response": {"id": "response-2", "status": "completed"}}
     )
 
     assert reasons == ["spoken_stop"]
+
+
+async def test_spoken_stop_does_not_flush_final_audio(tmp_path):
+    session, ws = make_session(tmp_path)
+    session.planner = FakePlanner()
+    session._start_playback_sender()
+    await session.handle_openai_event(
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "final-response",
+            "item_id": "final-item",
+            "content_index": 0,
+            "delta": base64.b64encode(bytes(FRAME_BYTES)).decode(),
+        }
+    )
+    stream_id = session.output.stream_id
+    await wait_for(lambda: session.output.sent_ms == 20)
+    await session._handle_tool_call(
+        {
+            "name": "end_session", "call_id": "stop-call", "arguments": "{}",
+            "response_id": "final-response",
+        }
+    )
+    await session.handle_openai_event(
+        {"type": "response.done", "response": {"id": "final-response", "status": "completed"}}
+    )
+    await wait_for(lambda: session.output.ended)
+    assert session.cloud is not None
+
+    await session.playback_progress(stream_id, 20)
+
+    assert session.cloud is None
+    assert not any(
+        kind == "json" and message["type"] == "playback.flush"
+        for kind, message in ws.messages
+    )
+    assert ws.messages[-1][1]["type"] == "session.ended"
 
 
 def test_playback_queue_uses_configured_bounded_duration(tmp_path):
@@ -737,12 +806,14 @@ async def test_session_reloads_diagnostic_setting_and_creates_recordings(
     assert session.settings.diagnostic_audio is True
     assert session.diagnostic_input is not None
     assert session.diagnostic_output is not None
+    assert session.diagnostic_source_output is not None
     session_id = session.session_id
     await session.stop("test")
     await asyncio.sleep(0)
     diagnostic_dir = settings.database_path.parent / "diagnostic-audio"
     assert (diagnostic_dir / f"session-{session_id}-input.pcm").exists()
     assert (diagnostic_dir / f"session-{session_id}-output.pcm").exists()
+    assert (diagnostic_dir / f"session-{session_id}-output-source.pcm").exists()
 
 
 async def test_xvf_gain_is_sent_at_session_start_only_to_supported_device(
@@ -823,6 +894,8 @@ async def test_barge_in_flushes_truncates_and_rejects_late_audio(tmp_path):
 async def test_output_is_chunked_and_padded_to_twenty_ms(tmp_path):
     session, ws = make_session(tmp_path)
     session._start_playback_sender()
+    session.diagnostic_source_output = io.BytesIO()
+    session.diagnostic_output = io.BytesIO()
     short_audio = bytes(100)
     await session.handle_openai_event(
         {
@@ -839,6 +912,8 @@ async def test_output_is_chunked_and_padded_to_twenty_ms(tmp_path):
     frames = [value for kind, value in ws.messages if kind == "bytes"]
     assert len(frames) == 1
     assert len(frames[0]) == FRAME_BYTES
+    assert session.diagnostic_source_output.getvalue() == session.diagnostic_output.getvalue()
+    assert session.output.source_hash.digest() == session.output.sent_hash.digest()
     await session._stop_playback_sender()
 
 
