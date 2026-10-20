@@ -1,0 +1,36 @@
+# One-flash stock Seeed 1.1.0 -> FFVA upgrade.
+# First boot holds the voice/audio setup while the XMOS image is written over
+# I2C. After verifying FFVA's version, the ESP32 reboots into the matching
+# XMOS-clock-master live configuration. Keep USB recovery available for this
+# tested stock-board path. It refuses an unknown XMOS version rather than
+# driving incompatible I2S clocks or overwriting an unrecognized image.
+packages:
+  live: !include respeaker-thinking-companion-ffva-master-live.yaml
+
+substitutions:
+  name: respeaker-lite-ffva
+  friendly_name: ReSpeaker Lite Thinking Companion
+  wake_start_condition: "id(ffva_dfu).can_proceed()"
+
+esphome:
+  build_path: .esphome/build-ffva-auto-upgrade
+  project:
+    name: aircable.respeaker-thinking-companion-ffva-upgrade
+    version: 0.2.0
+
+# The stock Seeed 1.1.0 factory image in the XTAG backup is Tools 15.2 format.
+# This v2 upgrade image is also Tools 15.2 format (CRC checked with xflash),
+# with image version 2 above the stock image version 1. Its application reports
+# 255.254.253 as an internal compatibility marker. Keep this exact value while
+# distributing the tested binary; changing it requires a new image and test.
+xmos_dfu:
+  id: ffva_dfu
+  i2c_id: internal_i2c
+  file: models/ffva-int-adec-stock-1.1.0-upgrade-v2.bin
+  sha256: 134ea0fc972803ccd2e1ebb772f384955e943436bacf0d95f71ec11127a32bdb
+  auto_update: true
+  source_version: "1.1.0"
+  target_version: "255.254.253"
+
+realtime_companion:
+  startup_guard: ffva_dfu

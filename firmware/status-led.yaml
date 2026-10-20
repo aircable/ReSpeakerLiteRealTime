@@ -1,0 +1,121 @@
+# Shared WS2812 status display for the Thinking Companion board (GPIO1).
+# The effect reads atomic transport state on the ESPHome loop; WebSocket/audio
+# callbacks never drive the LED directly.
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    internal: true
+    pin: GPIO1
+    num_leds: 1
+    rgb_order: GRB
+    chipset: ws2812
+    rmt_symbols: 192
+    # Only three bytes are needed; keeping the RMT source in internal RAM also
+    # avoids PSRAM/cache interactions while the audio pipeline is busy.
+    use_psram: false
+    # The effect supplies already-dim 8-bit colors. Default gamma 2.8 turns
+    # green=45 into about 2/255 at the LED, invisible behind the enclosure.
+    gamma_correct: 1.0
+    default_transition_length: 0s
+    effects:
+      - addressable_lambda:
+          name: Companion Status
+          update_interval: 50ms
+          lambda: |-
+            using esphome::realtime_companion::CompanionState;
+            const uint32_t now = millis();
+            const auto pulse = [now](uint32_t period_ms) {
+              const float phase = static_cast<float>(now % period_ms) / period_ms;
+              const float triangle = phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f;
+              return 0.20f + 0.80f * triangle;
+            };
+
+            uint8_t red = 0, green = 0, blue = 0;
+            float level = 1.0f;
+            uint8_t mode = 0;
+            const char *mode_name = "unknown";
+            if (id(realtime).is_timer_ringing()) {
+              red = 75; green = 32;
+              mode = 15; mode_name = "timer_alarm";
+              level = (now % 500) < 250 ? 1.0f : 0.0f;
+            } else if (!id(realtime).is_network_ready()) {
+              // Booting Wi-Fi, or disconnected after a previously working session.
+              if (id(realtime).has_authenticated_once() || now >= 30000) {
+                red = 55;
+                mode = 2; mode_name = "wifi_disconnected";
+              } else {
+                green = 42; blue = 55;
+                mode = 1; mode_name = "wifi_starting";
+              }
+              level = pulse(2000);
+            } else if (!id(realtime).is_authenticated()) {
+              if (id(realtime).has_authenticated_once() || now >= 30000) {
+                red = 70;
+                mode = 4; mode_name = "gateway_disconnected";
+              } else {
+                green = 42; blue = 55;
+                mode = 3; mode_name = "gateway_connecting";
+              }
+              level = pulse(800);
+            } else if (id(realtime).get_state() == CompanionState::ERROR) {
+              red = 80;
+              mode = 5; mode_name = "error";
+              level = (now % 500) < 250 ? 1.0f : 0.0f;
+            } else if (id(realtime).get_state() == CompanionState::MUTED) {
+              red = 55;  // Logical microphone mute; physical XVF mute is not readable.
+              mode = 6; mode_name = "software_muted";
+            } else if (id(user_button).state) {
+              blue = 70;
+              mode = 7; mode_name = "user_button";
+            } else if (id(realtime).is_barge_in_recent()) {
+              red = 70; green = 70; blue = 70;  // Brief white acknowledgement.
+              mode = 8; mode_name = "barge_in";
+            } else if (id(realtime).is_waiting_for_ready()) {
+              red = 70; green = 30;
+              mode = 9; mode_name = "waiting_for_ready";
+              level = pulse(1600);
+            } else if (id(realtime).is_session_paused()) {
+              // A stopped conversation is still armed for the wake word.
+              green = 45;
+              mode = 10; mode_name = "waiting_for_wake_word";
+            } else {
+              switch (id(realtime).get_state()) {
+                case CompanionState::IDLE:
+                  green = 45;  // Connected and standing by for wake word.
+                  mode = 10; mode_name = "waiting_for_wake_word";
+                  break;
+                case CompanionState::CONNECTING:
+                  green = 42; blue = 55;
+                  mode = 11; mode_name = "session_connecting";
+                  level = pulse(800);
+                  break;
+                case CompanionState::LISTENING:
+                  red = 55; blue = 55;
+                  mode = 12; mode_name = "listening";
+                  level = pulse(1600);
+                  break;
+                case CompanionState::THINKING:
+                  red = 10; green = 10; blue = 70;
+                  mode = 13; mode_name = "thinking";
+                  level = pulse(650);
+                  break;
+                case CompanionState::SPEAKING:
+                  green = 55; blue = 65;
+                  mode = 14; mode_name = "speaking";
+                  level = pulse(1600);
+                  break;
+                case CompanionState::MUTED:
+                case CompanionState::ERROR:
+                  break;  // Handled above.
+              }
+            }
+            static uint8_t previous_mode = 255;
+            if (initial_run || mode != previous_mode) {
+              ESP_LOGI("status_led", "WS2812 GPIO1 mode=%s rgb=%u/%u/%u", mode_name,
+                       static_cast<unsigned>(red), static_cast<unsigned>(green),
+                       static_cast<unsigned>(blue));
+              previous_mode = mode;
+            }
+            it[0].set_rgb(static_cast<uint8_t>(red * level),
+                          static_cast<uint8_t>(green * level),
+                          static_cast<uint8_t>(blue * level));

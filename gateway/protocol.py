@@ -28,6 +28,7 @@ class Authenticate(Envelope):
     type: Literal["auth"] = "auth"
     token: str
     device_id: str = Field(min_length=1, max_length=80)
+    name: str | None = Field(default=None, min_length=1, max_length=80)
     capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -67,6 +68,11 @@ class ReadyDetected(Envelope):
     type: Literal["ready.detected"] = "ready.detected"
 
 
+class TimerDismissed(Envelope):
+    type: Literal["timer.dismissed"] = "timer.dismissed"
+    timer_id: int = Field(gt=0)
+
+
 def parse_device_message(data: dict[str, Any]) -> Envelope:
     message_type = data.get("type")
     models: dict[str, type[Envelope]] = {
@@ -78,6 +84,7 @@ def parse_device_message(data: dict[str, Any]) -> Envelope:
         "heartbeat": Heartbeat,
         "volume.changed": VolumeChanged,
         "ready.detected": ReadyDetected,
+        "timer.dismissed": TimerDismissed,
     }
     model = models.get(message_type)
     if model is None:

@@ -1,11 +1,12 @@
 #include "realtime_companion.h"
+#include "wake_chime_pcm.h"
 
 #include "esphome/components/audio/audio.h"
+#include "esphome/components/json/json_util.h"
 #include "esphome/components/network/util.h"
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 
-#include <cJSON.h>
 #include <esp_timer.h>
 
 #include <algorithm>
@@ -18,7 +19,7 @@ static const char *const TAG = "realtime_companion";
 void RealtimeCompanion::setup() {
   ESP_LOGI(TAG, "Initializing transport; WebSocket will wait for network readiness");
   this->volume_preference_ = global_preferences->make_preference<float>(
-      fnv1_hash("realtime_companion_output_volume"));
+      fnv1_hash(this->volume_preference_key_.c_str()));
   float saved_volume;
   if (this->volume_preference_.load(&saved_volume) && saved_volume >= 0.0f && saved_volume <= 1.0f) {
     this->output_volume_ = saved_volume;
@@ -30,7 +31,7 @@ void RealtimeCompanion::setup() {
                                              &this->control_queue_struct_);
   this->progress_queue_ = xQueueCreateStatic(1, sizeof(ControlFrame), this->progress_queue_storage_,
                                               &this->progress_queue_struct_);
-  this->playback_queue_ = xQueueCreateStatic(10, sizeof(OutputFrame), this->playback_queue_storage_,
+  this->playback_queue_ = xQueueCreateStatic(PLAYBACK_QUEUE_FRAMES, sizeof(OutputFrame), this->playback_queue_storage_,
                                               &this->playback_queue_struct_);
   if (this->capture_queue_ == nullptr || this->control_queue_ == nullptr ||
       this->progress_queue_ == nullptr || this->playback_queue_ == nullptr) {
@@ -66,10 +67,17 @@ void RealtimeCompanion::setup() {
   this->speaker_->add_audio_output_callback([this](uint32_t frames, int64_t) {
     if (this->playback_active_.load(std::memory_order_acquire))
       this->played_frames_.fetch_add(frames, std::memory_order_relaxed);
+    else if (this->wake_ack_pending_.load(std::memory_order_acquire))
+      this->wake_ack_played_frames_.fetch_add(frames, std::memory_order_relaxed);
   });
   this->microphone_->add_data_callback(
       [this](const std::vector<uint8_t> &data) { this->handle_microphone_data(data); });
-  this->microphone_->start();
+  if (this->startup_guard_ == nullptr || this->startup_guard_->can_proceed()) {
+    this->microphone_->start();
+    this->microphone_started_ = true;
+  } else {
+    ESP_LOGE(TAG, "XMOS firmware check failed; microphone and gateway transport remain disabled");
+  }
 }
 
 void RealtimeCompanion::connect() {
@@ -195,6 +203,7 @@ void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_e
     this->session_start_pending_.store(false, std::memory_order_release);
     this->waiting_for_ready_.store(false, std::memory_order_release);
     this->ready_signal_sent_.store(false, std::memory_order_release);
+    this->barge_in_seen_.store(false, std::memory_order_release);
     xQueueReset(this->capture_queue_);
     xQueueReset(this->control_queue_);
     xQueueReset(this->progress_queue_);
@@ -207,10 +216,27 @@ void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_e
       OutputFrame output{};
       auto *mono = reinterpret_cast<const int16_t *>(event->data_ptr);
       auto *stereo = reinterpret_cast<int16_t *>(output.data.data());
+      // Treat the runtime value as a human-facing volume position rather than a
+      // linear PCM multiplier. Linear amplitude made almost the entire useful
+      // range fit below 2% on this amplifier. Squaring provides useful low-end
+      // resolution while retaining full scale at 100%.
+      const float output_gain = this->output_volume_ * this->output_volume_;
+      uint16_t input_peak = 0;
+      uint16_t output_peak = 0;
       for (size_t i = 0; i < INPUT_FRAME_BYTES / 2; i++) {
-        const int16_t scaled = static_cast<int16_t>(mono[i] * this->output_volume_);
+        const int16_t scaled = static_cast<int16_t>(mono[i] * output_gain);
         stereo[2 * i] = stereo[2 * i + 1] = scaled;
+        const int32_t input_sample = mono[i];
+        const int32_t output_sample = scaled;
+        input_peak = std::max<uint16_t>(input_peak, static_cast<uint16_t>(input_sample < 0 ? -input_sample : input_sample));
+        output_peak = std::max<uint16_t>(output_peak, static_cast<uint16_t>(output_sample < 0 ? -output_sample : output_sample));
       }
+      uint16_t prior = this->playback_input_peak_.load(std::memory_order_relaxed);
+      while (prior < input_peak && !this->playback_input_peak_.compare_exchange_weak(
+                                     prior, input_peak, std::memory_order_relaxed)) {}
+      prior = this->playback_output_peak_.load(std::memory_order_relaxed);
+      while (prior < output_peak && !this->playback_output_peak_.compare_exchange_weak(
+                                      prior, output_peak, std::memory_order_relaxed)) {}
       if (xQueueSend(this->playback_queue_, &output, 0) != pdTRUE)
         this->playback_dropped_frames_.fetch_add(1, std::memory_order_relaxed);
     } else if (event->op_code == 0x1) {
@@ -220,12 +246,11 @@ void RealtimeCompanion::handle_websocket_event(int32_t event_id, esp_websocket_e
 }
 
 void RealtimeCompanion::handle_text(const char *data, size_t length) {
-  std::string message(data, length);
-  cJSON *root = cJSON_ParseWithLength(message.data(), message.size());
-  if (root == nullptr)
+  auto document = json::parse_json(reinterpret_cast<const uint8_t *>(data), length);
+  if (document.isNull())
     return;
-  cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
-  const char *kind = cJSON_IsString(type) ? type->valuestring : "";
+  JsonObject root = document.as<JsonObject>();
+  const char *kind = root["type"] | "";
   if (strcmp(kind, "auth.ok") == 0) {
     ESP_LOGI(TAG, "Gateway authentication accepted");
     this->authenticated_ = true;
@@ -238,6 +263,7 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     this->stream_ready_.store(true, std::memory_order_release);
     this->waiting_for_ready_.store(false, std::memory_order_release);
     this->ready_signal_sent_.store(false, std::memory_order_release);
+    this->paused_.store(false, std::memory_order_release);
     this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::LISTENING);
   } else if (strcmp(kind, "session.ended") == 0) {
     ESP_LOGI(TAG, "Gateway session ended");
@@ -245,24 +271,25 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     this->stream_ready_.store(false, std::memory_order_release);
     this->waiting_for_ready_.store(false, std::memory_order_release);
     this->ready_signal_sent_.store(false, std::memory_order_release);
+    this->paused_.store(true, std::memory_order_release);
+    this->barge_in_seen_.store(false, std::memory_order_release);
     xQueueReset(this->capture_queue_);
     this->flush_playback();
     this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::IDLE);
   } else if (strcmp(kind, "state") == 0) {
-    cJSON *state = cJSON_GetObjectItemCaseSensitive(root, "state");
-    if (cJSON_IsString(state)) {
-      if (strcmp(state->valuestring, "thinking") == 0) this->update_state(CompanionState::THINKING);
-      if (strcmp(state->valuestring, "speaking") == 0) this->update_state(CompanionState::SPEAKING);
-      if (strcmp(state->valuestring, "listening") == 0) this->update_state(CompanionState::LISTENING);
-      if (strcmp(state->valuestring, "error") == 0) this->update_state(CompanionState::ERROR);
-    }
+    const char *state = root["state"] | "";
+    if (strcmp(state, "thinking") == 0) this->update_state(CompanionState::THINKING);
+    if (strcmp(state, "speaking") == 0) this->update_state(CompanionState::SPEAKING);
+    if (strcmp(state, "listening") == 0) this->update_state(CompanionState::LISTENING);
+    if (strcmp(state, "error") == 0) this->update_state(CompanionState::ERROR);
   } else if (strcmp(kind, "playback.start") == 0) {
-    cJSON *stream = cJSON_GetObjectItemCaseSensitive(root, "stream_id");
+    const char *stream = root["stream_id"] | "";
+    ESP_LOGI(TAG, "Playback started stream=%s", stream);
     xQueueReset(this->playback_queue_);
     xQueueReset(this->progress_queue_);
     {
       std::lock_guard<std::mutex> lock(this->playback_mutex_);
-      this->stream_id_ = cJSON_IsString(stream) ? stream->valuestring : "";
+      this->stream_id_ = stream;
       this->expected_duration_ms_ = 0;
     }
     this->played_frames_.store(0, std::memory_order_relaxed);
@@ -270,25 +297,56 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     this->playback_prebuffering_.store(true, std::memory_order_release);
     this->playback_active_.store(true, std::memory_order_release);
   } else if (strcmp(kind, "playback.end") == 0) {
-    cJSON *duration = cJSON_GetObjectItemCaseSensitive(root, "duration_ms");
     std::lock_guard<std::mutex> lock(this->playback_mutex_);
-    this->expected_duration_ms_ = cJSON_IsNumber(duration) ? duration->valueint : 0;
+    this->expected_duration_ms_ = root["duration_ms"] | 0;
     this->playback_end_received_.store(true, std::memory_order_release);
+    ESP_LOGI(TAG, "Playback end received stream=%s expected_ms=%u played_ms=%u queued=%u",
+             this->stream_id_.c_str(), static_cast<unsigned>(this->expected_duration_ms_),
+             static_cast<unsigned>(this->played_frames_.load(std::memory_order_relaxed) / 24),
+             static_cast<unsigned>(uxQueueMessagesWaiting(this->playback_queue_)));
   } else if (strcmp(kind, "playback.flush") == 0) {
+    ESP_LOGI(TAG, "Playback flushed stream=%s played_ms=%u queued=%u state=%u",
+             this->stream_id_.c_str(),
+             static_cast<unsigned>(this->played_frames_.load(std::memory_order_relaxed) / 24),
+             static_cast<unsigned>(uxQueueMessagesWaiting(this->playback_queue_)),
+             static_cast<unsigned>(this->get_state()));
+    // A flush while active playback is speaking is normally a user barge-in.
+    // Keep this as a short LED-only indication; the gateway owns the real state.
+    if (this->session_active_.load(std::memory_order_acquire) &&
+        this->playback_active_.load(std::memory_order_acquire) &&
+        this->get_state() == CompanionState::SPEAKING) {
+      this->last_barge_in_ms_.store(millis(), std::memory_order_release);
+      this->barge_in_seen_.store(true, std::memory_order_release);
+    }
     this->flush_playback();
+  } else if (strcmp(kind, "timer.alarm") == 0) {
+    const int32_t timer_id = root["timer_id"] | 0;
+    if (timer_id > 0) {
+      this->timer_alarm_id_.store(timer_id, std::memory_order_release);
+      ESP_LOGI(TAG, "Timer alarm received id=%ld", static_cast<long>(timer_id));
+    }
+  } else if (strcmp(kind, "timer.stop") == 0) {
+    const int32_t timer_id = root["timer_id"] | 0;
+    if (timer_id > 0 && timer_id == this->timer_alarm_id_.load(std::memory_order_acquire)) {
+      this->timer_alarm_id_.store(0, std::memory_order_release);
+      ESP_LOGI(TAG, "Timer alarm stopped id=%ld", static_cast<long>(timer_id));
+    }
   } else if (strcmp(kind, "volume.set") == 0) {
-    cJSON *level = cJSON_GetObjectItemCaseSensitive(root, "level");
-    if (cJSON_IsNumber(level))
-      this->set_runtime_volume(static_cast<float>(level->valuedouble), true);
+    JsonVariant level = root["level"];
+    if (level.is<float>() || level.is<double>() || level.is<int>())
+      this->set_runtime_volume(level.as<float>(), true);
+  } else if (strcmp(kind, "mic_gain.set") == 0 && this->mic_gain_controller_ != nullptr) {
+    JsonVariant gain = root["ch0_gain"];
+    if (gain.is<float>() || gain.is<double>() || gain.is<int>())
+      this->mic_gain_controller_->request_ch0_gain(gain.as<float>());
   } else if (strcmp(kind, "keyword.mode") == 0 && this->ready_keyword_enabled_) {
-    cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "mode");
-    const bool ready = cJSON_IsString(mode) && strcmp(mode->valuestring, "ready") == 0;
+    const char *mode = root["mode"] | "";
+    const bool ready = strcmp(mode, "ready") == 0;
     this->waiting_for_ready_.store(ready, std::memory_order_release);
     this->ready_signal_sent_.store(false, std::memory_order_release);
     xQueueReset(this->capture_queue_);
     ESP_LOGI(TAG, "Keyword mode changed to %s", ready ? "ready" : "wake");
   }
-  cJSON_Delete(root);
 }
 
 void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data) {
@@ -338,6 +396,8 @@ void RealtimeCompanion::handle_microphone_data(const std::vector<uint8_t> &data)
 }
 
 void RealtimeCompanion::append_capture_sample(int16_t sample) {
+  if (sample == INT16_MIN || sample == INT16_MAX)
+    this->capture_rail_samples_.fetch_add(1, std::memory_order_relaxed);
   const uint16_t magnitude = sample < 0 ? static_cast<uint16_t>(-static_cast<int32_t>(sample))
                                         : static_cast<uint16_t>(sample);
   this->building_peak_ = std::max(this->building_peak_, magnitude);
@@ -358,22 +418,42 @@ void RealtimeCompanion::append_capture_sample(int16_t sample) {
 }
 
 void RealtimeCompanion::loop() {
+  if (this->startup_guard_ != nullptr && !this->startup_guard_->can_proceed())
+    return;
+  if (!this->microphone_started_) {
+    this->microphone_->start();
+    this->microphone_started_ = true;
+  }
   if (this->client_ == nullptr && network::is_connected() &&
       millis() - this->last_connect_attempt_ms_ > 2000) {
     ESP_LOGI(TAG, "Network is ready; starting WebSocket client");
     this->connect();
   }
   if (this->auth_pending_.load(std::memory_order_acquire)) {
-    const std::string auth = "{\"v\":1,\"type\":\"auth\",\"token\":\"" + this->token_ +
-                             "\",\"device_id\":\"" + this->device_id_ +
-                             "\",\"capabilities\":{\"aec\":true,\"frame_ms\":20,"
-                             "\"runtime_volume\":true,\"ready_keyword\":" +
-                             std::string(this->ready_keyword_enabled_ ? "true" : "false") + "}}";
+    const std::string auth = json::build_json([this](JsonObject root) {
+      root["v"] = 1;
+      root["type"] = "auth";
+      root["token"] = this->token_;
+      root["device_id"] = this->device_id_;
+      if (!this->device_name_.empty())
+        root["name"] = this->device_name_;
+      JsonObject capabilities = root["capabilities"].to<JsonObject>();
+      capabilities["aec"] = true;
+      capabilities["frame_ms"] = 20;
+      capabilities["playback_queue_ms"] = PLAYBACK_QUEUE_FRAMES * 20;
+      capabilities["runtime_volume"] = true;
+      capabilities["ready_keyword"] = this->ready_keyword_enabled_;
+      capabilities["timer_alarm"] = true;
+      capabilities["xvf_agc_ch0"] = this->mic_gain_controller_ != nullptr;
+    });
     if (this->send_json(auth))
       this->auth_pending_.store(false, std::memory_order_release);
   }
+  this->process_timer_alarm();
+  this->process_wake_ack();
   if (this->session_start_pending_.load(std::memory_order_acquire) && this->authenticated_ &&
-      this->session_active_ && this->send_json("{\"v\":1,\"type\":\"session.start\"}")) {
+      this->session_active_ && !this->wake_ack_pending_.load(std::memory_order_acquire) &&
+      this->send_json("{\"v\":1,\"type\":\"session.start\"}")) {
     // The gateway buffers subsequent WebSocket frames while it establishes the OpenAI session.
     // Enabling capture here preserves speech that begins immediately after the wake word.
     this->stream_ready_.store(true, std::memory_order_release);
@@ -381,14 +461,17 @@ void RealtimeCompanion::loop() {
     ESP_LOGI(TAG, "Session start sent; accepting microphone frames for transport");
   }
   if (this->session_active_.load(std::memory_order_acquire) &&
-      millis() - this->last_audio_stats_ms_ >= 2000) {
+      millis() - this->last_audio_stats_ms_ >= this->audio_stats_interval_ms_) {
     this->last_audio_stats_ms_ = millis();
     const uint32_t captured = this->captured_frames_.exchange(0, std::memory_order_relaxed);
     const uint32_t sent = this->sent_frames_.exchange(0, std::memory_order_relaxed);
     const uint32_t dropped = this->dropped_frames_.exchange(0, std::memory_order_relaxed);
+    const uint32_t rail_samples = this->capture_rail_samples_.exchange(0, std::memory_order_relaxed);
     const uint32_t playback_dropped =
         this->playback_dropped_frames_.exchange(0, std::memory_order_relaxed);
     const uint16_t peak = this->capture_peak_.exchange(0, std::memory_order_relaxed);
+    const uint16_t playback_input_peak = this->playback_input_peak_.exchange(0, std::memory_order_relaxed);
+    const uint16_t playback_output_peak = this->playback_output_peak_.exchange(0, std::memory_order_relaxed);
     const unsigned queued = this->capture_queue_ == nullptr ? 0 : uxQueueMessagesWaiting(this->capture_queue_);
     const unsigned control_queued =
         this->control_queue_ == nullptr ? 0 : uxQueueMessagesWaiting(this->control_queue_);
@@ -397,12 +480,18 @@ void RealtimeCompanion::loop() {
     const unsigned playback_queued =
         this->playback_queue_ == nullptr ? 0 : uxQueueMessagesWaiting(this->playback_queue_);
     ESP_LOGI(TAG,
-             "Audio stats/2s: captured=%u sent=%u dropped=%u queued=%u/6 peak=%u "
-             "control_queued=%u/8 progress_pending=%u/1 playback_queued=%u/10 "
+             "Audio stats/%ums: captured=%u sent=%u dropped=%u queued=%u/6 peak=%u rail_samples=%u "
+             "playback_in_peak=%u playback_out_peak=%u volume=%.0f%% "
+             "control_queued=%u/8 progress_pending=%u/1 playback_queued=%u/%u "
              "playback_dropped=%u tx_stack_free=%u ready=%s connected=%s",
+             static_cast<unsigned>(this->audio_stats_interval_ms_),
              static_cast<unsigned>(captured), static_cast<unsigned>(sent),
              static_cast<unsigned>(dropped), queued, static_cast<unsigned>(peak),
+             static_cast<unsigned>(rail_samples),
+             static_cast<unsigned>(playback_input_peak), static_cast<unsigned>(playback_output_peak),
+             this->output_volume_ * 100.0f,
              control_queued, progress_pending, playback_queued,
+             static_cast<unsigned>(PLAYBACK_QUEUE_FRAMES),
              static_cast<unsigned>(playback_dropped),
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(this->audio_sender_task_handle_)),
              this->stream_ready_.load(std::memory_order_acquire) ? "yes" : "no",
@@ -410,7 +499,7 @@ void RealtimeCompanion::loop() {
   }
   if (this->playback_prebuffering_.load(std::memory_order_acquire)) {
     const UBaseType_t queued = uxQueueMessagesWaiting(this->playback_queue_);
-    if (queued >= PLAYBACK_PREBUFFER_FRAMES ||
+    if (queued >= this->playback_prebuffer_frames_ ||
         (queued > 0 && this->playback_end_received_.load(std::memory_order_acquire))) {
       ESP_LOGI(TAG, "Playback prebuffer ready: %u frames (%u ms)", static_cast<unsigned>(queued),
                static_cast<unsigned>(queued * 20));
@@ -425,7 +514,10 @@ void RealtimeCompanion::loop() {
     size_t written = this->speaker_->play(playback.data.data() + playback.offset, remaining, 0);
     playback.offset += written;
     if (playback.offset != playback.data.size()) {
-      xQueueSendToFront(this->playback_queue_, &playback, 0);
+      if (xQueueSendToFront(this->playback_queue_, &playback, 0) != pdTRUE) {
+        this->playback_dropped_frames_.fetch_add(1, std::memory_order_relaxed);
+        ESP_LOGW(TAG, "Playback queue full while retrying a partial frame");
+      }
     } else {
       // Progress is counted by the DAC-output callback, not by accepted input bytes.
     }
@@ -445,11 +537,16 @@ void RealtimeCompanion::loop() {
           this->send_playback_progress(
               "{\"v\":1,\"type\":\"playback.progress\",\"stream_id\":\"" + stream_id +
               "\",\"played_ms\":" + std::to_string(played_ms) + "}");
-      // Do not discard the final progress locally until the gateway has received it. Otherwise a
-      // single failed control write leaves the gateway permanently in its speaking state.
-      if (progress_sent && expected_duration_ms != 0 && played_ms >= expected_duration_ms) {
+      // Resampler/DAC accounting can finish fractionally below the PCM duration. Requiring exact
+      // equality leaves the stream active forever and keeps generating stale progress messages.
+      // One 20 ms transport frame is an inaudible and safe completion tolerance.
+      if (progress_sent && expected_duration_ms != 0 && played_ms + 20 >= expected_duration_ms) {
         std::lock_guard<std::mutex> lock(this->playback_mutex_);
         if (this->stream_id_ == stream_id) {
+          ESP_LOGI(TAG, "Playback locally complete stream=%s played_ms=%u expected_ms=%u queued=%u",
+                   stream_id.c_str(), static_cast<unsigned>(played_ms),
+                   static_cast<unsigned>(expected_duration_ms),
+                   static_cast<unsigned>(uxQueueMessagesWaiting(this->playback_queue_)));
           this->stream_id_.clear();
           this->expected_duration_ms_ = 0;
           this->playback_active_.store(false, std::memory_order_release);
@@ -460,13 +557,126 @@ void RealtimeCompanion::loop() {
   }
 }
 
+void RealtimeCompanion::process_wake_ack() {
+  if (!this->wake_ack_pending_.load(std::memory_order_acquire))
+    return;
+  if (!this->wake_ack_started_) {
+    if (!this->speaker_->is_stopped()) {
+      ESP_LOGW(TAG, "Wake chime skipped because speaker is busy");
+      this->wake_ack_pending_.store(false, std::memory_order_release);
+      return;
+    }
+    this->wake_ack_started_ms_ = millis();
+    this->wake_ack_started_ = true;
+    this->speaker_->start();
+  }
+  if (static_cast<uint32_t>(millis() - this->wake_ack_started_ms_) > 2500) {
+    ESP_LOGW(TAG, "Local chime timed out");
+    this->speaker_->stop();
+    this->wake_ack_pending_.store(false, std::memory_order_release);
+    if (this->is_timer_ringing()) this->timer_alarm_repeat_after_ms_ = millis() + 1500;
+    return;
+  }
+  static constexpr uint32_t SAMPLES_PER_FRAME = OUTPUT_FRAME_BYTES / (2 * sizeof(int16_t));
+  static constexpr uint32_t TOTAL_SAMPLES = kWakeChimePcm_len / sizeof(int16_t);
+  static constexpr uint32_t TOTAL_FRAMES = (TOTAL_SAMPLES + SAMPLES_PER_FRAME - 1) / SAMPLES_PER_FRAME;
+  if (this->wake_ack_draining_) {
+    if (this->speaker_->is_stopped() ||
+        this->wake_ack_played_frames_.load(std::memory_order_relaxed) + 24 >= TOTAL_SAMPLES) {
+      if (this->is_timer_ringing()) {
+        this->timer_alarm_repeat_after_ms_ = millis() + 1500;
+      } else {
+        ESP_LOGI(TAG, "Wake chime complete; starting gateway session");
+      }
+      this->wake_ack_pending_.store(false, std::memory_order_release);
+    }
+    return;
+  }
+  if (!this->speaker_->is_running())
+    return;
+
+  if (this->wake_ack_frame_index_ < TOTAL_FRAMES) {
+    if (this->wake_ack_frame_offset_ == 0) {
+      // The original Voice PE / ReSpeaker wake sound is mono 48 kHz FLAC, converted
+      // once to 24 kHz PCM16. Keep this gain independent of the voice's squared
+      // volume curve: the notification should remain gentle but audible.
+      const float gain = 0.15f + 0.55f * this->output_volume_;
+      for (uint32_t i = 0; i < SAMPLES_PER_FRAME; i++) {
+        const uint32_t position = this->wake_ack_frame_index_ * SAMPLES_PER_FRAME + i;
+        int16_t sample = 0;
+        if (position < TOTAL_SAMPLES) {
+          const uint32_t byte_offset = 2 * position;
+          const uint16_t raw = static_cast<uint16_t>(kWakeChimePcm[byte_offset]) |
+                               (static_cast<uint16_t>(kWakeChimePcm[byte_offset + 1]) << 8);
+          sample = static_cast<int16_t>(static_cast<int16_t>(raw) * gain);
+        }
+        this->wake_ack_pcm_[2 * i] = sample;
+        this->wake_ack_pcm_[2 * i + 1] = sample;
+      }
+    }
+    const size_t remaining = OUTPUT_FRAME_BYTES - this->wake_ack_frame_offset_;
+    const auto *pcm = reinterpret_cast<const uint8_t *>(this->wake_ack_pcm_.data());
+    this->wake_ack_frame_offset_ += this->speaker_->play(pcm + this->wake_ack_frame_offset_, remaining, 0);
+    if (this->wake_ack_frame_offset_ == OUTPUT_FRAME_BYTES) {
+      this->wake_ack_frame_offset_ = 0;
+      this->wake_ack_frame_index_++;
+    }
+    return;
+  }
+  this->speaker_->finish();
+  this->wake_ack_draining_ = true;
+}
+
+void RealtimeCompanion::process_timer_alarm() {
+  const int32_t timer_id = this->timer_alarm_id_.load(std::memory_order_acquire);
+  if (timer_id != this->timer_alarm_handled_id_) {
+    this->flush_playback();
+    this->timer_alarm_handled_id_ = timer_id;
+    this->timer_alarm_started_ms_ = millis();
+    this->timer_alarm_repeat_after_ms_ = millis();
+  }
+  if (timer_id > 0) {
+    if (static_cast<uint32_t>(millis() - this->timer_alarm_started_ms_) >= 60000) {
+      ESP_LOGI(TAG, "Timer alarm timed out after 60 seconds id=%ld", static_cast<long>(timer_id));
+      this->dismiss_timer_alarm();
+    } else if (!this->wake_ack_pending_.load(std::memory_order_acquire) &&
+               !this->session_active_.load(std::memory_order_acquire) &&
+               this->speaker_->is_stopped() &&
+               static_cast<int32_t>(millis() - this->timer_alarm_repeat_after_ms_) >= 0) {
+      this->wake_ack_played_frames_.store(0, std::memory_order_relaxed);
+      this->wake_ack_frame_index_ = 0;
+      this->wake_ack_frame_offset_ = 0;
+      this->wake_ack_started_ = false;
+      this->wake_ack_draining_ = false;
+      this->wake_ack_pending_.store(true, std::memory_order_release);
+    }
+  }
+  const int32_t dismissed = this->timer_dismiss_pending_id_.load(std::memory_order_acquire);
+  if (dismissed > 0 && this->send_json("{\"v\":1,\"type\":\"timer.dismissed\",\"timer_id\":" +
+                                      std::to_string(dismissed) + "}")) {
+    this->timer_dismiss_pending_id_.store(0, std::memory_order_release);
+    ESP_LOGI(TAG, "Timer dismissal sent id=%ld", static_cast<long>(dismissed));
+  }
+}
+
+void RealtimeCompanion::dismiss_timer_alarm() {
+  const int32_t timer_id = this->timer_alarm_id_.exchange(0, std::memory_order_acq_rel);
+  if (timer_id <= 0) return;
+  this->timer_dismiss_pending_id_.store(timer_id, std::memory_order_release);
+  this->wake_ack_pending_.store(false, std::memory_order_release);
+  this->speaker_->stop();
+  ESP_LOGI(TAG, "Timer alarm dismissed id=%ld", static_cast<long>(timer_id));
+}
+
 void RealtimeCompanion::start_session() {
-  if (this->muted_)
+  if (this->muted_ || this->session_active_ || this->is_timer_ringing())
     return;
   this->session_active_ = true;
   this->stream_ready_.store(false, std::memory_order_release);
   this->waiting_for_ready_.store(false, std::memory_order_release);
   this->ready_signal_sent_.store(false, std::memory_order_release);
+  this->paused_.store(false, std::memory_order_release);
+  this->barge_in_seen_.store(false, std::memory_order_release);
   this->captured_frames_.store(0, std::memory_order_relaxed);
   this->sent_frames_.store(0, std::memory_order_relaxed);
   this->dropped_frames_.store(0, std::memory_order_relaxed);
@@ -480,6 +690,25 @@ void RealtimeCompanion::start_session() {
     this->session_start_pending_.store(true, std::memory_order_release);
 }
 
+void RealtimeCompanion::wake_word_detected() {
+  if (this->is_timer_ringing()) {
+    this->dismiss_timer_alarm();
+    return;
+  }
+  if (this->muted_ || this->session_active_)
+    return;
+  this->start_session();
+  if (this->output_volume_ <= 0.0f)
+    return;  // Zero output volume also silences the wake notification.
+  this->wake_ack_played_frames_.store(0, std::memory_order_relaxed);
+  this->wake_ack_frame_index_ = 0;
+  this->wake_ack_frame_offset_ = 0;
+  this->wake_ack_started_ = false;
+  this->wake_ack_draining_ = false;
+  this->wake_ack_pending_.store(true, std::memory_order_release);
+  ESP_LOGI(TAG, "Wake word accepted; playing original 947 ms ReSpeaker chime before microphone transport");
+}
+
 void RealtimeCompanion::stop_session(const char *reason) {
   if (!this->session_active_)
     return;
@@ -488,6 +717,8 @@ void RealtimeCompanion::stop_session(const char *reason) {
   this->stream_ready_.store(false, std::memory_order_release);
   this->waiting_for_ready_.store(false, std::memory_order_release);
   this->ready_signal_sent_.store(false, std::memory_order_release);
+  this->paused_.store(true, std::memory_order_release);
+  this->barge_in_seen_.store(false, std::memory_order_release);
   xQueueReset(this->capture_queue_);
   this->flush_playback();
   this->update_state(this->muted_ ? CompanionState::MUTED : CompanionState::IDLE);
@@ -507,6 +738,10 @@ void RealtimeCompanion::ready_detected() {
 }
 
 void RealtimeCompanion::toggle_session() {
+  if (this->is_timer_ringing()) {
+    this->dismiss_timer_alarm();
+    return;
+  }
   if (this->session_active_)
     this->stop_session();
   else
@@ -529,6 +764,7 @@ void RealtimeCompanion::set_muted(bool muted) {
 }
 
 void RealtimeCompanion::flush_playback() {
+  this->wake_ack_pending_.store(false, std::memory_order_release);
   xQueueReset(this->playback_queue_);
   xQueueReset(this->progress_queue_);
   this->speaker_->stop();
@@ -576,12 +812,19 @@ bool RealtimeCompanion::send_playback_progress(const std::string &json) {
 
 bool RealtimeCompanion::is_network_ready() const { return network::is_connected(); }
 
+bool RealtimeCompanion::is_barge_in_recent() const {
+  return this->barge_in_seen_.load(std::memory_order_acquire) &&
+         static_cast<uint32_t>(millis() - this->last_barge_in_ms_.load(std::memory_order_acquire)) < 1200;
+}
+
 void RealtimeCompanion::set_runtime_volume(float volume, bool persist) {
   const float bounded = std::max(0.0f, std::min(1.0f, volume));
   this->output_volume_ = bounded;
   if (persist && !this->volume_preference_.save(&this->output_volume_))
     ESP_LOGW(TAG, "Could not persist assistant output volume");
-  ESP_LOGI(TAG, "Assistant output volume set to %.0f%%", this->output_volume_ * 100.0f);
+  ESP_LOGI(TAG, "Assistant output volume set to %.0f%% (effective PCM gain %.2f%%)",
+           this->output_volume_ * 100.0f,
+           this->output_volume_ * this->output_volume_ * 100.0f);
   this->report_volume();
 }
 
@@ -598,11 +841,18 @@ void RealtimeCompanion::dump_config() {
   ESP_LOGCONFIG(TAG, "Realtime Thinking Companion:");
   ESP_LOGCONFIG(TAG, "  Gateway: %s", this->url_.c_str());
   ESP_LOGCONFIG(TAG, "  Device ID: %s", this->device_id_.c_str());
-  ESP_LOGCONFIG(TAG, "  Assistant output volume: %.0f%%", this->output_volume_ * 100.0f);
+  ESP_LOGCONFIG(TAG, "  Assistant output volume: %.0f%% (effective PCM gain %.2f%%)",
+                this->output_volume_ * 100.0f,
+                this->output_volume_ * this->output_volume_ * 100.0f);
   ESP_LOGCONFIG(TAG, "  Ready keyword support: %s", this->ready_keyword_enabled_ ? "yes" : "no");
+  ESP_LOGCONFIG(TAG, "  Playback prebuffer: %u x 20 ms (%u ms)",
+                static_cast<unsigned>(this->playback_prebuffer_frames_),
+                static_cast<unsigned>(this->playback_prebuffer_frames_) * 20);
+  ESP_LOGCONFIG(TAG, "  Audio stats interval: %u ms", static_cast<unsigned>(this->audio_stats_interval_ms_));
+  ESP_LOGCONFIG(TAG, "  XVF3610 channel-0 gain control: %s", this->mic_gain_controller_ != nullptr ? "yes" : "no");
   ESP_LOGCONFIG(TAG,
                 "  TX queues: 8 control + 1 coalesced progress + 6 x 20 ms audio; playback queue: "
-                "10 x 20 ms");
+                "%u x 20 ms", static_cast<unsigned>(PLAYBACK_QUEUE_FRAMES));
 }
 
 }  // namespace esphome::realtime_companion

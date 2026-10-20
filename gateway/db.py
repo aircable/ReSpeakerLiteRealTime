@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -59,6 +59,19 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS timers (
+  id INTEGER PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  label TEXT NOT NULL DEFAULT '',
+  due_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK(status IN ('active','ringing','dismissed','cancelled')),
+  created_at TEXT NOT NULL,
+  fired_at TEXT,
+  closed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS timers_due ON timers(status, due_at);
+CREATE INDEX IF NOT EXISTS timers_device ON timers(device_id, status, due_at);
 """
 
 
@@ -80,6 +93,55 @@ class Database:
                     "INSERT INTO projects(name, goal, active, created_at, updated_at) VALUES(?,?,?,?,?)",
                     ("First project", "Define the project goal", 1, stamp, stamp),
                 )
+
+    def create_timer(self, device_id: str, duration_seconds: int, label: str = "") -> dict[str, Any]:
+        if not 1 <= duration_seconds <= 86400:
+            raise ValueError("Timer duration must be between 1 second and 24 hours")
+        stamp = datetime.now(UTC)
+        due_at = (stamp + timedelta(seconds=duration_seconds)).isoformat()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO timers(device_id, label, due_at, created_at) VALUES(?,?,?,?)",
+                (device_id, label[:80], due_at, stamp.isoformat()),
+            )
+            row = conn.execute("SELECT * FROM timers WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return dict(row)
+
+    def list_timers(self, device_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM timers WHERE device_id=? AND status IN ('active','ringing') "
+                "ORDER BY due_at, id", (device_id,)
+            )]
+
+    def fire_due_timers(self) -> list[str]:
+        """Atomically mark due alarms; retain them for disconnected devices."""
+        stamp = now()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "UPDATE timers SET status='ringing', fired_at=? "
+                "WHERE status='active' AND due_at<=? RETURNING device_id",
+                (stamp, stamp),
+            ).fetchall()
+        return list(dict.fromkeys(row["device_id"] for row in rows))
+
+    def next_ringing_timer(self, device_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM timers WHERE device_id=? AND status='ringing' "
+                "ORDER BY due_at, id LIMIT 1", (device_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def close_timer(self, device_id: str, timer_id: int, *, dismissed: bool = False) -> dict[str, Any] | None:
+        status = "dismissed" if dismissed else "cancelled"
+        with self.connect() as conn:
+            row = conn.execute(
+                "UPDATE timers SET status=?, closed_at=? WHERE id=? AND device_id=? "
+                "AND status IN ('active','ringing') AND (?=0 OR status='ringing') RETURNING *",
+                (status, now(), timer_id, device_id, int(dismissed)),
+            ).fetchone()
+        return dict(row) if row else None
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -179,12 +241,19 @@ class Database:
             )
             return ordinal
 
-    def recent_turns(self, project_id: int, limit: int = 12) -> list[dict[str, Any]]:
+    def recent_turns(
+        self, project_id: int, limit: int = 12, device_id: str | None = None
+    ) -> list[dict[str, Any]]:
         with self.connect() as conn:
+            where = "WHERE s.project_id=?"
+            values: tuple[Any, ...] = (project_id,)
+            if device_id is not None:
+                where += " AND s.device_id=?"
+                values += (device_id,)
             rows = conn.execute(
                 "SELECT t.* FROM turns t JOIN sessions s ON s.id=t.session_id "
-                "WHERE s.project_id=? ORDER BY t.id DESC LIMIT ?",
-                (project_id, limit),
+                f"{where} ORDER BY t.id DESC LIMIT ?",
+                (*values, limit),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
@@ -221,8 +290,10 @@ class Database:
                 )
             ]
 
-    def project_turns(self, project_id: int, limit: int = 100) -> list[dict[str, Any]]:
-        return self.recent_turns(project_id, min(max(limit, 1), 500))
+    def project_turns(
+        self, project_id: int, limit: int = 100, device_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self.recent_turns(project_id, min(max(limit, 1), 500), device_id)
 
     def setting_overrides(self) -> dict[str, Any]:
         with self.connect() as conn:

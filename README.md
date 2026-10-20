@@ -46,7 +46,7 @@ Realtime API's 4096-token per-response ceiling.
 
 `IDLE_TIMEOUT_SECONDS` starts after a completed assistant reply while the device is listening; set
 it to `0` to keep the session open until an explicit stop or the hard session limit. Raw microphone
-frames, including room noise, do not reset it. Say “go to sleep”, “stop”, or “goodbye” to end a
+frames, including room noise, do not reset it. Say “go to sleep”, “end session”, or “goodbye” to end a
 session immediately. The firmware's `output_volume` scales direct Realtime PCM before the
 speaker path (`0.125` is -18 dB relative to full scale). The AIC3204 remains at its proven default;
 changing its logarithmic control in addition to PCM scaling compounds the attenuation.
@@ -62,6 +62,37 @@ on. “What projects do I have?” lists projects, and “Switch to PROJECT NAME
 A switch closes the old project context and opens a clean Realtime and database session on the
 same device connection, so transcripts and durable project memory remain separated.
 
+## Voice commands
+
+The gateway-wide command registry is [gateway/voice_commands.py](gateway/voice_commands.py).
+Each entry records example spoken requests, when to use or avoid the command, its device effect,
+its Realtime argument schema, any required device capability, and the session handler that runs
+it. The gateway derives both the Realtime tool definitions and the voice-command instructions
+from this registry; project instructions only add project-specific policies. Example phrases
+guide the model's intent-based selection; they are not an exact-match speech parser.
+
+| Example request | Function | Effect |
+| --- | --- | --- |
+| “Go to sleep” | `end_session` | Ends the session and resumes wake-word listening |
+| “Which project is active?” | `list_projects` | Read-only lookup |
+| “Switch to Cooking Companion” | `switch_project` | Changes the active project and Realtime context |
+| “Set volume to 40 percent” | `control_volume` | Changes and persists device playback volume |
+| “Pause until ready” | `wait_for_ready` | Stops microphone upload and arms local ready-word detection |
+| “What time is it?” | `get_local_time` | Reads the gateway clock in the configured time zone |
+| “Set a five-minute timer” | `set_timer` | Stores a countdown and rings on this ReSpeaker |
+| “How much time is left?” | `list_timers` | Reports this device’s active timers |
+| “Cancel the pasta timer” | `cancel_timer` | Cancels a matching timer |
+
+`wait_for_ready` is advertised only when the firmware reports the `ready_keyword` capability.
+Timer commands are advertised only when the firmware reports `timer_alarm`. Set **Time zone** in
+the web UI to an IANA zone such as `America/Los_Angeles`; the default is UTC. Timer deadlines are
+stored in UTC and survive a gateway restart. The alarm is a local repeating chime with an amber
+status LED; USER or the wake word dismisses it. A disconnected ReSpeaker rings after reconnecting,
+not while it is offline. Output volume at zero also silences the alarm.
+To add a new command, add a registry entry and a corresponding `_voice_*` handler on
+`DeviceSession`, then test its capability gate and result. A project instruction cannot add a
+function that is absent from the gateway's registry. Web search is not registered yet.
+
 Home Assistant OS normally manages containers as Apps (formerly add-ons). Running this command
 directly requires host-level SSH access and is not managed by Supervisor; packaging the image as a
 Home Assistant App is the supported long-term HAOS installation path.
@@ -70,11 +101,26 @@ The SQLite database lives in the `companion-data` volume. Raw audio is not store
 transcriptions and assistant transcripts are retained, and the post-session planner writes the
 project summary and Markdown plan together with an immutable revision in one transaction.
 
-## Flash the device
+## Upgrade a stock ReSpeaker Lite
+
+For a stock Seeed XMOS 1.1.0 board, use the tested [one-flash FFVA upgrade guide](firmware/FFVA_AUTO_UPGRADE.md).
+Its ESP32 firmware embeds the matching XMOS image and performs the one-time I²C DFU upgrade on
+first boot. The gateway must also be updated to expose the time and timer tools. The older
+`respeaker-thinking-companion.yaml` below targets the original Seeed XMOS image, not FFVA.
+
+## Legacy Seeed firmware
 
 The XMOS chip must first have the formatBCE/Seeed 48 kHz I²S firmware v1.1.0 or newer. Copy
 `firmware/secrets.example.yaml` to `firmware/secrets.yaml`, point `gateway_ws_url` at the gateway,
 then compile `firmware/respeaker-thinking-companion.yaml` with ESPHome 2026.6 or newer.
+
+For multiple boards, give each firmware build a unique `substitutions.name` and
+`substitutions.friendly_name` before flashing. The `name` becomes the gateway `device_id`; both
+boards may use the same gateway URL and device token. The web UI's **Live device** selector shows
+each connected device by friendly name and ID, and limits its transcript and volume control to
+that device. Older firmware that does not report a friendly name still appears by ID. Selecting
+in the UI does not route speech: the board that hears the wake word starts the voice session.
+Voice settings and the default active project remain shared across devices.
 
 ### Optional local “ready” model
 
@@ -101,6 +147,9 @@ active during playback. The wake phrase is **Okay Nabu**, using the pinned
 
 The USR-to-D2 and MUTE-to-D3 rear-pad jumpers are required for the physical controls used by the
 configuration. See [PROTOCOL.md](PROTOCOL.md) for the wire contract.
+
+For XMOS USB DFU, XTAG4 recovery, the proposed JTAG adapter, parts list, and programming-tool
+checklist, see [XMOS_PROGRAMMING.md](XMOS_PROGRAMMING.md).
 
 `output_volume` in the firmware YAML is the first-boot default. After flashing, the connected
 device volume can be changed with the Live device slider or by saying, for example, “set volume

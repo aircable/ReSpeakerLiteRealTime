@@ -1,0 +1,42 @@
+# FFVA/ReSpeaker experiment with the XMOS generating MCLK, BCLK, and LRCLK.
+# Load only with an FFVA INT XMOS image built with
+# -DFFVA_INT_XMOS_CLOCK_MASTER=1. Keep the established GPIO43 mic / GPIO44
+# playback wiring; the existing XVF3610 live YAML remains unchanged.
+packages:
+  base: !include respeaker-thinking-companion-xvf3610-live.yaml
+
+substitutions:
+  friendly_name: Thinking Companion FFVA Clock Master
+
+# Suppress framework DEBUG chatter in this live test, but keep startup INFO,
+# audio-health summaries, state transitions, and all WARN/ERROR diagnostics.
+logger:
+  level: INFO
+
+esphome:
+  build_path: .esphome/build-ffva-master
+  project:
+    name: aircable.respeaker-thinking-companion-ffva-master
+    version: 0.1.0
+
+# The existing speaker is already an I2S secondary. The mic is the only ESP32
+# audio component that previously generated clocks. Both now receive BCLK and
+# LRCLK from XMOS. Do not configure GPIO9 as ESP32 MCLK: ESP-IDF would drive it
+# even in I2S slave mode, contending with the XMOS MCLK output.
+i2s_audio:
+  - id: !extend xmos_rx_master
+    i2s_mclk_pin: !remove
+
+microphone:
+  - id: !extend xmos_microphones
+    i2s_mode: secondary
+
+xvf3610_audio:
+  ffva_mode: true
+  aec_diagnostics: false
+
+realtime_companion:
+  mic_gain_controller: !remove
+  volume_preference_key: realtime_companion_output_volume_ffva_master
+  audio_stats_interval_ms: 5000
+  playback_prebuffer_frames: 12  # 240 ms; smooth FFVA playback at the cost of 80 ms vs. XVF3610.

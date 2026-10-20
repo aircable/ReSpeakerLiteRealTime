@@ -1,7 +1,10 @@
 import asyncio
 import base64
 import io
+import logging
+import math
 from fastapi import WebSocketDisconnect
+from unittest.mock import AsyncMock
 
 from gateway.config import Settings
 from gateway.db import Database
@@ -10,6 +13,9 @@ from gateway.protocol import FRAME_BYTES, DeviceState
 from gateway.session import (
     BARGE_IN_LEVEL_WINDOW_FRAMES,
     BARGE_IN_WARMUP_MS,
+    LISTENING_LEVEL_MIN_ACTIVE_FRAMES,
+    LISTENING_LEVEL_RELEASE_FRAMES,
+    LISTENING_LEVEL_WINDOW_FRAMES,
     MAX_DEVICE_PLAYBACK_LEAD_MS,
     MAX_QUEUED_INPUT_FRAMES,
     PLAYBACK_COMPLETION_TOLERANCE_MS,
@@ -41,6 +47,7 @@ class FakeCloud:
         self.closed = False
         self.tool_outputs = []
         self.response_requests = []
+        self.barge_in_updates = []
 
     async def append_audio(self, pcm):
         self.audio.append(pcm)
@@ -60,14 +67,19 @@ class FakeCloud:
     async def request_response(self, instructions=None):
         self.response_requests.append(instructions)
 
+    async def set_barge_in(self, enabled):
+        self.barge_in_updates.append(enabled)
+
 
 class FakeRealtime(FakeCloud):
-    def __init__(self, settings, instructions, on_event, ready_keyword_enabled=False):
+    def __init__(self, settings, instructions, on_event, ready_keyword_enabled=False,
+                 timer_alarm_enabled=False):
         super().__init__()
         self.settings = settings
         self.instructions = instructions
         self.on_event = on_event
         self.ready_keyword_enabled = ready_keyword_enabled
+        self.timer_alarm_enabled = timer_alarm_enabled
 
     async def connect(self):
         pass
@@ -88,6 +100,7 @@ def make_session(tmp_path, **setting_overrides):
         "ui_token": "browser-secret",
         "database_path": tmp_path / "test.db",
         "idle_timeout_seconds": 30,
+        "listening_rms_threshold": 0,
         **setting_overrides,
     }
     settings = Settings(**setting_values)
@@ -101,6 +114,64 @@ def make_session(tmp_path, **setting_overrides):
     session.accepting_audio = True
     session.cloud_ready = True
     return session, ws
+
+
+async def test_local_time_uses_configured_zone(tmp_path):
+    session, _ = make_session(tmp_path, time_zone="America/Los_Angeles")
+    cloud = session.cloud
+    await session._voice_get_local_time(cloud, "time", {})
+    result = cloud.tool_outputs[0][1]
+    assert result["time_zone"] == "America/Los_Angeles"
+    assert result["weekday"]
+    assert result["local_datetime"]
+
+
+async def test_timer_alarm_survives_disconnection_and_dismisses(tmp_path):
+    session, ws = make_session(tmp_path)
+    session.timer_alarm_enabled = True
+    session.cloud = None
+    session.session_id = None
+    timer = session.db.create_timer("device", 30, "tea")
+    with session.db.connect() as conn:
+        conn.execute("UPDATE timers SET due_at='2000-01-01T00:00:00+00:00' WHERE id=?", (timer["id"],))
+    session.db.fire_due_timers()
+
+    await session.notify_pending_timer()
+    await session.notify_pending_timer()
+    alarms = [value for kind, value in ws.messages if kind == "json" and value["type"] == "timer.alarm"]
+    assert len(alarms) == 1
+    assert alarms[0]["timer_id"] == timer["id"]
+
+    await session.timer_dismissed(timer["id"])
+    assert session.db.next_ringing_timer("device") is None
+    assert any(value["type"] == "timer.stop" for kind, value in ws.messages if kind == "json")
+
+
+async def test_timer_alarm_stops_active_voice_session_first(tmp_path):
+    session, ws = make_session(tmp_path)
+    session.timer_alarm_enabled = True
+    session.stop = AsyncMock()
+    timer = session.db.create_timer("device", 30)
+    with session.db.connect() as conn:
+        conn.execute("UPDATE timers SET due_at='2000-01-01T00:00:00+00:00' WHERE id=?", (timer["id"],))
+    session.db.fire_due_timers()
+    await session.notify_pending_timer()
+    session.stop.assert_awaited_once_with("timer_alarm")
+    assert ws.messages[-1][1]["type"] == "timer.alarm"
+
+
+async def test_voice_timer_create_list_and_cancel(tmp_path):
+    session, _ = make_session(tmp_path)
+    cloud = session.cloud
+    session.timer_alarm_enabled = True
+    await session._voice_set_timer(cloud, "create", {"duration_seconds": 90, "label": "tea"})
+    created = cloud.tool_outputs[-1][1]
+    assert created["ok"] and created["label"] == "tea"
+    await session._voice_list_timers(cloud, "list", {})
+    assert cloud.tool_outputs[-1][1]["timers"][0]["timer_id"] == created["timer_id"]
+    await session._voice_cancel_timer(cloud, "cancel", {"label": "tea"})
+    assert cloud.tool_outputs[-1][1]["ok"]
+    assert session.db.list_timers("device") == []
 
 
 async def test_ready_word_wait_gates_audio_until_local_detection(tmp_path):
@@ -156,6 +227,147 @@ async def test_ready_word_wait_gates_audio_until_local_detection(tmp_path):
     assert ws.messages[-1][1]["mode"] == "wake"
 
 
+async def test_unavailable_ready_command_returns_device_capability_error(tmp_path):
+    session, _ = make_session(tmp_path)
+
+    await session._handle_tool_call(
+        {"name": "wait_for_ready", "call_id": "ready-call", "arguments": "{}"}
+    )
+
+    assert session.cloud.tool_outputs == [
+        ("ready-call", {"ready": False, "error": "The device has no ready-word model."})
+    ]
+    assert session.cloud.response_requests == [None]
+    assert not session.waiting_for_ready
+
+
+async def test_voice_command_enables_barge_in_live_and_saves_setting(tmp_path):
+    session, _ = make_session(tmp_path, barge_in_enabled=False)
+    events = []
+
+    async def observe(event):
+        events.append(event)
+
+    session.observer = observe
+    await session._handle_tool_call(
+        {"name": "set_barge_in", "call_id": "barge-call", "arguments": '{"enabled": true}'}
+    )
+
+    assert session.cloud.barge_in_updates == [True]
+    assert session.settings.barge_in_enabled is True
+    assert session.db.setting_overrides()["barge_in_enabled"] is True
+    assert session.cloud.tool_outputs == [("barge-call", {"ok": True, "barge_in_enabled": True})]
+    assert session.cloud.response_requests == [None]
+    assert any(event["type"] == "settings.changed" and event["barge_in_enabled"] for event in events)
+
+
+async def test_voice_command_rejects_missing_barge_in_state(tmp_path):
+    session, _ = make_session(tmp_path)
+    await session._handle_tool_call(
+        {"name": "set_barge_in", "call_id": "barge-call", "arguments": "{}"}
+    )
+    assert session.cloud.barge_in_updates == []
+    assert session.cloud.tool_outputs[0][1]["ok"] is False
+
+
+async def test_unknown_voice_command_is_rejected_without_device_action(tmp_path):
+    session, ws = make_session(tmp_path)
+
+    await session._handle_tool_call(
+        {"name": "nonexistent_command", "call_id": "bad-call", "arguments": "{}"}
+    )
+
+    assert session.cloud.tool_outputs == [
+        ("bad-call", {"ok": False, "error": "Unknown command."})
+    ]
+    assert session.cloud.response_requests == [None]
+    assert ws.messages == []
+
+
+async def test_end_session_voice_command_waits_for_final_playback(tmp_path):
+    session, _ = make_session(tmp_path)
+    reasons = []
+
+    async def record_stop(reason):
+        reasons.append(reason)
+
+    session.stop = record_stop
+    session.output = OutputStream("stream", "response-1", "item-1", 0, sent_ms=100)
+    await session._handle_tool_call(
+        {
+            "name": "end_session", "call_id": "stop-call", "arguments": "{}",
+            "response_id": "response-1",
+        }
+    )
+    assert reasons == []
+    await session.handle_openai_event(
+        {"type": "response.done", "response": {"id": "response-1", "status": "completed"}}
+    )
+    assert reasons == []
+    await session._complete_playback("device_progress")
+
+    assert reasons == ["spoken_stop"]
+
+
+async def test_end_session_voice_command_without_audio_stops_after_response_done(tmp_path):
+    session, _ = make_session(tmp_path)
+    reasons = []
+
+    async def record_stop(reason):
+        reasons.append(reason)
+
+    session.stop = record_stop
+    await session._handle_tool_call(
+        {
+            "name": "end_session", "call_id": "stop-call", "arguments": "{}",
+            "response_id": "response-2",
+        }
+    )
+    assert reasons == []
+    await session.handle_openai_event(
+        {"type": "response.done", "response": {"id": "response-2", "status": "completed"}}
+    )
+
+    assert reasons == ["spoken_stop"]
+
+
+async def test_spoken_stop_does_not_flush_final_audio(tmp_path):
+    session, ws = make_session(tmp_path)
+    session.planner = FakePlanner()
+    session._start_playback_sender()
+    await session.handle_openai_event(
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "final-response",
+            "item_id": "final-item",
+            "content_index": 0,
+            "delta": base64.b64encode(bytes(FRAME_BYTES)).decode(),
+        }
+    )
+    stream_id = session.output.stream_id
+    await wait_for(lambda: session.output.sent_ms == 20)
+    await session._handle_tool_call(
+        {
+            "name": "end_session", "call_id": "stop-call", "arguments": "{}",
+            "response_id": "final-response",
+        }
+    )
+    await session.handle_openai_event(
+        {"type": "response.done", "response": {"id": "final-response", "status": "completed"}}
+    )
+    await wait_for(lambda: session.output.ended)
+    assert session.cloud is not None
+
+    await session.playback_progress(stream_id, 20)
+
+    assert session.cloud is None
+    assert not any(
+        kind == "json" and message["type"] == "playback.flush"
+        for kind, message in ws.messages
+    )
+    assert ws.messages[-1][1]["type"] == "session.ended"
+
+
 def test_playback_queue_uses_configured_bounded_duration(tmp_path):
     session, _ = make_session(tmp_path, playback_buffer_seconds=45)
 
@@ -200,6 +412,98 @@ async def test_voice_volume_tool_returns_result_to_realtime(tmp_path):
     assert cloud.tool_outputs == [("volume-call", {"ok": True, "level_percent": 30})]
     assert cloud.response_requests == [None]
     assert session.device_volume == 0.3
+
+
+async def test_web_search_runs_off_realtime_reader_and_publishes_sources(monkeypatch, tmp_path):
+    session, ws = make_session(tmp_path)
+    published = []
+
+    async def observer(message):
+        published.append(message)
+
+    async def fake_search(_settings, query):
+        assert query == "weather today"
+        await asyncio.sleep(0)
+        return {"answer": "Sunny [1]", "citations": [
+            {"start": 6, "end": 9, "url": "https://weather.example", "title": "Forecast"}
+        ]}
+
+    monkeypatch.setattr("gateway.session.search_web", fake_search)
+    session.observer = observer
+    cloud = session.cloud
+    await session._handle_tool_call({
+        "name": "search_web", "call_id": "search-call",
+        "arguments": '{"query":"weather today"}',
+    })
+    assert not cloud.tool_outputs  # The reader has already returned to receiving events.
+    await asyncio.gather(*tuple(session.search_tasks))
+
+    assert cloud.tool_outputs == [("search-call", {
+        "ok": True, "answer": "Sunny [1]",
+        "sources": [{"url": "https://weather.example", "title": "Forecast"}],
+    })]
+    assert cloud.response_requests == [None]
+    assert ws.messages == []
+    assert published[-1]["type"] == "search.result"
+    assert published[-1]["citations"][0]["start"] == 6
+
+
+async def test_web_search_is_cancelled_on_session_stop(monkeypatch, tmp_path):
+    session, _ = make_session(tmp_path)
+    started = asyncio.Event()
+
+    async def slow_search(_settings, _query):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("gateway.session.search_web", slow_search)
+    cloud = session.cloud
+    await session._handle_tool_call({
+        "name": "search_web", "call_id": "search-call", "arguments": '{"query":"latest news"}',
+    })
+    await started.wait()
+    await session.stop("button")
+
+    assert not session.search_tasks
+    assert cloud.closed
+    assert cloud.tool_outputs == []
+
+
+async def test_web_search_error_returns_to_realtime_without_ui_result(monkeypatch, tmp_path):
+    from gateway.web_search import WebSearchError
+
+    session, _ = make_session(tmp_path)
+    published = []
+
+    async def observer(message):
+        published.append(message)
+
+    async def failed_search(_settings, _query):
+        raise WebSearchError("No sourced answer was found.")
+
+    monkeypatch.setattr("gateway.session.search_web", failed_search)
+    session.observer = observer
+    await session._handle_tool_call({
+        "name": "search_web", "call_id": "search-call", "arguments": '{"query":"obscure query"}',
+    })
+    await asyncio.gather(*tuple(session.search_tasks))
+
+    assert session.cloud.tool_outputs == [
+        ("search-call", {"ok": False, "error": "No sourced answer was found."})
+    ]
+    assert session.cloud.response_requests == [None]
+    assert published == []
+
+
+async def test_web_search_rejects_missing_query_without_network(tmp_path):
+    session, _ = make_session(tmp_path)
+    await session._handle_tool_call({
+        "name": "search_web", "call_id": "search-call", "arguments": '{}',
+    })
+    assert not session.search_tasks
+    assert session.cloud.tool_outputs == [
+        ("search-call", {"ok": False, "error": "A search query is required."})
+    ]
 
 
 async def test_silent_audio_transport_does_not_reset_idle_timer(tmp_path):
@@ -305,6 +609,126 @@ async def test_barge_in_level_gate_ignores_a_single_full_scale_spike(tmp_path):
     await wait_for(lambda: len(session.cloud.audio) == BARGE_IN_LEVEL_WINDOW_FRAMES)
     assert not session.barge_gate_open
     assert session.cloud.audio == [bytes(FRAME_BYTES)] * BARGE_IN_LEVEL_WINDOW_FRAMES
+    await session._stop_input_sender()
+
+
+async def test_barge_in_guard_log_distinguishes_partial_peak_from_full_window(tmp_path, caplog):
+    session, _ = make_session(
+        tmp_path, barge_in_enabled=True, barge_in_rms_threshold=12000
+    )
+    session.output = OutputStream("stream", "response", "item", 0, sent_ms=2000)
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS)
+    spike = (32767).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    with caplog.at_level(logging.INFO, logger="gateway.session"):
+        await session.receive_audio(spike)
+        for _ in range(BARGE_IN_LEVEL_WINDOW_FRAMES - 1):
+            await session.receive_audio(bytes(FRAME_BYTES))
+        session._reset_barge_in_level_gate()
+
+    full_window_rms = math.isqrt(32767**2 // BARGE_IN_LEVEL_WINDOW_FRAMES)
+    assert f"max_full_window_rms={full_window_rms}" in caplog.text
+    assert f"margin={full_window_rms - 12000:+d}" in caplog.text
+    assert "full_windows=1 window_ms=400 max_partial_rms=32767" in caplog.text
+    assert "Barge-in level qualified" not in caplog.text
+    await session._stop_input_sender()
+
+
+async def test_barge_in_qualification_log_shows_threshold_margin(tmp_path, caplog):
+    session, _ = make_session(
+        tmp_path, barge_in_enabled=True, barge_in_rms_threshold=12000
+    )
+    session.output = OutputStream("stream", "response", "item", 0, sent_ms=2000)
+    await session.playback_progress("stream", BARGE_IN_WARMUP_MS)
+    speech = (13000).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    with caplog.at_level(logging.INFO, logger="gateway.session"):
+        for _ in range(BARGE_IN_LEVEL_WINDOW_FRAMES):
+            await session.receive_audio(speech)
+
+    assert session.barge_gate_open
+    assert "rolling_rms=13000 threshold=12000 margin=+1000 window_ms=400" in caplog.text
+    await session._stop_input_sender()
+
+
+async def test_listening_gate_rejects_quiet_voice_and_click_then_passes_loud_speech(tmp_path):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    session.diagnostic_input = io.BytesIO()
+    quiet = (300).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    click = (32767).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    speech = (2000).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+
+    for _ in range(LISTENING_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(quiet)
+    await session.receive_audio(click)
+    for _ in range(LISTENING_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(quiet)
+    await wait_for(lambda: len(session.cloud.audio) == 2 * LISTENING_LEVEL_WINDOW_FRAMES + 1)
+    assert not session.listening_gate_open
+    assert session.cloud.audio == [bytes(FRAME_BYTES)] * len(session.cloud.audio)
+
+    for _ in range(LISTENING_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(speech)
+    await wait_for(lambda: len(session.cloud.audio) == 3 * LISTENING_LEVEL_WINDOW_FRAMES + 8)
+    assert session.listening_gate_open
+    assert session.cloud.audio[-LISTENING_LEVEL_WINDOW_FRAMES:] == [speech] * LISTENING_LEVEL_WINDOW_FRAMES
+    assert session.diagnostic_input.getvalue() == (
+        quiet * LISTENING_LEVEL_WINDOW_FRAMES
+        + click
+        + quiet * LISTENING_LEVEL_WINDOW_FRAMES
+        + speech * LISTENING_LEVEL_WINDOW_FRAMES
+    )
+
+    for _ in range(LISTENING_LEVEL_RELEASE_FRAMES):
+        await session.receive_audio(quiet)
+    assert not session.listening_gate_open
+    await session.receive_audio(quiet)
+    await wait_for(lambda: session.cloud.audio[-1] == bytes(FRAME_BYTES))
+    await session._stop_input_sender()
+
+
+async def test_listening_gate_requires_sustained_level_not_peak(tmp_path):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    loud = (2000).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    for _ in range(LISTENING_LEVEL_MIN_ACTIVE_FRAMES - 1):
+        await session.receive_audio(loud)
+    for _ in range(LISTENING_LEVEL_WINDOW_FRAMES):
+        await session.receive_audio(bytes(FRAME_BYTES))
+    assert not session.listening_gate_open
+    assert all(frame == bytes(FRAME_BYTES) for frame in session.cloud.audio)
+    await session._stop_input_sender()
+
+
+async def test_listening_guard_log_uses_sixth_highest_frame_not_click_peak(tmp_path, caplog):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    click = (32767).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    quiet = (300).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    with caplog.at_level(logging.INFO, logger="gateway.session"):
+        await session.receive_audio(click)
+        for _ in range(LISTENING_LEVEL_WINDOW_FRAMES - 1):
+            await session.receive_audio(quiet)
+        session._reset_listening_level_gate()
+
+    assert "max_decision_rms=300 threshold=800 margin=-500" in caplog.text
+    assert "max_active_frames=1 required_active_frames=6" in caplog.text
+    assert "max_frame_rms=32767 full_windows=1" in caplog.text
+    assert "Listening level qualified" not in caplog.text
+    await session._stop_input_sender()
+
+
+async def test_listening_qualification_log_shows_decision_margin(tmp_path, caplog):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    loud = (900).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    quiet = (300).to_bytes(2, "little", signed=True) * (FRAME_BYTES // 2)
+    with caplog.at_level(logging.INFO, logger="gateway.session"):
+        for _ in range(LISTENING_LEVEL_MIN_ACTIVE_FRAMES):
+            await session.receive_audio(loud)
+        for _ in range(LISTENING_LEVEL_WINDOW_FRAMES - LISTENING_LEVEL_MIN_ACTIVE_FRAMES):
+            await session.receive_audio(quiet)
+
+    assert session.listening_gate_open
+    assert (
+        "decision_rms=900 threshold=800 margin=+100 active_frames=6 "
+        "required_active_frames=6 window_ms=160"
+    ) in caplog.text
     await session._stop_input_sender()
 
 
@@ -443,12 +867,50 @@ async def test_session_reloads_diagnostic_setting_and_creates_recordings(
     assert session.settings.diagnostic_audio is True
     assert session.diagnostic_input is not None
     assert session.diagnostic_output is not None
+    assert session.diagnostic_source_output is not None
     session_id = session.session_id
     await session.stop("test")
     await asyncio.sleep(0)
     diagnostic_dir = settings.database_path.parent / "diagnostic-audio"
     assert (diagnostic_dir / f"session-{session_id}-input.pcm").exists()
     assert (diagnostic_dir / f"session-{session_id}-output.pcm").exists()
+    assert (diagnostic_dir / f"session-{session_id}-output-source.pcm").exists()
+
+
+async def test_xvf_gain_is_sent_at_session_start_only_to_supported_device(
+    tmp_path, monkeypatch
+):
+    settings = Settings(
+        device_token="device-secret",
+        ui_token="browser-secret",
+        database_path=tmp_path / "test.db",
+        announce_active_project=False,
+    )
+    db = Database(settings.database_path)
+    db.initialize()
+    db.update_settings({"xvf_agc_ch0_gain": 18.0})
+    monkeypatch.setattr("gateway.session.RealtimeConnection", FakeRealtime)
+
+    supported_socket = FakeWebSocket()
+    supported = DeviceSession(
+        supported_socket, "xvf", settings, db, FakePlanner(),
+        capabilities={"xvf_agc_ch0": True},
+    )
+    await supported.start(None)
+    assert any(
+        value["type"] == "mic_gain.set" and value["ch0_gain"] == 18.0
+        for kind, value in supported_socket.messages if kind == "json"
+    )
+    await supported.stop("test")
+
+    unsupported_socket = FakeWebSocket()
+    unsupported = DeviceSession(unsupported_socket, "seeed", settings, db, FakePlanner())
+    await unsupported.start(None)
+    assert not any(
+        value["type"] == "mic_gain.set"
+        for kind, value in unsupported_socket.messages if kind == "json"
+    )
+    await unsupported.stop("test")
 
 
 async def wait_for(predicate):
@@ -493,6 +955,8 @@ async def test_barge_in_flushes_truncates_and_rejects_late_audio(tmp_path):
 async def test_output_is_chunked_and_padded_to_twenty_ms(tmp_path):
     session, ws = make_session(tmp_path)
     session._start_playback_sender()
+    session.diagnostic_source_output = io.BytesIO()
+    session.diagnostic_output = io.BytesIO()
     short_audio = bytes(100)
     await session.handle_openai_event(
         {
@@ -509,6 +973,8 @@ async def test_output_is_chunked_and_padded_to_twenty_ms(tmp_path):
     frames = [value for kind, value in ws.messages if kind == "bytes"]
     assert len(frames) == 1
     assert len(frames[0]) == FRAME_BYTES
+    assert session.diagnostic_source_output.getvalue() == session.diagnostic_output.getvalue()
+    assert session.output.source_hash.digest() == session.output.sent_hash.digest()
     await session._stop_playback_sender()
 
 
@@ -599,6 +1065,16 @@ async def test_output_flow_control_waits_for_device_playback_progress(tmp_path):
 
     await session.playback_progress("stream", 20)
     await waiter
+
+
+def test_extended_playback_lead_requires_device_queue_capability(tmp_path):
+    legacy, ws = make_session(tmp_path)
+    assert legacy.max_device_playback_lead_ms == MAX_DEVICE_PLAYBACK_LEAD_MS
+    extended = DeviceSession(
+        ws, "new-device", legacy.settings, legacy.db, legacy.planner,
+        capabilities={"playback_queue_ms": 320},
+    )
+    assert extended.max_device_playback_lead_ms == 320
 
 
 async def test_playback_completes_within_one_transport_frame_tolerance(tmp_path):

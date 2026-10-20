@@ -2,12 +2,15 @@ import asyncio
 import logging
 import os
 import secrets
-from contextlib import asynccontextmanager
+import wave
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -22,6 +25,7 @@ from .protocol import (
     SessionStart,
     SessionStop,
     StateReport,
+    TimerDismissed,
     VolumeChanged,
     parse_device_message,
     server_message,
@@ -93,8 +97,11 @@ class GatewaySettingsUpdate(BaseModel):
     openai_trace: bool | None = None
     barge_in_enabled: bool | None = None
     barge_in_rms_threshold: int | None = Field(default=None, ge=0, le=32768)
+    xvf_agc_ch0_gain: float | None = Field(default=None, ge=0.0, le=1000.0)
+    listening_rms_threshold: int | None = Field(default=None, ge=0, le=32768)
     announce_active_project: bool | None = None
     transcript_retention_days: int | None = Field(default=None, ge=0, le=3650)
+    time_zone: str | None = None
 
 
 class DeviceVolumeUpdate(BaseModel):
@@ -127,11 +134,33 @@ async def lifespan(app: FastAPI):
         GATEWAY_COMMIT,
     )
     settings = get_settings()
-    Database(settings.database_path).initialize()
-    yield
+    db = Database(settings.database_path)
+    db.initialize()
+    timer_task = asyncio.create_task(_run_timers(db), name="device-timer-scheduler")
+    try:
+        yield
+    finally:
+        timer_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await timer_task
+
+
+async def _run_timers(db: Database) -> None:
+    while True:
+        await asyncio.sleep(0.5)
+        for device_id in db.fire_due_timers():
+            logger.info("Timer due device=%s", device_id)
+        for session in tuple(device_sessions.values()):
+            try:
+                await session.notify_pending_timer()
+            except Exception:
+                logger.exception("Timer alarm delivery failed device=%s; will retry", session.device_id)
 
 
 app = FastAPI(title="ReSpeaker Thinking Companion", version=GATEWAY_VERSION, lifespan=lifespan)
+
+FFVA_CAPTURE_RATE = 16_000
+FFVA_CAPTURE_MAX_BYTES = FFVA_CAPTURE_RATE * 2 * 10  # Ten seconds of mono PCM16.
 
 
 @app.get("/")
@@ -146,6 +175,40 @@ async def health() -> dict[str, str]:
         "version": GATEWAY_VERSION,
         "commit": GATEWAY_COMMIT,
     }
+
+
+@app.post("/api/diagnostics/ffva-mic")
+async def ffva_mic_capture(
+    request: Request,
+    device_token: Annotated[str | None, Header(alias="X-Device-Token")] = None,
+) -> dict[str, Any]:
+    """Save a short, isolated FFVA ASR-channel test; no Realtime session is opened."""
+    settings = get_settings()
+    if not device_token or not secrets.compare_digest(device_token, settings.device_token):
+        raise HTTPException(status_code=401, detail="invalid device token")
+    if request.headers.get("content-type", "").split(";", 1)[0] != "application/octet-stream":
+        raise HTTPException(status_code=415, detail="expected mono 16 kHz PCM16")
+
+    pcm = bytearray()
+    async for chunk in request.stream():
+        if len(pcm) + len(chunk) > FFVA_CAPTURE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="capture exceeds 10 seconds")
+        pcm.extend(chunk)
+    if len(pcm) < FFVA_CAPTURE_RATE * 2 or len(pcm) % 2:
+        raise HTTPException(status_code=400, detail="capture must contain 1-10 seconds of PCM16")
+
+    diagnostic_dir = settings.database_path.parent / "diagnostic-audio"
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    filename = f"ffva-mic-{stamp}-{secrets.token_hex(4)}.wav"
+    path = diagnostic_dir / filename
+    with wave.open(str(path), "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(2)
+        recording.setframerate(FFVA_CAPTURE_RATE)
+        recording.writeframes(pcm)
+    logger.info("FFVA mic diagnostic saved path=%s seconds=%.2f", path, len(pcm) / (FFVA_CAPTURE_RATE * 2))
+    return {"file": filename, "seconds": len(pcm) / (FFVA_CAPTURE_RATE * 2)}
 
 
 @app.get("/api/projects", dependencies=[Depends(require_ui_token)])
@@ -167,7 +230,18 @@ async def gateway_settings(
 async def update_gateway_settings(
     body: GatewaySettingsUpdate, db: Annotated[Database, Depends(database)]
 ) -> dict[str, bool]:
-    db.update_settings(body.model_dump(exclude_none=True))
+    values = body.model_dump(exclude_none=True)
+    if "time_zone" in values:
+        try:
+            ZoneInfo(values["time_zone"])
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise HTTPException(422, "Use an IANA time zone such as America/Los_Angeles") from exc
+    db.update_settings(values)
+    if "xvf_agc_ch0_gain" in values:
+        for session in tuple(device_sessions.values()):
+            if session.xvf_agc_ch0_supported:
+                with suppress(WebSocketDisconnect, RuntimeError):
+                    await session.request_xvf_gain(values["xvf_agc_ch0_gain"])
     return {"saved": True}
 
 
@@ -176,6 +250,7 @@ async def connected_devices() -> list[dict[str, Any]]:
     return [
         {
             "device_id": session.device_id,
+            "name": session.device_name,
             "state": session.state.value,
             "volume_percent": (
                 round(session.device_volume * 100) if session.device_volume is not None else None
@@ -233,9 +308,10 @@ async def project_history(
 
 @app.get("/api/projects/{project_id}/turns", dependencies=[Depends(require_ui_token)])
 async def project_turns(
-    project_id: int, db: Annotated[Database, Depends(database)], limit: int = 100
+    project_id: int, db: Annotated[Database, Depends(database)], limit: int = 100,
+    device_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    return db.project_turns(project_id, limit)
+    return db.project_turns(project_id, limit, device_id)
 
 
 @app.get("/api/projects/{project_id}/export.md", dependencies=[Depends(require_ui_token)])
@@ -268,6 +344,7 @@ async def device_socket(websocket: WebSocket) -> None:
             planner,
             live_hub.publish,
             capabilities=auth.capabilities,
+            device_name=auth.name,
         )
         device_sessions[auth.device_id] = session
         logger.info(
@@ -281,6 +358,10 @@ async def device_socket(websocket: WebSocket) -> None:
             device_id=auth.device_id,
             audio={"format": "pcm_s16le", "sample_rate": 24000, "channels": 1, "frame_ms": 20},
         )
+        await session.notify_pending_timer()
+        # Apply before the wake word whenever the device is already online.
+        # start() resends current UI overrides for a persistent connection.
+        await session.request_xvf_gain(effective_settings.xvf_agc_ch0_gain)
         while True:
             incoming = await websocket.receive()
             if incoming.get("bytes") is not None:
@@ -309,6 +390,8 @@ async def device_socket(websocket: WebSocket) -> None:
                 await session.report_volume(message.level)
             elif isinstance(message, ReadyDetected):
                 await session.ready_detected()
+            elif isinstance(message, TimerDismissed):
+                await session.timer_dismissed(message.timer_id)
     except WebSocketDisconnect as exc:
         logger.warning(
             "Device WebSocket disconnected device=%s code=%s reason=%s",

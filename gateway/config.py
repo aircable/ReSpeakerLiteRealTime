@@ -1,8 +1,9 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,8 +35,23 @@ class Settings(BaseSettings):
     barge_in_enabled: bool = False
     # PCM16 RMS required during assistant playback; 0 disables the local gate.
     barge_in_rms_threshold: int = Field(default=8000, ge=0, le=32768)
+    # XVF3610 channel-0 fixed gain; 0 restores its adaptive AGC.
+    xvf_agc_ch0_gain: float = Field(default=25.0, ge=0.0, le=1000.0)
+    # Minimum PCM16 frame RMS for starting a turn while no assistant audio plays.
+    # Initial XVF test value; zero disables the gate if normal speech is missed.
+    listening_rms_threshold: int = Field(default=800, ge=0, le=32768)
     announce_active_project: bool = True
     transcript_retention_days: int = Field(default=0, ge=0, le=3650)
+    time_zone: str = "UTC"
+
+    @field_validator("time_zone")
+    @classmethod
+    def valid_time_zone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("Use an IANA time zone such as America/Los_Angeles") from exc
+        return value
 
 
 @lru_cache

@@ -1,8 +1,10 @@
 import base64
+import json
 import logging
 
 from gateway.config import Settings
 from gateway.realtime import RealtimeConnection
+from gateway.voice_commands import tool_specs
 
 
 async def ignore_event(_event):
@@ -58,6 +60,30 @@ def test_server_vad_configuration(tmp_path):
     }
 
 
+async def test_barge_in_update_changes_only_live_turn_detection(tmp_path):
+    class RecordingSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(json.loads(data))
+
+    connection = make_connection(tmp_path)
+    connection.socket = RecordingSocket()
+    await connection.set_barge_in(True)
+
+    assert connection.settings.barge_in_enabled is True
+    assert connection.socket.sent == [{
+        "type": "session.update",
+        "session": {"audio": {"input": {"turn_detection": {
+            "type": "semantic_vad",
+            "create_response": True,
+            "interrupt_response": True,
+            "eagerness": "auto",
+        }}}},
+    }]
+
+
 def test_far_field_noise_reduction_is_enabled_by_default(tmp_path):
     connection = make_connection(tmp_path)
 
@@ -102,3 +128,33 @@ def test_trace_counts_audio_and_response_usage_without_logging_audio(tmp_path, c
     assert connection.total_input_tokens == 12
     assert connection.total_output_tokens == 7
     assert audio not in caplog.text
+
+
+async def test_session_update_advertises_registry_tools(tmp_path, monkeypatch):
+    class RecordingSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, data):
+            self.sent.append(json.loads(data))
+
+        async def __aiter__(self):
+            if False:
+                yield None
+
+    socket = RecordingSocket()
+
+    async def connect_socket(*_args, **_kwargs):
+        return socket
+
+    monkeypatch.setattr("gateway.realtime.websockets.connect", connect_socket)
+    connection = make_connection(tmp_path)
+    connection.settings = connection.settings.model_copy(update={"openai_api_key": "test-key"})
+    connection.ready_keyword_enabled = True
+
+    await connection.connect()
+
+    update = socket.sent[0]
+    assert update["type"] == "session.update"
+    assert update["session"]["tools"] == tool_specs({"ready_keyword": True})
+    await connection.reader_task

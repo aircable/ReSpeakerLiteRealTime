@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -8,8 +9,10 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, BinaryIO
+from zoneinfo import ZoneInfo
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -19,15 +22,21 @@ from .db import Database
 from .planner import Planner
 from .protocol import FRAME_BYTES, DeviceState, server_message
 from .realtime import RealtimeConnection
+from .voice_commands import COMMANDS_BY_NAME
+from .web_search import WebSearchError, search_web
 
 logger = logging.getLogger(__name__)
 PLAYBACK_FRAME_SECONDS = 0.020
 PLAYBACK_COMPLETION_TOLERANCE_MS = round(PLAYBACK_FRAME_SECONDS * 1000)
-MAX_DEVICE_PLAYBACK_LEAD_MS = 200
+MAX_DEVICE_PLAYBACK_LEAD_MS = 200  # Legacy 10-frame device queue.
+MAX_EXTENDED_PLAYBACK_LEAD_MS = 320  # New 16-frame queue.
 MAX_QUEUED_INPUT_FRAMES = 250  # Five seconds of 20 ms startup/jitter buffering.
 PLAYBACK_FRAMES_PER_SECOND = round(1 / PLAYBACK_FRAME_SECONDS)
 BARGE_IN_WARMUP_MS = 1000  # Gate speaker onset using reported DAC playback, not generation time.
 BARGE_IN_LEVEL_WINDOW_FRAMES = 20  # 400 ms of 20 ms microphone frames.
+LISTENING_LEVEL_WINDOW_FRAMES = 8  # 160 ms; a click must not start a turn.
+LISTENING_LEVEL_MIN_ACTIVE_FRAMES = 6  # At least 120 ms above the configured RMS.
+LISTENING_LEVEL_RELEASE_FRAMES = 50  # Return to gated listening after 1 s quiet.
 SILENT_INPUT_FRAME = bytes(FRAME_BYTES)
 
 
@@ -42,6 +51,9 @@ class OutputStream:
     ended: bool = False
     end_queued: bool = False
     ended_monotonic: float = 0.0
+    source_bytes: int = 0
+    source_hash: Any = field(default_factory=hashlib.sha256, repr=False)
+    sent_hash: Any = field(default_factory=hashlib.sha256, repr=False)
 
 
 @dataclass(frozen=True)
@@ -60,9 +72,11 @@ class DeviceSession:
         planner: Planner,
         observer: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         capabilities: dict[str, Any] | None = None,
+        device_name: str | None = None,
     ):
         self.websocket = websocket
         self.device_id = device_id
+        self.device_name = device_name or device_id
         self.settings = settings
         self.db = db
         self.planner = planner
@@ -96,6 +110,10 @@ class DeviceSession:
         self.observer = observer
         self.diagnostic_input: BinaryIO | None = None
         self.diagnostic_output: BinaryIO | None = None
+        self.diagnostic_source_output: BinaryIO | None = None
+        self.end_session_pending = False
+        self.end_session_response_id: str | None = None
+        self.end_session_response_done = False
         self.input_frames_total = 0
         self.input_frames_interval = 0
         self.input_samples_interval = 0
@@ -109,14 +127,36 @@ class DeviceSession:
         self.barge_gate_stream_id: str | None = None
         self.barge_gate_frames: deque[tuple[bytes, int]] = deque()
         self.barge_gate_square_sum = 0
-        self.barge_gate_peak_rms = 0
+        self.barge_gate_max_full_rms = 0
+        self.barge_gate_max_partial_rms = 0
+        self.barge_gate_full_windows = 0
+        self.barge_gate_last_played_ms = 0
         self.barge_gate_open = False
+        self.listening_gate_frames: deque[tuple[bytes, int]] = deque()
+        self.listening_gate_active_frames = 0
+        self.listening_gate_open = False
+        self.listening_gate_quiet_frames = 0
+        self.listening_gate_max_frame_rms = 0
+        self.listening_gate_max_decision_rms = 0
+        self.listening_gate_max_active_frames = 0
+        self.listening_gate_full_windows = 0
         self.announcement_echo_guard = False
         self.device_volume: float | None = None
         self.ready_keyword_enabled = bool((capabilities or {}).get("ready_keyword"))
+        self.timer_alarm_enabled = bool((capabilities or {}).get("timer_alarm"))
+        self.timer_alarm_sent_id: int | None = None
+        queue_ms = (capabilities or {}).get("playback_queue_ms")
+        self.max_device_playback_lead_ms = (
+            min(queue_ms, MAX_EXTENDED_PLAYBACK_LEAD_MS)
+            if isinstance(queue_ms, int) and not isinstance(queue_ms, bool)
+            and queue_ms >= MAX_DEVICE_PLAYBACK_LEAD_MS
+            else MAX_DEVICE_PLAYBACK_LEAD_MS
+        )
+        self.xvf_agc_ch0_supported = bool((capabilities or {}).get("xvf_agc_ch0"))
         self.ready_wait_requested = False
         self.waiting_for_ready = False
         self.pending_ready_call_id: str | None = None
+        self.search_tasks: set[asyncio.Task[None]] = set()
 
     async def send_json(self, message_type: str, **payload: Any) -> None:
         message = server_message(message_type, **{"device_id": self.device_id, **payload})
@@ -138,6 +178,16 @@ class DeviceSession:
             "volume.changed",
             level=self.device_volume,
             level_percent=round(self.device_volume * 100),
+        )
+
+    async def request_xvf_gain(self, gain: float) -> None:
+        if not self.xvf_agc_ch0_supported:
+            return
+        await self.send_json("mic_gain.set", ch0_gain=gain)
+        logger.info(
+            "XMOS channel-0 AGC requested device=%s gain=%.1f (0=adaptive)",
+            self.device_id,
+            gain,
         )
 
     async def control_volume(
@@ -232,8 +282,12 @@ class DeviceSession:
         self.settings = self.settings.model_copy(update=self.db.setting_overrides())
         self.planner.settings = self.settings
         self.accepting_audio = True
+        self.end_session_pending = False
+        self.end_session_response_id = None
+        self.end_session_response_done = False
         self.warmup_vad_items.clear()
         self._reset_barge_in_level_gate()
+        self._reset_listening_level_gate()
         project = self.db.get_project(requested_project_id)
         self.project_id = project["id"]
         self.session_id = self.db.start_session(self.project_id, self.device_id, self.settings.realtime_model)
@@ -248,16 +302,19 @@ class DeviceSession:
             diagnostic_dir = self.settings.database_path.parent / "diagnostic-audio"
             input_path = diagnostic_dir / f"session-{self.session_id}-input.pcm"
             output_path = diagnostic_dir / f"session-{self.session_id}-output.pcm"
+            source_path = diagnostic_dir / f"session-{self.session_id}-output-source.pcm"
             try:
                 diagnostic_dir.mkdir(parents=True, exist_ok=True)
                 self.diagnostic_input = input_path.open("wb")
                 self.diagnostic_output = output_path.open("wb")
+                self.diagnostic_source_output = source_path.open("wb")
                 logger.info(
-                    "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s",
+                    "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s source=%s",
                     self.device_id,
                     self.session_id,
                     input_path,
                     output_path,
+                    source_path,
                 )
             except OSError:
                 logger.exception(
@@ -266,30 +323,33 @@ class DeviceSession:
                     self.session_id,
                     diagnostic_dir,
                 )
-                for recording in (self.diagnostic_input, self.diagnostic_output):
+                for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
                     if recording is not None:
                         recording.close()
-                self.diagnostic_input = self.diagnostic_output = None
+                self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
         context = build_instructions(
             project,
             self.db.recent_turns(self.project_id, 12),
             ready_keyword_enabled=self.ready_keyword_enabled,
+            timer_alarm_enabled=self.timer_alarm_enabled,
         )
         self.cloud = RealtimeConnection(
             self.settings,
             context,
             self.handle_openai_event,
             ready_keyword_enabled=self.ready_keyword_enabled,
+            timer_alarm_enabled=self.timer_alarm_enabled,
         )
         await self.set_state(DeviceState.CONNECTING)
         try:
+            await self.request_xvf_gain(self.settings.xvf_agc_ch0_gain)
             await self.cloud.connect()
         except Exception:
             self.db.end_session(self.session_id, "connect_error", {})
-            for recording in (self.diagnostic_input, self.diagnostic_output):
+            for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
                 if recording is not None:
                     recording.close()
-            self.diagnostic_input = self.diagnostic_output = None
+            self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
             self.cloud = None
             self.accepting_audio = False
             self.cloud_ready = False
@@ -325,9 +385,11 @@ class DeviceSession:
         if output is None:
             if self.barge_gate_stream_id is not None:
                 self._reset_barge_in_level_gate()
-        elif self.barge_gate_stream_id != output.stream_id:
-            self._reset_barge_in_level_gate()
-            self.barge_gate_stream_id = output.stream_id
+        else:
+            if self.barge_gate_stream_id != output.stream_id:
+                self._reset_barge_in_level_gate()
+                self.barge_gate_stream_id = output.stream_id
+            self._reset_listening_level_gate()
         self.input_frames_total += 1
         self.input_frames_interval += 1
         self.input_samples_interval += len(samples)
@@ -357,15 +419,13 @@ class DeviceSession:
                 and not self.barge_gate_open
                 and self.barge_gate_frames
             ):
-                logger.info(
-                    "Barge-in level guard device=%s stream=%s max_rolling_rms=%d threshold=%d played_ms=%d",
-                    self.device_id,
-                    output.stream_id,
-                    self.barge_gate_peak_rms,
-                    self.settings.barge_in_rms_threshold,
-                    output.played_ms,
-                )
-                self.barge_gate_peak_rms = 0
+                self._log_barge_in_level_guard("periodic")
+            if (
+                output is None
+                and self.settings.listening_rms_threshold > 0
+                and not self.listening_gate_open
+            ):
+                self._log_listening_level_guard("periodic")
         if self.diagnostic_input is not None:
             self.diagnostic_input.write(pcm)
         warmup_guarded = self._barge_in_warmup_active()
@@ -418,6 +478,16 @@ class DeviceSession:
             self.echo_suppressed_frames = 0
         if not self.accepting_audio:
             return
+        if (
+            output is None
+            and not fully_guarded
+            and self.settings.listening_rms_threshold > 0
+        ):
+            listening_frames = self._check_listening_level(pcm, frame_square_sum)
+            if listening_frames is None:
+                pcm = SILENT_INPUT_FRAME
+            else:
+                pre_roll = listening_frames
         if self.cloud_ready:
             self._start_input_sender()
         for input_frame in pre_roll if pre_roll is not None else (pcm,):
@@ -444,11 +514,39 @@ class DeviceSession:
         )
 
     def _reset_barge_in_level_gate(self) -> None:
+        if not self.barge_gate_open:
+            self._log_barge_in_level_guard("stream_end")
         self.barge_gate_stream_id = None
         self.barge_gate_frames.clear()
         self.barge_gate_square_sum = 0
-        self.barge_gate_peak_rms = 0
+        self.barge_gate_max_full_rms = 0
+        self.barge_gate_max_partial_rms = 0
+        self.barge_gate_full_windows = 0
+        self.barge_gate_last_played_ms = 0
         self.barge_gate_open = False
+
+    def _log_barge_in_level_guard(self, reason: str) -> None:
+        if not self.barge_gate_full_windows and not self.barge_gate_max_partial_rms:
+            return
+        threshold = self.settings.barge_in_rms_threshold
+        full_rms = (
+            str(self.barge_gate_max_full_rms) if self.barge_gate_full_windows else "n/a"
+        )
+        margin = (
+            f"{self.barge_gate_max_full_rms - threshold:+d}"
+            if self.barge_gate_full_windows else "n/a"
+        )
+        logger.info(
+            "Barge-in level guard device=%s stream=%s max_full_window_rms=%s "
+            "threshold=%d margin=%s full_windows=%d window_ms=%d "
+            "max_partial_rms=%d played_ms=%d reason=%s",
+            self.device_id, self.barge_gate_stream_id, full_rms, threshold, margin,
+            self.barge_gate_full_windows, BARGE_IN_LEVEL_WINDOW_FRAMES * 20,
+            self.barge_gate_max_partial_rms, self.barge_gate_last_played_ms, reason,
+        )
+        self.barge_gate_max_full_rms = 0
+        self.barge_gate_max_partial_rms = 0
+        self.barge_gate_full_windows = 0
 
     def _check_barge_in_level(self, pcm: bytes, frame_square_sum: int) -> list[bytes] | None:
         if len(self.barge_gate_frames) == BARGE_IN_LEVEL_WINDOW_FRAMES:
@@ -458,25 +556,122 @@ class DeviceSession:
         self.barge_gate_square_sum += frame_square_sum
         sample_count = len(self.barge_gate_frames) * (FRAME_BYTES // 2)
         rolling_rms = math.isqrt(self.barge_gate_square_sum // sample_count)
-        self.barge_gate_peak_rms = max(self.barge_gate_peak_rms, rolling_rms)
+        self.barge_gate_last_played_ms = self.output.played_ms if self.output is not None else 0
+        if len(self.barge_gate_frames) < BARGE_IN_LEVEL_WINDOW_FRAMES:
+            self.barge_gate_max_partial_rms = max(self.barge_gate_max_partial_rms, rolling_rms)
+            return None
+        self.barge_gate_full_windows += 1
+        self.barge_gate_max_full_rms = max(self.barge_gate_max_full_rms, rolling_rms)
         threshold = self.settings.barge_in_rms_threshold
-        if (
-            len(self.barge_gate_frames) < BARGE_IN_LEVEL_WINDOW_FRAMES
-            or self.barge_gate_square_sum < threshold * threshold * sample_count
-        ):
+        if self.barge_gate_square_sum < threshold * threshold * sample_count:
             return None
         pre_roll = [frame for frame, _ in self.barge_gate_frames]
         self.barge_gate_frames.clear()
         self.barge_gate_square_sum = 0
         self.barge_gate_open = True
         logger.info(
-            "Barge-in level qualified device=%s stream=%s rolling_rms=%d threshold=%d pre_roll_ms=%d played_ms=%d",
+            "Barge-in level qualified device=%s stream=%s rolling_rms=%d "
+            "threshold=%d margin=%+d window_ms=%d pre_roll_ms=%d played_ms=%d",
             self.device_id,
             self.barge_gate_stream_id,
             rolling_rms,
             threshold,
+            rolling_rms - threshold,
+            BARGE_IN_LEVEL_WINDOW_FRAMES * 20,
             len(pre_roll) * 20,
             self.output.played_ms if self.output is not None else 0,
+        )
+        self.barge_gate_max_full_rms = 0
+        self.barge_gate_max_partial_rms = 0
+        self.barge_gate_full_windows = 0
+        return pre_roll
+
+    def _reset_listening_level_gate(self) -> None:
+        if not self.listening_gate_open:
+            self._log_listening_level_guard("gate_reset")
+        self.listening_gate_frames.clear()
+        self.listening_gate_active_frames = 0
+        self.listening_gate_open = False
+        self.listening_gate_quiet_frames = 0
+        self.listening_gate_max_frame_rms = 0
+        self.listening_gate_max_decision_rms = 0
+        self.listening_gate_max_active_frames = 0
+        self.listening_gate_full_windows = 0
+
+    def _log_listening_level_guard(self, reason: str) -> None:
+        if not self.listening_gate_full_windows and not self.listening_gate_max_frame_rms:
+            return
+        threshold = self.settings.listening_rms_threshold
+        decision_rms = (
+            str(self.listening_gate_max_decision_rms)
+            if self.listening_gate_full_windows else "n/a"
+        )
+        margin = (
+            f"{self.listening_gate_max_decision_rms - threshold:+d}"
+            if self.listening_gate_full_windows else "n/a"
+        )
+        logger.info(
+            "Listening level guard device=%s max_decision_rms=%s threshold=%d "
+            "margin=%s max_active_frames=%d required_active_frames=%d "
+            "window_ms=%d max_frame_rms=%d full_windows=%d reason=%s",
+            self.device_id, decision_rms, threshold, margin,
+            self.listening_gate_max_active_frames, LISTENING_LEVEL_MIN_ACTIVE_FRAMES,
+            LISTENING_LEVEL_WINDOW_FRAMES * 20, self.listening_gate_max_frame_rms,
+            self.listening_gate_full_windows, reason,
+        )
+        self.listening_gate_max_frame_rms = 0
+        self.listening_gate_max_decision_rms = 0
+        self.listening_gate_max_active_frames = 0
+        self.listening_gate_full_windows = 0
+
+    def _check_listening_level(self, pcm: bytes, frame_square_sum: int) -> list[bytes] | None:
+        frame_rms = math.isqrt(frame_square_sum // (FRAME_BYTES // 2))
+        threshold = self.settings.listening_rms_threshold
+        if self.listening_gate_open:
+            self.listening_gate_quiet_frames = (
+                0 if frame_rms >= threshold else self.listening_gate_quiet_frames + 1
+            )
+            if self.listening_gate_quiet_frames >= LISTENING_LEVEL_RELEASE_FRAMES:
+                self._reset_listening_level_gate()
+                return None
+            return [pcm]
+        self.listening_gate_max_frame_rms = max(self.listening_gate_max_frame_rms, frame_rms)
+        if len(self.listening_gate_frames) == LISTENING_LEVEL_WINDOW_FRAMES:
+            _, old_rms = self.listening_gate_frames.popleft()
+            self.listening_gate_active_frames -= int(old_rms >= threshold)
+        self.listening_gate_frames.append((pcm, frame_rms))
+        self.listening_gate_active_frames += int(frame_rms >= threshold)
+        if len(self.listening_gate_frames) < LISTENING_LEVEL_WINDOW_FRAMES:
+            return None
+        # The sixth-highest frame level is the threshold-independent value
+        # which decides this six-of-eight gate; a lone click cannot inflate it.
+        decision_rms = sorted((level for _, level in self.listening_gate_frames), reverse=True)[
+            LISTENING_LEVEL_MIN_ACTIVE_FRAMES - 1
+        ]
+        self.listening_gate_full_windows += 1
+        self.listening_gate_max_decision_rms = max(self.listening_gate_max_decision_rms, decision_rms)
+        self.listening_gate_max_active_frames = max(
+            self.listening_gate_max_active_frames, self.listening_gate_active_frames
+        )
+        if self.listening_gate_active_frames < LISTENING_LEVEL_MIN_ACTIVE_FRAMES:
+            return None
+        pre_roll = [frame for frame, _ in self.listening_gate_frames]
+        active_frames = self.listening_gate_active_frames
+        self.listening_gate_frames.clear()
+        self.listening_gate_active_frames = 0
+        self.listening_gate_open = True
+        self.listening_gate_quiet_frames = 0
+        logger.info(
+            "Listening level qualified device=%s decision_rms=%d threshold=%d "
+            "margin=%+d active_frames=%d required_active_frames=%d window_ms=%d pre_roll_ms=%d",
+            self.device_id,
+            decision_rms,
+            threshold,
+            decision_rms - threshold,
+            active_frames,
+            LISTENING_LEVEL_MIN_ACTIVE_FRAMES,
+            LISTENING_LEVEL_WINDOW_FRAMES * 20,
+            len(pre_roll) * 20,
         )
         return pre_roll
 
@@ -541,7 +736,14 @@ class DeviceSession:
             with contextlib.suppress(Exception):
                 await cloud.truncate(output.item_id, output.content_index, output.played_ms)
         self.output = None
+        self.end_session_pending = False
+        self.end_session_response_id = None
+        self.end_session_response_done = False
         self._reset_barge_in_level_gate()
+        self._reset_listening_level_gate()
+        # The server has already recognized this barge-in; do not hide the
+        # remainder of the same utterance behind the idle listening gate.
+        self.listening_gate_open = True
         self.playback_progress_event.set()
         self.output_buffer.clear()
         self._clear_playback_queue()
@@ -586,6 +788,7 @@ class DeviceSession:
                 self.warmup_vad_items.discard(event["item_id"])
                 logger.info("Ignoring VAD stop from barge-in warmup device=%s", self.device_id)
                 return
+            self._reset_listening_level_gate()
             await self.set_state(DeviceState.THINKING)
             return
         if kind == "error":
@@ -607,14 +810,20 @@ class DeviceSession:
                 self.db.add_turn(
                     self.session_id, "user", transcript, event.get("item_id")
                 )
-                await self.send_json("transcript.committed", role="user", text=transcript)
+                await self.send_json(
+                    "transcript.committed", role="user", text=transcript,
+                    project_id=self.project_id,
+                )
             return
         if kind in {"response.output_audio.delta", "response.audio.delta"}:
             await self._audio_delta(event)
             return
         if kind in {"response.output_audio_transcript.delta", "response.audio_transcript.delta"}:
             self.assistant_text += event.get("delta", "")
-            await self.send_json("transcript.delta", role="assistant", text=event.get("delta", ""))
+            await self.send_json(
+                "transcript.delta", role="assistant", text=event.get("delta", ""),
+                project_id=self.project_id,
+            )
             return
         if kind in {"response.output_audio.done", "response.audio.done"}:
             await self._finish_audio_frame()
@@ -635,6 +844,14 @@ class DeviceSession:
                 )
             self.assistant_text = ""
             self.last_activity = time.monotonic()
+            if self.end_session_pending and (
+                self.end_session_response_id is None
+                or response.get("id") == self.end_session_response_id
+            ):
+                self.end_session_response_done = True
+                if self.output is None:
+                    await self.stop("spoken_stop")
+                    return
             if self.output is None:
                 if self.announcement_echo_guard:
                     self.announcement_echo_guard = False
@@ -651,61 +868,272 @@ class DeviceSession:
 
     async def _handle_tool_call(self, event: dict[str, Any]) -> None:
         name = event.get("name")
-        if name == "end_session":
-            await self.stop("spoken_stop")
-            return
+        command = COMMANDS_BY_NAME.get(name) if isinstance(name, str) else None
         cloud = self.cloud
         call_id = event.get("call_id")
-        if cloud is None or not call_id:
+        if command is None:
+            logger.warning("Ignoring unknown voice tool device=%s name=%s", self.device_id, name)
+            if cloud is not None and call_id:
+                await cloud.submit_tool_output(call_id, {"ok": False, "error": "Unknown command."})
+                await cloud.request_response()
             return
-        if name == "wait_for_ready":
-            if not self.ready_keyword_enabled:
+        if command.call_id_required and (cloud is None or not call_id):
+            return
+        if not command.available({
+            "ready_keyword": self.ready_keyword_enabled,
+            "timer_alarm": self.timer_alarm_enabled,
+        }):
+            if cloud is not None and call_id:
                 await cloud.submit_tool_output(
-                    call_id, {"ready": False, "error": "The device has no ready-word model."}
+                    call_id,
+                    command.unavailable_result
+                    or {"ok": False, "error": "This device does not support that command."},
                 )
                 await cloud.request_response()
-                return
-            self.pending_ready_call_id = call_id
-            self.ready_wait_requested = True
-            logger.info(
-                "Ready-word wait requested device=%s session=%s",
-                self.device_id,
-                self.session_id,
-            )
-            await self._enter_ready_wait_if_possible()
-            return
-        if name == "list_projects":
-            projects = self.db.list_projects()
-            await cloud.submit_tool_output(
-                call_id,
-                {
-                    "active_project": next(
-                        (project["name"] for project in projects if project["active"]), None
-                    ),
-                    "projects": [project["name"] for project in projects],
-                },
-            )
-            await cloud.request_response()
-            return
-        if name == "control_volume":
-            try:
-                arguments = json.loads(event.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-            result = await self.control_volume(
-                str(arguments.get("action") or ""),
-                arguments.get("level_percent"),
-                arguments.get("change_percent"),
-            )
-            await cloud.submit_tool_output(call_id, result)
-            await cloud.request_response()
-            return
-        if name != "switch_project":
             return
         try:
             arguments = json.loads(event.get("arguments") or "{}")
-        except json.JSONDecodeError:
+        except (TypeError, json.JSONDecodeError):
             arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        logger.info("Voice command requested device=%s command=%s", self.device_id, command.name)
+        if command.name == "end_session":
+            self.end_session_response_id = event.get("response_id")
+        await getattr(self, command.handler)(cloud, call_id, arguments)
+
+    async def _voice_end_session(
+        self, _cloud: RealtimeConnection | None, _call_id: str | None, _arguments: dict[str, Any]
+    ) -> None:
+        # A Realtime response can contain spoken audio followed by a function
+        # call. The function arguments arrive before the device has played the
+        # queued audio, so stopping here clips the final spoken sentence.
+        self.end_session_pending = True
+        self.end_session_response_done = False
+        logger.info(
+            "Voice end requested device=%s response=%s; waiting for final playback",
+            self.device_id,
+            self.end_session_response_id,
+        )
+
+    async def _voice_wait_for_ready(
+        self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
+    ) -> None:
+        self.pending_ready_call_id = call_id
+        self.ready_wait_requested = True
+        logger.info(
+            "Ready-word wait requested device=%s session=%s",
+            self.device_id,
+            self.session_id,
+        )
+        await self._enter_ready_wait_if_possible()
+
+    async def _voice_list_projects(
+        self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
+    ) -> None:
+        projects = self.db.list_projects()
+        await cloud.submit_tool_output(
+            call_id,
+            {
+                "active_project": next(
+                    (project["name"] for project in projects if project["active"]), None
+                ),
+                "projects": [project["name"] for project in projects],
+            },
+        )
+        await cloud.request_response()
+
+    async def _voice_control_volume(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        result = await self.control_volume(
+            str(arguments.get("action") or ""),
+            arguments.get("level_percent"),
+            arguments.get("change_percent"),
+        )
+        await cloud.submit_tool_output(call_id, result)
+        await cloud.request_response()
+
+    async def _voice_get_local_time(
+        self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
+    ) -> None:
+        local = datetime.now(ZoneInfo(self.settings.time_zone))
+        await cloud.submit_tool_output(call_id, {
+            "ok": True,
+            "local_datetime": local.isoformat(timespec="seconds"),
+            "time_zone": self.settings.time_zone,
+            "weekday": local.strftime("%A"),
+        })
+        await cloud.request_response()
+
+    async def _voice_set_timer(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        seconds = arguments.get("duration_seconds")
+        label = arguments.get("label", "")
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or not 1 <= seconds <= 86400:
+            result = {"ok": False, "error": "Give a duration from 1 second to 24 hours."}
+        elif not isinstance(label, str):
+            result = {"ok": False, "error": "Timer label must be text."}
+        elif len(self.db.list_timers(self.device_id)) >= 16:
+            result = {"ok": False, "error": "This device already has 16 active timers."}
+        else:
+            timer = self.db.create_timer(self.device_id, seconds, label.strip())
+            result = {"ok": True, "timer_id": timer["id"], "label": timer["label"],
+                      "duration_seconds": seconds, "due_at": timer["due_at"]}
+            logger.info("Timer set device=%s id=%s seconds=%d label=%r", self.device_id,
+                        timer["id"], seconds, timer["label"])
+        await cloud.submit_tool_output(call_id, result)
+        await cloud.request_response()
+
+    async def _voice_list_timers(
+        self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
+    ) -> None:
+        local_now = datetime.now(ZoneInfo(self.settings.time_zone))
+        timers = [{
+            "timer_id": row["id"], "label": row["label"], "status": row["status"],
+            "seconds_remaining": max(0, int((datetime.fromisoformat(row["due_at"]) - local_now).total_seconds())),
+            "due_at_local": datetime.fromisoformat(row["due_at"]).astimezone(
+                ZoneInfo(self.settings.time_zone)).isoformat(timespec="seconds"),
+        } for row in self.db.list_timers(self.device_id)]
+        await cloud.submit_tool_output(call_id, {"ok": True, "timers": timers})
+        await cloud.request_response()
+
+    async def _voice_cancel_timer(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        candidates = self.db.list_timers(self.device_id)
+        timer_id = arguments.get("timer_id")
+        label = arguments.get("label")
+        if isinstance(timer_id, int) and not isinstance(timer_id, bool):
+            candidates = [row for row in candidates if row["id"] == timer_id]
+        elif isinstance(label, str) and label.strip():
+            query = label.strip().casefold()
+            candidates = [row for row in candidates if query in row["label"].casefold()]
+        if len(candidates) != 1:
+            result = {"ok": False, "error": "No unique timer matched; specify its label or ID.",
+                      "timers": [{"timer_id": row["id"], "label": row["label"]} for row in candidates]}
+        else:
+            row = self.db.close_timer(self.device_id, candidates[0]["id"])
+            result = {"ok": row is not None, "timer_id": candidates[0]["id"],
+                      "label": candidates[0]["label"]}
+            if row and self.timer_alarm_sent_id == row["id"]:
+                self.timer_alarm_sent_id = None
+                await self.send_json("timer.stop", timer_id=row["id"])
+        await cloud.submit_tool_output(call_id, result)
+        await cloud.request_response()
+
+    async def notify_pending_timer(self) -> None:
+        """Deliver the oldest persisted alarm, also after reconnect."""
+        if not self.timer_alarm_enabled or self.stopping:
+            return
+        timer = self.db.next_ringing_timer(self.device_id)
+        if timer is None or timer["id"] == self.timer_alarm_sent_id:
+            return
+        if self.cloud is not None:
+            await self.stop("timer_alarm")
+        await self.send_json("timer.alarm", timer_id=timer["id"], label=timer["label"])
+        self.timer_alarm_sent_id = timer["id"]
+        logger.info("Timer alarm sent device=%s id=%s label=%r", self.device_id,
+                    timer["id"], timer["label"])
+
+    async def timer_dismissed(self, timer_id: int) -> None:
+        row = self.db.close_timer(self.device_id, timer_id, dismissed=True)
+        if row is None:
+            return
+        if self.timer_alarm_sent_id == timer_id:
+            self.timer_alarm_sent_id = None
+            await self.send_json("timer.stop", timer_id=timer_id)
+        logger.info("Timer dismissed device=%s id=%d", self.device_id, timer_id)
+        await self.notify_pending_timer()
+
+    async def _voice_set_barge_in(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        enabled = arguments.get("enabled")
+        if not isinstance(enabled, bool):
+            result = {"ok": False, "error": "Specify whether barge-in should be on or off."}
+        else:
+            try:
+                if self.settings.barge_in_enabled != enabled:
+                    await cloud.set_barge_in(enabled)
+                self.settings.barge_in_enabled = enabled
+                self._reset_barge_in_level_gate()
+                self.db.update_settings({"barge_in_enabled": enabled})
+                await self.publish_json("settings.changed", barge_in_enabled=enabled)
+                logger.info("Voice barge-in changed device=%s enabled=%s", self.device_id, enabled)
+                result = {"ok": True, "barge_in_enabled": enabled}
+            except Exception:
+                logger.exception("Voice barge-in update failed device=%s", self.device_id)
+                result = {"ok": False, "error": "Could not change barge-in right now."}
+        await cloud.submit_tool_output(call_id, result)
+        await cloud.request_response()
+
+    async def _voice_search_web(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        query = arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            await cloud.submit_tool_output(call_id, {"ok": False, "error": "A search query is required."})
+            await cloud.request_response()
+            return
+        if self.search_tasks:
+            await cloud.submit_tool_output(call_id, {"ok": False, "error": "A web search is already running."})
+            await cloud.request_response()
+            return
+        task = asyncio.create_task(
+            self._run_web_search(cloud, call_id, query.strip()[:500], self.session_id, self.project_id),
+            name=f"web-search-{self.device_id}",
+        )
+        self.search_tasks.add(task)
+        task.add_done_callback(self.search_tasks.discard)
+
+    async def _run_web_search(
+        self, cloud: RealtimeConnection, call_id: str, query: str,
+        session_id: int | None, project_id: int | None,
+    ) -> None:
+        logger.info("Web search started device=%s session=%s", self.device_id, session_id)
+        try:
+            result = await search_web(self.settings, query)
+            output = {"ok": True, "answer": result["answer"], "sources": [
+                {"title": citation["title"], "url": citation["url"]}
+                for citation in result["citations"]
+            ]}
+        except asyncio.CancelledError:
+            raise
+        except WebSearchError as exc:
+            result = None
+            output = {"ok": False, "error": str(exc)}
+        except Exception:
+            logger.exception("Web search failed device=%s session=%s", self.device_id, session_id)
+            result = None
+            output = {"ok": False, "error": "Web search failed. Please try again."}
+        if self.cloud is not cloud or self.session_id != session_id or self.stopping:
+            return
+        if result is not None:
+            await self.publish_json(
+                "search.result", project_id=project_id, query=query,
+                answer=result["answer"], citations=result["citations"],
+            )
+        try:
+            await cloud.submit_tool_output(call_id, output)
+            await cloud.request_response()
+        except Exception:
+            logger.exception("Web search result delivery failed device=%s session=%s", self.device_id, session_id)
+            return
+        logger.info("Web search finished device=%s session=%s ok=%s", self.device_id, session_id, output["ok"])
+
+    async def _cancel_search_tasks(self) -> None:
+        tasks = tuple(self.search_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.search_tasks.clear()
+
+    async def _voice_switch_project(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
         requested_name = str(arguments.get("project_name") or "").strip()
         project = self.db.find_project(requested_name)
         if project is None:
@@ -799,16 +1227,19 @@ class DeviceSession:
         diagnostic_dir = self.settings.database_path.parent / "diagnostic-audio"
         input_path = diagnostic_dir / f"session-{self.session_id}-input.pcm"
         output_path = diagnostic_dir / f"session-{self.session_id}-output.pcm"
+        source_path = diagnostic_dir / f"session-{self.session_id}-output-source.pcm"
         try:
             diagnostic_dir.mkdir(parents=True, exist_ok=True)
             self.diagnostic_input = input_path.open("wb")
             self.diagnostic_output = output_path.open("wb")
+            self.diagnostic_source_output = source_path.open("wb")
             logger.info(
-                "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s",
+                "Diagnostic audio recording enabled device=%s session=%s input=%s output=%s source=%s",
                 self.device_id,
                 self.session_id,
                 input_path,
                 output_path,
+                source_path,
             )
         except OSError:
             logger.exception(
@@ -817,7 +1248,10 @@ class DeviceSession:
                 self.session_id,
                 diagnostic_dir,
             )
-            self.diagnostic_input = self.diagnostic_output = None
+            for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
+                if recording is not None:
+                    recording.close()
+            self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
 
     async def _switch_project(self, project: dict[str, Any]) -> None:
         """Open a clean cloud and transcript context without dropping the device socket."""
@@ -830,6 +1264,10 @@ class DeviceSession:
             project["id"],
         )
         self.accepting_audio = False
+        self.end_session_pending = False
+        self.end_session_response_id = None
+        self.end_session_response_done = False
+        await self._cancel_search_tasks()
         self.cloud_ready = False
         self.ready_wait_requested = False
         self.waiting_for_ready = False
@@ -857,10 +1295,10 @@ class DeviceSession:
             self.db.end_session(old_session_id, "project_switch", self.usage)
         if old_session_id is not None and old_project_id is not None:
             asyncio.create_task(self.planner.update_after_session(old_project_id, old_session_id))
-        for recording in (self.diagnostic_input, self.diagnostic_output):
+        for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
             if recording is not None:
                 recording.close()
-        self.diagnostic_input = self.diagnostic_output = None
+        self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
         self.db.activate_project(project["id"])
         self.project_id = project["id"]
         self.session_id = self.db.start_session(
@@ -874,17 +1312,23 @@ class DeviceSession:
             project,
             self.db.recent_turns(self.project_id, 12),
             ready_keyword_enabled=self.ready_keyword_enabled,
+            timer_alarm_enabled=self.timer_alarm_enabled,
         )
         self.cloud = RealtimeConnection(
             self.settings,
             context,
             self.handle_openai_event,
             ready_keyword_enabled=self.ready_keyword_enabled,
+            timer_alarm_enabled=self.timer_alarm_enabled,
         )
         try:
             await self.cloud.connect()
         except Exception:
             self.db.end_session(self.session_id, "connect_error", {})
+            for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
+                if recording is not None:
+                    recording.close()
+            self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
             self.cloud = None
             await self.set_state(DeviceState.ERROR)
             raise
@@ -917,6 +1361,18 @@ class DeviceSession:
         item_id = event.get("item_id", "unknown-item")
         content_index = int(event.get("content_index", 0))
         if self.output is None or self.output.response_id != response_id or self.output.item_id != item_id:
+            if self.output is not None:
+                logger.warning(
+                    "Assistant audio stream superseded before playback completed device=%s old_stream=%s "
+                    "old_response=%s source_bytes=%d sent_ms=%d played_ms=%d queued_frames=%d",
+                    self.device_id,
+                    self.output.stream_id,
+                    self.output.response_id,
+                    self.output.source_bytes,
+                    self.output.sent_ms,
+                    self.output.played_ms,
+                    self.playback_queue.qsize(),
+                )
             stream_id = uuid.uuid4().hex
             self.output = OutputStream(stream_id, response_id, item_id, content_index)
             self.output_buffer.clear()
@@ -929,7 +1385,12 @@ class DeviceSession:
                 format="pcm_s16le",
             )
             await self.set_state(DeviceState.SPEAKING)
-        self.output_buffer.extend(base64.b64decode(event["delta"]))
+        audio = base64.b64decode(event["delta"])
+        self.output.source_bytes += len(audio)
+        self.output.source_hash.update(audio)
+        if self.diagnostic_source_output is not None:
+            self.diagnostic_source_output.write(audio)
+        self.output_buffer.extend(audio)
         while len(self.output_buffer) >= FRAME_BYTES and self.output is not None:
             frame = bytes(self.output_buffer[:FRAME_BYTES])
             del self.output_buffer[:FRAME_BYTES]
@@ -939,7 +1400,11 @@ class DeviceSession:
         if self.output is None or self.output.end_queued:
             return
         if self.output_buffer:
-            self.output_buffer.extend(b"\x00" * (FRAME_BYTES - len(self.output_buffer)))
+            padding = b"\x00" * (FRAME_BYTES - len(self.output_buffer))
+            self.output_buffer.extend(padding)
+            self.output.source_hash.update(padding)
+            if self.diagnostic_source_output is not None:
+                self.diagnostic_source_output.write(padding)
             self._queue_playback(
                 PlaybackPacket(self.output.stream_id, bytes(self.output_buffer))
             )
@@ -1011,6 +1476,7 @@ class DeviceSession:
             if output is None or output.stream_id != packet.stream_id:
                 continue
             await self.send_bytes(packet.data)
+            output.sent_hash.update(packet.data)
             if self.diagnostic_output is not None:
                 self.diagnostic_output.write(packet.data)
             output.sent_ms += 20
@@ -1022,7 +1488,7 @@ class DeviceSession:
             output = self.output
             if output is None or output.stream_id != stream_id:
                 return
-            if output.sent_ms - output.played_ms < MAX_DEVICE_PLAYBACK_LEAD_MS:
+            if output.sent_ms - output.played_ms < self.max_device_playback_lead_ms:
                 return
             self.playback_progress_event.clear()
             await self.playback_progress_event.wait()
@@ -1031,6 +1497,9 @@ class DeviceSession:
         if self.stopping or self.cloud is None:
             return
         self.stopping = True
+        self.end_session_pending = False
+        self.end_session_response_id = None
+        self.end_session_response_done = False
         session_id, project_id = self.session_id, self.project_id
         logger.info(
             "Ending session device=%s session=%s reason=%s state=%s",
@@ -1040,6 +1509,7 @@ class DeviceSession:
             self.state.value,
         )
         try:
+            await self._cancel_search_tasks()
             self.accepting_audio = False
             self.cloud_ready = False
             self.ready_wait_requested = False
@@ -1047,6 +1517,7 @@ class DeviceSession:
             self.pending_ready_call_id = None
             self.warmup_vad_items.clear()
             self._reset_barge_in_level_gate()
+            self._reset_listening_level_gate()
             if self.ready_keyword_enabled:
                 notify_device = await self.send_optional(
                     "keyword.mode", notify_device, mode="wake"
@@ -1068,10 +1539,10 @@ class DeviceSession:
             self.output = None
             self.playback_progress_event.set()
             self.output_buffer.clear()
-            for recording in (self.diagnostic_input, self.diagnostic_output):
+            for recording in (self.diagnostic_input, self.diagnostic_output, self.diagnostic_source_output):
                 if recording is not None:
                     recording.close()
-            self.diagnostic_input = self.diagnostic_output = None
+            self.diagnostic_input = self.diagnostic_output = self.diagnostic_source_output = None
             self.state = DeviceState.IDLE
             notify_device = await self.send_optional(
                 "state", notify_device, state=DeviceState.IDLE.value
@@ -1119,16 +1590,34 @@ class DeviceSession:
         output = self.output
         if output is None:
             return
+        source_frames = (output.source_bytes + FRAME_BYTES - 1) // FRAME_BYTES
+        sent_bytes = output.sent_ms * (FRAME_BYTES // 20)
+        audio_match = (
+            output.end_queued
+            and source_frames * FRAME_BYTES == sent_bytes
+            and output.source_hash.digest() == output.sent_hash.digest()
+        )
         logger.info(
-            "Assistant playback complete device=%s stream=%s reason=%s sent_ms=%d played_ms=%d",
+            "Assistant playback complete device=%s stream=%s reason=%s source_bytes=%d sent_ms=%d played_ms=%d audio_match=%s",
             self.device_id,
             output.stream_id,
             reason,
+            output.source_bytes,
             output.sent_ms,
             output.played_ms,
+            audio_match,
         )
+        if output.end_queued and not audio_match:
+            logger.warning(
+                "Assistant audio differs from Realtime source device=%s stream=%s source_bytes=%d sent_bytes=%d",
+                self.device_id,
+                output.stream_id,
+                output.source_bytes,
+                sent_bytes,
+            )
         self.output = None
         self._reset_barge_in_level_gate()
+        self._reset_listening_level_gate()
         self.playback_progress_event.set()
         if self.announcement_echo_guard:
             self.announcement_echo_guard = False
@@ -1136,6 +1625,9 @@ class DeviceSession:
         elif not self.settings.barge_in_enabled:
             self.echo_gate_until = time.monotonic() + 0.3
         self.last_activity = time.monotonic()
+        if self.end_session_pending and self.end_session_response_done:
+            await self.stop("spoken_stop")
+            return
         await self.set_state(DeviceState.LISTENING)
         await self._enter_ready_wait_if_possible()
 

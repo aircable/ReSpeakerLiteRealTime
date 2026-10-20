@@ -1,0 +1,235 @@
+# Staged live-voice experiment for the stock XMOS XVF3610-INT 5.7.3 image.
+# Do not use with the Seeed XMOS 1.1.0 image: its I2S directions are reversed.
+# This deliberately leaves physical microphone mute manual. The stock XVF
+# control service does not expose Seeed's mute-state polling endpoint, so a
+# blind GPIO4 pulse at boot could override a user's intentional mute.
+# Wake word, ready-word wait, USER-button session stop, gateway transport,
+# AEC reference, and the board status LED are included.
+packages:
+  status_led: !include status-led.yaml
+
+substitutions:
+  name: thinking-companion
+  friendly_name: Thinking Companion XVF3610 Test
+  wake_start_condition: "true"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.6.0
+  project:
+    name: aircable.respeaker-thinking-companion-xvf3610
+    version: 0.1.12
+  on_boot:
+    - priority: -100
+      then:
+        - light.turn_on:
+            id: status_led
+            brightness: 100%
+            effect: Companion Status
+        - lambda: ESP_LOGI("status_led", "WS2812 GPIO1 state effect activated");
+        - if:
+            condition:
+              lambda: return ${wake_start_condition};
+            then:
+              - micro_wake_word.start
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 8MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+  logs:
+    realtime_companion: INFO
+    xvf3610_audio: INFO
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [realtime_companion, xvf3610_audio, xmos_dfu]
+  - source:
+      type: git
+      url: https://github.com/formatBCE/esphome
+      ref: f8f41eeac4381c1c5ef8feaa8de4cedc25d0898f
+    components: [i2s_audio, aic3204]
+    refresh: 30d
+
+i2c:
+  id: internal_i2c
+  sda: GPIO5
+  scl: GPIO6
+  frequency: 100kHz
+
+audio_dac:
+  - platform: aic3204
+    id: codec
+    i2c_id: internal_i2c
+
+i2s_audio:
+  - id: xmos_rx_master
+    i2s_lrclk_pin: {number: GPIO7, allow_other_uses: true}
+    i2s_bclk_pin: {number: GPIO8, allow_other_uses: true}
+    i2s_mclk_pin: GPIO9
+  - id: codec_tx_slave
+    i2s_lrclk_pin: {number: GPIO7, allow_other_uses: true}
+    i2s_bclk_pin: {number: GPIO8, allow_other_uses: true}
+
+microphone:
+  - platform: i2s_audio
+    id: xmos_microphones
+    i2s_audio_id: xmos_rx_master
+    i2s_din_pin: GPIO43
+    adc_type: external
+    pdm: false
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    mclk_multiple: 256
+    i2s_mode: primary
+    channel: stereo
+
+speaker:
+  - platform: i2s_audio
+    id: codec_speaker
+    i2s_audio_id: codec_tx_slave
+    i2s_dout_pin: GPIO44
+    dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    i2s_mode: secondary
+    channel: stereo
+    timeout: never
+    buffer_duration: 100ms
+    audio_dac: codec
+  - platform: resampler
+    id: realtime_resampler
+    output_speaker: codec_speaker
+    sample_rate: 48000
+    bits_per_sample: 16
+    buffer_duration: 100ms
+    filters: 16
+    taps: 32
+
+xvf3610_audio:
+  id: xvf_audio
+  i2c_id: internal_i2c
+  address: 0x2C
+  audio_dac: codec
+  microphone: xmos_microphones
+  aec_diagnostics: true
+
+realtime_companion:
+  id: realtime
+  mic_gain_controller: xvf_audio
+  microphone: xmos_microphones
+  speaker: realtime_resampler
+  url: !secret gateway_ws_url
+  token: !secret device_token
+  device_id: ${name}
+  device_name: ${friendly_name}
+  # Independent saved setting: the Seeed 1.1.0 board calibration must not
+  # silently override this XVF3610 test's initial playback level.
+  output_volume: 0.25
+  volume_preference_key: realtime_companion_output_volume_xvf3610
+  ready_keyword: true
+  playback_prebuffer_frames: 8  # 160 ms; Seeed firmware keeps the 120 ms default.
+
+binary_sensor:
+  - platform: gpio
+    id: user_button
+    internal: true
+    pin: {number: GPIO3, inverted: true}
+    filters: [delayed_on: 50ms, delayed_off: 50ms]
+    on_click:
+      - min_length: 50ms
+        max_length: 1s
+        then:
+          - lambda: id(realtime).toggle_session();
+
+micro_wake_word:
+  id: wake_word
+  microphone:
+    microphone: xmos_microphones
+    channels: 1
+    gain_factor: 4
+  stop_after_detection: false
+  models:
+    - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu_model
+      internal: true
+    - model: models/ready.json
+      id: ready_model
+      internal: true
+  vad:
+    probability_cutoff: 0.05
+  on_wake_word_detected:
+    - lambda: |-
+        if (wake_word == "ready")
+          id(realtime).ready_detected();
+        else
+          id(realtime).wake_word_detected();
+
+# Keep only one keyword classifier enabled. The gateway's keyword.mode event
+# switches to the local ready model while microphone transport is paused.
+interval:
+  - interval: 100ms
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: return id(realtime).is_waiting_for_ready();
+              - micro_wake_word.model_is_enabled: okay_nabu_model
+          then:
+            - micro_wake_word.disable_model: okay_nabu_model
+      - if:
+          condition:
+            and:
+              - lambda: return id(realtime).is_waiting_for_ready();
+              - not:
+                  micro_wake_word.model_is_enabled: ready_model
+          then:
+            - micro_wake_word.enable_model: ready_model
+            - lambda: ESP_LOGI("ready_model", "Activated ready keyword model");
+      - if:
+          condition:
+            and:
+              - lambda: return !id(realtime).is_waiting_for_ready();
+              - micro_wake_word.model_is_enabled: ready_model
+          then:
+            - micro_wake_word.disable_model: ready_model
+      - if:
+          condition:
+            and:
+              - lambda: return !id(realtime).is_waiting_for_ready();
+              - not:
+                  micro_wake_word.model_is_enabled: okay_nabu_model
+          then:
+            - micro_wake_word.enable_model: okay_nabu_model
+            - lambda: ESP_LOGI("ready_model", "Activated Okay Nabu wake model");

@@ -44,3 +44,39 @@ def test_find_project_accepts_case_insensitive_unique_spoken_match(tmp_path):
     assert db.find_project("  GARDEN irrigation  ")["id"] == second["id"]
     assert db.find_project("Irrigation")["id"] == second["id"]
     assert db.find_project("missing") is None
+
+
+def test_project_turns_can_be_filtered_to_one_device(tmp_path):
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    project_id = db.get_project()["id"]
+    first = db.start_session(project_id, "kitchen", "test-model")
+    second = db.start_session(project_id, "office", "test-model")
+    db.add_turn(first, "user", "Kitchen question")
+    db.add_turn(second, "user", "Office question")
+
+    assert [turn["text"] for turn in db.project_turns(project_id)] == [
+        "Kitchen question", "Office question"
+    ]
+    assert [turn["text"] for turn in db.project_turns(project_id, device_id="office")] == [
+        "Office question"
+    ]
+
+
+def test_timers_persist_and_ring_only_on_the_owning_device(tmp_path):
+    path = tmp_path / "timers.db"
+    db = Database(path)
+    db.initialize()
+    kitchen = db.create_timer("kitchen", 60, "pasta")
+    office = db.create_timer("office", 60, "meeting")
+    assert [row["id"] for row in Database(path).list_timers("kitchen")] == [kitchen["id"]]
+    with db.connect() as conn:
+        conn.execute("UPDATE timers SET due_at='2000-01-01T00:00:00+00:00'")
+
+    assert set(db.fire_due_timers()) == {"kitchen", "office"}
+    assert db.fire_due_timers() == []
+    assert db.next_ringing_timer("kitchen")["id"] == kitchen["id"]
+    assert db.next_ringing_timer("office")["id"] == office["id"]
+    assert db.close_timer("office", kitchen["id"], dismissed=True) is None
+    assert db.close_timer("kitchen", kitchen["id"], dismissed=True)["status"] == "dismissed"
+    assert db.next_ringing_timer("kitchen") is None

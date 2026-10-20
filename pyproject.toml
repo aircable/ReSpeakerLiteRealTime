@@ -1,12 +1,13 @@
 [project]
 name = "respeaker-thinking-companion"
-version = "0.4.4"
+version = "0.4.13"
 description = "Local OpenAI Realtime gateway for a ReSpeaker Lite thinking companion"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.116,<0.117",
   "httpx>=0.28,<1",
   "pydantic-settings>=2.10,<3",
+  "tzdata>=2026.2,<2027",
   "python-multipart>=0.0.20,<1",
   "uvicorn[standard]>=0.35,<1",
   "websockets>=15,<16",

@@ -7,6 +7,7 @@ from gateway.protocol import (
     PlaybackProgress,
     ReadyDetected,
     VolumeChanged,
+    TimerDismissed,
     parse_device_message,
 )
 
@@ -21,6 +22,21 @@ def test_parse_versioned_authentication():
     )
     assert isinstance(message, Authenticate)
     assert message.device_id == "desk"
+    assert message.name is None
+
+
+def test_authentication_can_report_friendly_name():
+    message = parse_device_message(
+        {
+            "v": 1,
+            "type": "auth",
+            "token": "secret",
+            "device_id": "kitchen",
+            "name": "Kitchen Companion",
+        }
+    )
+    assert isinstance(message, Authenticate)
+    assert message.name == "Kitchen Companion"
 
 
 def test_rejects_wrong_protocol_version():
@@ -42,3 +58,10 @@ def test_parse_runtime_volume_report():
 def test_parse_ready_word_detection():
     message = parse_device_message({"v": 1, "type": "ready.detected"})
     assert isinstance(message, ReadyDetected)
+
+
+def test_parse_timer_dismissal():
+    message = parse_device_message({"v": 1, "type": "timer.dismissed", "timer_id": 7})
+    assert isinstance(message, TimerDismissed)
+    with pytest.raises(ValidationError):
+        parse_device_message({"v": 1, "type": "timer.dismissed", "timer_id": 0})
