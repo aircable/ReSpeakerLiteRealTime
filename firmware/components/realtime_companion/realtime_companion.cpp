@@ -641,6 +641,7 @@ void RealtimeCompanion::process_timer_alarm() {
       this->dismiss_timer_alarm();
     } else if (!this->wake_ack_pending_.load(std::memory_order_acquire) &&
                !this->session_active_.load(std::memory_order_acquire) &&
+               this->output_volume_ > 0.0f &&
                this->speaker_->is_stopped() &&
                static_cast<int32_t>(millis() - this->timer_alarm_repeat_after_ms_) >= 0) {
       this->wake_ack_played_frames_.store(0, std::memory_order_relaxed);

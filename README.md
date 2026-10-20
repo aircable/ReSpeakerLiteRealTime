@@ -89,6 +89,7 @@ the web UI to an IANA zone such as `America/Los_Angeles`; the default is UTC. Ti
 stored in UTC and survive a gateway restart. The alarm is a local repeating chime with an amber
 status LED; USER or the wake word dismisses it. A disconnected ReSpeaker rings after reconnecting,
 not while it is offline. Output volume at zero also silences the alarm.
+The chime stops automatically after 60 seconds if not dismissed.
 To add a new command, add a registry entry and a corresponding `_voice_*` handler on
 `DeviceSession`, then test its capability gate and result. A project instruction cannot add a
 function that is absent from the gateway's registry. Web search is not registered yet.

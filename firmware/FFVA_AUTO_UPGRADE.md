@@ -70,6 +70,7 @@ connected. If the physical mute LED is red, press mute to unmute the microphones
 Timers are persisted by the gateway in SQLite. If the device is disconnected when a timer is
 due, it rings after reconnecting, not at the original deadline while offline. A gateway restart
 does not discard the timer. Timer chime uses the device's output volume; 0% is silent.
+If it is not dismissed, the local chime stops after 60 seconds.
 
 ## Recovery and scope
 
