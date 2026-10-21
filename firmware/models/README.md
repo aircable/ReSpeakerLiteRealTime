@@ -7,7 +7,7 @@ Place the trained microWakeWord export here as:
 
 The manifest must use `"wake_word": "ready"`. For the Seeed XMOS image, compile
 `respeaker-thinking-companion-ready.yaml` instead of the base firmware file.
-The XVF3610 live build also includes this model and its ready-word switching.
+The FFVA live build also includes this model and its ready-word switching.
 
 The ready variant advertises the capability to the gateway. The gateway exposes its
 `wait_for_ready` tool only to capable devices, pauses microphone transport after a procedural

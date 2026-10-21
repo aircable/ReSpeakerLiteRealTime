@@ -9,12 +9,9 @@
 
 namespace esphome::xmos_dfu {
 
-enum class Protocol : uint8_t { NONE, SEEED, XVF };
 enum class Phase : uint8_t {
   IDLE,
   DISCOVER,
-  XVF_DETACH,
-  XVF_BUS_RESET,
   SEND_BLOCK,
   POLL_BLOCK,
   SEND_FINAL,
@@ -53,10 +50,8 @@ class XmosDfu : public Component, public i2c::I2CDevice {
   bool write_at_(uint8_t address, const uint8_t *data, size_t size);
   bool read_seeed_version_(uint8_t *version);
   bool version_matches_(const uint8_t *actual, const uint8_t *expected);
-  Protocol discover_(bool log_result);
-  void disable_legacy_polling_if_incompatible_();
+  bool discover_(bool log_result);
   bool seeed_ready_();
-  bool xvf_status_(uint32_t &state, uint32_t &status, uint32_t &timeout_ms);
   bool send_block_();
   bool send_final_();
   void fail_(const char *message);
@@ -67,11 +62,8 @@ class XmosDfu : public Component, public i2c::I2CDevice {
   bool auto_update_{false};
   uint8_t source_version_[3]{};
   uint8_t target_version_[3]{};
-  Protocol protocol_{Protocol::NONE};
-  uint8_t protocol_address_{0x42};
   Phase phase_{Phase::IDLE};
   uint32_t offset_{0};
-  uint16_t block_number_{0};
   uint32_t next_action_ms_{0};
   uint32_t started_ms_{0};
   uint32_t last_progress_ms_{0};

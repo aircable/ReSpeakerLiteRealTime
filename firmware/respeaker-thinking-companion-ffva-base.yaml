@@ -1,16 +1,12 @@
-# Staged live-voice experiment for the stock XMOS XVF3610-INT 5.7.3 image.
-# Do not use with the Seeed XMOS 1.1.0 image: its I2S directions are reversed.
-# This deliberately leaves physical microphone mute manual. The stock XVF
-# control service does not expose Seeed's mute-state polling endpoint, so a
-# blind GPIO4 pulse at boot could override a user's intentional mute.
-# Wake word, ready-word wait, USER-button session stop, gateway transport,
-# AEC reference, and the board status LED are included.
+# ReSpeaker Lite live voice path for the tested FFVA XMOS-clock-master image.
+# Use the auto-upgrade YAML for a stock Seeed 1.1.0 board. Do not mix its I2S
+# configuration with a different XMOS application. Physical mute is manual.
 packages:
   status_led: !include status-led.yaml
 
 substitutions:
   name: thinking-companion
-  friendly_name: Thinking Companion XVF3610 Test
+  friendly_name: Thinking Companion FFVA
   wake_start_condition: "true"
 
 esphome:
@@ -18,8 +14,8 @@ esphome:
   friendly_name: ${friendly_name}
   min_version: 2026.6.0
   project:
-    name: aircable.respeaker-thinking-companion-xvf3610
-    version: 0.1.12
+    name: aircable.respeaker-thinking-companion-ffva
+    version: 1.0.0
   on_boot:
     - priority: -100
       then:
@@ -60,11 +56,11 @@ wifi:
   power_save_mode: none
 
 logger:
-  level: DEBUG
+  level: INFO
   hardware_uart: USB_SERIAL_JTAG
   logs:
     realtime_companion: INFO
-    xvf3610_audio: INFO
+    ffva_audio: INFO
 
 ota:
   - platform: esphome
@@ -74,7 +70,7 @@ external_components:
   - source:
       type: local
       path: components
-    components: [realtime_companion, xvf3610_audio, xmos_dfu]
+    components: [realtime_companion, ffva_audio, xmos_dfu]
   - source:
       type: git
       url: https://github.com/formatBCE/esphome
@@ -97,7 +93,6 @@ i2s_audio:
   - id: xmos_rx_master
     i2s_lrclk_pin: {number: GPIO7, allow_other_uses: true}
     i2s_bclk_pin: {number: GPIO8, allow_other_uses: true}
-    i2s_mclk_pin: GPIO9
   - id: codec_tx_slave
     i2s_lrclk_pin: {number: GPIO7, allow_other_uses: true}
     i2s_bclk_pin: {number: GPIO8, allow_other_uses: true}
@@ -112,7 +107,7 @@ microphone:
     sample_rate: 48000
     bits_per_sample: 32bit
     mclk_multiple: 256
-    i2s_mode: primary
+    i2s_mode: secondary
     channel: stereo
 
 speaker:
@@ -137,29 +132,25 @@ speaker:
     filters: 16
     taps: 32
 
-xvf3610_audio:
-  id: xvf_audio
+ffva_audio:
+  id: ffva_audio_component
   i2c_id: internal_i2c
-  address: 0x2C
+  address: 0x18
   audio_dac: codec
   microphone: xmos_microphones
-  aec_diagnostics: true
 
 realtime_companion:
   id: realtime
-  mic_gain_controller: xvf_audio
   microphone: xmos_microphones
   speaker: realtime_resampler
   url: !secret gateway_ws_url
   token: !secret device_token
   device_id: ${name}
   device_name: ${friendly_name}
-  # Independent saved setting: the Seeed 1.1.0 board calibration must not
-  # silently override this XVF3610 test's initial playback level.
   output_volume: 0.25
-  volume_preference_key: realtime_companion_output_volume_xvf3610
+  volume_preference_key: realtime_companion_output_volume_ffva_master
   ready_keyword: true
-  playback_prebuffer_frames: 8  # 160 ms; Seeed firmware keeps the 120 ms default.
+  playback_prebuffer_frames: 12  # 240 ms startup smoothing for XMOS-master playback.
 
 binary_sensor:
   - platform: gpio

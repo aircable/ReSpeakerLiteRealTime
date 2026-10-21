@@ -335,10 +335,6 @@ void RealtimeCompanion::handle_text(const char *data, size_t length) {
     JsonVariant level = root["level"];
     if (level.is<float>() || level.is<double>() || level.is<int>())
       this->set_runtime_volume(level.as<float>(), true);
-  } else if (strcmp(kind, "mic_gain.set") == 0 && this->mic_gain_controller_ != nullptr) {
-    JsonVariant gain = root["ch0_gain"];
-    if (gain.is<float>() || gain.is<double>() || gain.is<int>())
-      this->mic_gain_controller_->request_ch0_gain(gain.as<float>());
   } else if (strcmp(kind, "keyword.mode") == 0 && this->ready_keyword_enabled_) {
     const char *mode = root["mode"] | "";
     const bool ready = strcmp(mode, "ready") == 0;
@@ -444,7 +440,6 @@ void RealtimeCompanion::loop() {
       capabilities["runtime_volume"] = true;
       capabilities["ready_keyword"] = this->ready_keyword_enabled_;
       capabilities["timer_alarm"] = true;
-      capabilities["xvf_agc_ch0"] = this->mic_gain_controller_ != nullptr;
     });
     if (this->send_json(auth))
       this->auth_pending_.store(false, std::memory_order_release);
@@ -850,7 +845,6 @@ void RealtimeCompanion::dump_config() {
                 static_cast<unsigned>(this->playback_prebuffer_frames_),
                 static_cast<unsigned>(this->playback_prebuffer_frames_) * 20);
   ESP_LOGCONFIG(TAG, "  Audio stats interval: %u ms", static_cast<unsigned>(this->audio_stats_interval_ms_));
-  ESP_LOGCONFIG(TAG, "  XVF3610 channel-0 gain control: %s", this->mic_gain_controller_ != nullptr ? "yes" : "no");
   ESP_LOGCONFIG(TAG,
                 "  TX queues: 8 control + 1 coalesced progress + 6 x 20 ms audio; playback queue: "
                 "%u x 20 ms", static_cast<unsigned>(PLAYBACK_QUEUE_FRAMES));

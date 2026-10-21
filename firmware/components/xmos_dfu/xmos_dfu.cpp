@@ -7,26 +7,12 @@
 #include <algorithm>
 #include <cstring>
 
-#ifdef USE_RESPEAKER_LITE
-// formatBCE's component exposes no runtime switch for its tight-loop 0xF1 mute poll. Its
-// translation unit uses this flag to gate that poll, so turn it off for non-Seeed images.
-namespace esphome::respeaker_lite {
-extern bool initialized;
-}
-#endif
-
 namespace esphome::xmos_dfu {
 
 static const char *const TAG = "xmos_dfu";
 static constexpr uint8_t SEEED_ADDRESS = 0x42;
 static constexpr uint8_t SEEED_RESOURCE = 0xF0;
-static constexpr uint8_t XVF_ADDRESS = 0x2C;
-static constexpr uint8_t XVF_RESOURCE = 0xD0;
 static constexpr size_t BLOCK_SIZE = 128;
-
-static uint32_t load_u32_le(const uint8_t *p) {
-  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
-}
 
 void XmosDfu::setup() {
   if (this->auto_update_) {
@@ -38,35 +24,13 @@ void XmosDfu::setup() {
     ESP_LOGI(TAG, "Checking XMOS firmware before enabling ESP32 audio pins");
     return;
   }
-#ifdef USE_RESPEAKER_LITE
-  // The legacy component performs its version check after three seconds. Inspect the resulting
-  // application just afterwards and stop its Seeed-only mute polling when another image is active.
-  this->set_timeout(3200, [this]() { this->disable_legacy_polling_if_incompatible_(); });
-#else
   this->set_timeout(5000, [this]() { this->discover_(true); });
-#endif
-}
-
-void XmosDfu::disable_legacy_polling_if_incompatible_() {
-#ifdef USE_RESPEAKER_LITE
-  uint8_t version[4]{};
-  if (!this->read_at_(SEEED_ADDRESS, SEEED_RESOURCE, 0xD8, version, sizeof(version)) ||
-      version[0] != 0)
-    return;
-  if (version[1] == 1 && version[2] == 1 && version[3] == 0)
-    return;
-  esphome::respeaker_lite::initialized = false;
-  ESP_LOGW(TAG,
-           "XMOS version %u.%u.%u is not Seeed 1.1.0; disabled legacy 0xF1 mute polling. "
-           "Physical mute reporting is unavailable during this experiment.",
-           version[1], version[2], version[3]);
-#endif
 }
 
 void XmosDfu::dump_config() {
-  ESP_LOGCONFIG(TAG, "XMOS dual-protocol I2C updater:");
+  ESP_LOGCONFIG(TAG, "XMOS Seeed-compatible I2C updater:");
   ESP_LOGCONFIG(TAG, "  Embedded image: %s (%u bytes)", this->image_name_, this->firmware_size_);
-  ESP_LOGCONFIG(TAG, "  Discovery: Seeed 0x42/F0 and XVF3610 0x2C/D0");
+  ESP_LOGCONFIG(TAG, "  Discovery: Seeed-compatible 0x42/F0");
   if (this->auto_update_)
     ESP_LOGCONFIG(TAG, "  Auto-upgrade: %u.%u.%u -> %u.%u.%u (stock Seeed 0x42/F0 only)",
                   source_version_[0], source_version_[1], source_version_[2],
@@ -97,37 +61,16 @@ bool XmosDfu::version_matches_(const uint8_t *actual, const uint8_t *expected) {
   return std::memcmp(actual, expected, 3) == 0;
 }
 
-Protocol XmosDfu::discover_(bool log_result) {
-  const uint8_t addresses[] = {SEEED_ADDRESS, XVF_ADDRESS};
-  for (const uint8_t address : addresses) {
-    uint8_t version[4]{};
-    if (this->read_at_(address, SEEED_RESOURCE, 0xD8, version, sizeof(version)) && version[0] == 0) {
-      this->protocol_address_ = address;
-      if (log_result)
-        ESP_LOGI(TAG, "DFU available: Seeed protocol address=0x%02X resource=0xF0 version=%u.%u.%u",
-                 address, version[1], version[2], version[3]);
-      return Protocol::SEEED;
-    }
+bool XmosDfu::discover_(bool log_result) {
+  uint8_t version[3]{};
+  if (!this->read_seeed_version_(version)) {
+    if (log_result) ESP_LOGE(TAG, "No Seeed-compatible XMOS I2C DFU service found at 0x42/F0");
+    return false;
   }
-  // Prefer the XMOS default, but also accept a data partition that retains Seeed's 0x42 address.
-  const uint8_t xvf_addresses[] = {XVF_ADDRESS, SEEED_ADDRESS};
-  for (const uint8_t address : xvf_addresses) {
-    uint8_t control_version[1]{};
-    uint8_t state_raw[4]{};
-    if (this->read_at_(address, 0x00, 0x80, control_version, sizeof(control_version)) &&
-        this->read_at_(address, XVF_RESOURCE, 0x86, state_raw, sizeof(state_raw))) {
-      const uint32_t state = load_u32_le(state_raw);
-      if (control_version[0] == 0x10 && state <= 10) {
-        this->protocol_address_ = address;
-        if (log_result)
-          ESP_LOGI(TAG, "DFU available: XVF protocol address=0x%02X resource=0xD0 control=%u state=%u",
-                   address, control_version[0], state);
-        return Protocol::XVF;
-      }
-    }
-  }
-  if (log_result) ESP_LOGE(TAG, "No supported XMOS I2C DFU service found at 0x42 or 0x2C");
-  return Protocol::NONE;
+  if (log_result)
+    ESP_LOGI(TAG, "DFU available: Seeed-compatible protocol address=0x42 resource=0xF0 version=%u.%u.%u",
+             version[0], version[1], version[2]);
+  return true;
 }
 
 void XmosDfu::start_update() {
@@ -139,38 +82,28 @@ void XmosDfu::start_update() {
     this->fail_("No embedded XMOS image");
     return;
   }
-  this->protocol_ = this->discover_(true);
-  if (this->protocol_ == Protocol::NONE) {
+  if (!this->discover_(true)) {
     this->fail_("No supported XMOS DFU service; upgrade not started");
     return;
   }
-  if (this->auto_update_ && (this->protocol_ != Protocol::SEEED || this->protocol_address_ != SEEED_ADDRESS)) {
-    this->fail_("Automatic stock upgrade requires Seeed DFU at 0x42/F0");
-    return;
-  }
   this->offset_ = 0;
-  this->block_number_ = 0;
   this->started_ms_ = millis();
   this->last_progress_ms_ = 0;
   ESP_LOGW(TAG, "Beginning XMOS update with %s (%u bytes); do not remove power",
            this->image_name_, this->firmware_size_);
 
-  if (this->protocol_ == Protocol::SEEED) {
-    const uint8_t select_upgrade[] = {SEEED_RESOURCE, 0x40, 1, 1};
-    if (!this->write_at_(this->protocol_address_, select_upgrade, sizeof(select_upgrade))) {
-      this->fail_("Seeed SETALTERNATE failed");
-      return;
-    }
-    this->phase_ = Phase::SEND_BLOCK;
-  } else {
-    this->phase_ = Phase::XVF_DETACH;
+  const uint8_t select_upgrade[] = {SEEED_RESOURCE, 0x40, 1, 1};
+  if (!this->write_at_(SEEED_ADDRESS, select_upgrade, sizeof(select_upgrade))) {
+    this->fail_("Seeed SETALTERNATE failed");
+    return;
   }
+  this->phase_ = Phase::SEND_BLOCK;
   this->next_action_ms_ = millis();
 }
 
 bool XmosDfu::seeed_ready_() {
   uint8_t response[6]{};
-  if (!this->read_at_(this->protocol_address_, SEEED_RESOURCE, 0x83, response, sizeof(response)) || response[0] != 0)
+  if (!this->read_at_(SEEED_ADDRESS, SEEED_RESOURCE, 0x83, response, sizeof(response)) || response[0] != 0)
     return false;
   const uint8_t status = response[1];
   const uint8_t state = response[5];
@@ -183,45 +116,19 @@ bool XmosDfu::seeed_ready_() {
   return state == 2 || state == 5 || state == 8;
 }
 
-bool XmosDfu::xvf_status_(uint32_t &state, uint32_t &status, uint32_t &timeout_ms) {
-  uint8_t response[12]{};
-  if (!this->read_at_(this->protocol_address_, XVF_RESOURCE, 0x87, response, sizeof(response))) return false;
-  status = load_u32_le(response);
-  state = load_u32_le(response + 4);
-  timeout_ms = load_u32_le(response + 8);
-  this->next_action_ms_ = millis() + timeout_ms;
-  return status == 0 && state <= 10;
-}
-
 bool XmosDfu::send_block_() {
   const size_t count = std::min<size_t>(BLOCK_SIZE, this->firmware_size_ - this->offset_);
-  if (this->protocol_ == Protocol::SEEED) {
-    uint8_t request[BLOCK_SIZE + 5] = {SEEED_RESOURCE, 0x01, 0x82, 0, 0};
-    request[3] = static_cast<uint8_t>(count);
-    std::memcpy(request + 5, this->firmware_ + this->offset_, count);
-    if (!this->write_at_(this->protocol_address_, request, sizeof(request))) return false;
-  } else {
-    uint8_t request[3 + 4 + BLOCK_SIZE]{};
-    request[0] = XVF_RESOURCE;
-    request[1] = 0x03;
-    request[2] = static_cast<uint8_t>(count + 4);
-    request[3] = static_cast<uint8_t>(this->block_number_);
-    request[4] = static_cast<uint8_t>(this->block_number_ >> 8);
-    std::memcpy(request + 7, this->firmware_ + this->offset_, count);
-    if (!this->write_at_(this->protocol_address_, request, count + 7)) return false;
-  }
+  uint8_t request[BLOCK_SIZE + 5] = {SEEED_RESOURCE, 0x01, 0x82, 0, 0};
+  request[3] = static_cast<uint8_t>(count);
+  std::memcpy(request + 5, this->firmware_ + this->offset_, count);
+  if (!this->write_at_(SEEED_ADDRESS, request, sizeof(request))) return false;
   this->offset_ += count;
-  this->block_number_++;
   return true;
 }
 
 bool XmosDfu::send_final_() {
-  if (this->protocol_ == Protocol::SEEED) {
-    uint8_t request[BLOCK_SIZE + 5] = {SEEED_RESOURCE, 0x01, 0x82, 0, 0};
-    return this->write_at_(this->protocol_address_, request, sizeof(request));
-  }
-  const uint8_t request[] = {XVF_RESOURCE, 0x03, 4, 0, 0, 0, 0};
-  return this->write_at_(this->protocol_address_, request, sizeof(request));
+  uint8_t request[BLOCK_SIZE + 5] = {SEEED_RESOURCE, 0x01, 0x82, 0, 0};
+  return this->write_at_(SEEED_ADDRESS, request, sizeof(request));
 }
 
 void XmosDfu::fail_(const char *message) {
@@ -264,41 +171,15 @@ void XmosDfu::loop() {
       }
       break;
     }
-    case Phase::XVF_DETACH: {
-      uint8_t state_raw[4]{};
-      if (!this->read_at_(this->protocol_address_, XVF_RESOURCE, 0x86, state_raw, sizeof(state_raw)) ||
-          load_u32_le(state_raw) != 0) { this->fail_("XVF is not in APP_IDLE"); break; }
-      const uint8_t detach[] = {XVF_RESOURCE, 0x01, 0};
-      if (!this->write_at_(this->protocol_address_, detach, sizeof(detach))) { this->fail_("XVF DETACH failed"); break; }
-      this->phase_ = Phase::XVF_BUS_RESET;
-      this->next_action_ms_ = millis() + 10;
-      break;
-    }
-    case Phase::XVF_BUS_RESET: {
-      uint8_t state_raw[4]{};
-      if (!this->read_at_(this->protocol_address_, XVF_RESOURCE, 0x86, state_raw, sizeof(state_raw)) ||
-          load_u32_le(state_raw) != 1) { this->fail_("XVF did not enter APP_DETACH"); break; }
-      const uint8_t reset[] = {XVF_RESOURCE, 0x02, 0};
-      if (!this->write_at_(this->protocol_address_, reset, sizeof(reset))) { this->fail_("XVF BUS_RESET failed"); break; }
-      this->phase_ = Phase::SEND_BLOCK;
-      this->next_action_ms_ = millis() + 10;
-      break;
-    }
     case Phase::SEND_BLOCK:
       if (this->offset_ >= this->firmware_size_) { this->phase_ = Phase::SEND_FINAL; break; }
-      if (this->protocol_ == Protocol::SEEED && !this->seeed_ready_()) { this->next_action_ms_ = millis() + 5; break; }
+      if (!this->seeed_ready_()) { this->next_action_ms_ = millis() + 5; break; }
       if (!this->send_block_()) { this->fail_("XMOS DNLOAD write failed"); break; }
       this->phase_ = Phase::POLL_BLOCK;
       this->next_action_ms_ = millis() + 1;
       break;
     case Phase::POLL_BLOCK: {
-      bool ready = false;
-      if (this->protocol_ == Protocol::SEEED) ready = this->seeed_ready_();
-      else {
-        uint32_t state, status, timeout_ms;
-        if (!this->xvf_status_(state, status, timeout_ms)) { this->fail_("XVF GETSTATUS failed"); break; }
-        ready = state == 5;
-      }
+      const bool ready = this->seeed_ready_();
       if (!ready) break;
       if (millis() - this->last_progress_ms_ > 1000 || this->offset_ == this->firmware_size_) {
         this->last_progress_ms_ = millis();
@@ -313,22 +194,13 @@ void XmosDfu::loop() {
       this->next_action_ms_ = millis() + 5;
       break;
     case Phase::POLL_FINAL: {
-      bool ready = false;
-      if (this->protocol_ == Protocol::SEEED) ready = this->seeed_ready_();
-      else {
-        uint32_t state, status, timeout_ms;
-        if (!this->xvf_status_(state, status, timeout_ms)) { this->fail_("XVF final GETSTATUS failed"); break; }
-        ready = state == 2;
-      }
+      const bool ready = this->seeed_ready_();
       if (ready) this->phase_ = Phase::REBOOT;
       break;
     }
     case Phase::REBOOT: {
       const uint8_t seeed_reboot[] = {SEEED_RESOURCE, 0x59, 1, 0};
-      const uint8_t xvf_reboot[] = {XVF_RESOURCE, 0x05, 0};
-      const bool ok = this->protocol_ == Protocol::SEEED
-                          ? this->write_at_(this->protocol_address_, seeed_reboot, sizeof(seeed_reboot))
-                          : this->write_at_(this->protocol_address_, xvf_reboot, sizeof(xvf_reboot));
+      const bool ok = this->write_at_(SEEED_ADDRESS, seeed_reboot, sizeof(seeed_reboot));
       if (!ok) { this->fail_("XMOS reboot command failed"); break; }
       ESP_LOGI(TAG, "XMOS image written; waiting for reboot and post-flash DFU discovery");
       this->phase_ = Phase::VERIFY;
@@ -353,12 +225,11 @@ void XmosDfu::loop() {
           this->fail_("XMOS post-flash version mismatch; voice startup blocked");
           break;
         }
-      } else if (this->discover_(true) == Protocol::NONE) {
+      } else if (!this->discover_(true)) {
         this->fail_("Image write completed, but no supported DFU service appeared after reboot");
         break;
       }
       ESP_LOGI(TAG, "XMOS update complete in %.1f seconds", (millis() - this->started_ms_) / 1000.0f);
-      this->disable_legacy_polling_if_incompatible_();
       this->phase_ = Phase::COMPLETE;
       if (this->auto_update_) {
         ESP_LOGI(TAG, "Rebooting ESP32 to initialize I2S and codec against the new XMOS image");

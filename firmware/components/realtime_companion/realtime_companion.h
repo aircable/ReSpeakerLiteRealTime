@@ -4,7 +4,6 @@
 #include "esphome/components/speaker/speaker.h"
 #include "esphome/core/component.h"
 #include "esphome/core/preferences.h"
-#include "mic_gain_control.h"
 
 #include <esp_websocket_client.h>
 #include <resampler.h>
@@ -71,7 +70,6 @@ class RealtimeCompanion : public Component {
   void set_ready_keyword_enabled(bool enabled) { ready_keyword_enabled_ = enabled; }
   void set_playback_prebuffer_frames(uint8_t frames) { playback_prebuffer_frames_ = frames; }
   void set_audio_stats_interval_ms(uint32_t interval_ms) { audio_stats_interval_ms_ = interval_ms; }
-  void set_mic_gain_controller(MicGainControl *controller) { mic_gain_controller_ = controller; }
   void set_startup_guard(Component *guard) { startup_guard_ = guard; }
 
   void start_session();
@@ -200,7 +198,6 @@ class RealtimeCompanion : public Component {
   std::atomic<bool> stream_ready_{false};
   std::atomic<bool> muted_{false};
   bool ready_keyword_enabled_{false};
-  MicGainControl *mic_gain_controller_{nullptr};
   std::atomic<bool> waiting_for_ready_{false};
   std::atomic<bool> ready_signal_sent_{false};
 };

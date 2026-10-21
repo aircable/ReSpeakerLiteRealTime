@@ -16,7 +16,7 @@ esphome:
   build_path: .esphome/build-ffva-auto-upgrade
   project:
     name: aircable.respeaker-thinking-companion-ffva-upgrade
-    version: 0.2.0
+    version: 1.0.0
 
 # The stock Seeed 1.1.0 factory image in the XTAG backup is Tools 15.2 format.
 # This v2 upgrade image is also Tools 15.2 format (CRC checked with xflash),

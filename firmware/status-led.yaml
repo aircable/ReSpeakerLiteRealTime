@@ -62,7 +62,7 @@ light:
               mode = 5; mode_name = "error";
               level = (now % 500) < 250 ? 1.0f : 0.0f;
             } else if (id(realtime).get_state() == CompanionState::MUTED) {
-              red = 55;  // Logical microphone mute; physical XVF mute is not readable.
+              red = 55;  // Logical microphone mute; physical mute is not readable.
               mode = 6; mode_name = "software_muted";
             } else if (id(user_button).state) {
               blue = 70;

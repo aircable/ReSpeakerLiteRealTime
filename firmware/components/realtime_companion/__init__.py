@@ -13,7 +13,6 @@ CONF_DEVICE_NAME = "device_name"
 CONF_OUTPUT_VOLUME = "output_volume"
 CONF_VOLUME_PREFERENCE_KEY = "volume_preference_key"
 CONF_READY_KEYWORD = "ready_keyword"
-CONF_MIC_GAIN_CONTROLLER = "mic_gain_controller"
 CONF_STARTUP_GUARD = "startup_guard"
 CONF_PLAYBACK_PREBUFFER_FRAMES = "playback_prebuffer_frames"
 CONF_AUDIO_STATS_INTERVAL_MS = "audio_stats_interval_ms"
@@ -35,7 +34,6 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_READY_KEYWORD, default=False): cv.boolean,
         cv.Optional(CONF_PLAYBACK_PREBUFFER_FRAMES, default=6): cv.int_range(min=1, max=16),
         cv.Optional(CONF_AUDIO_STATS_INTERVAL_MS, default=2000): cv.int_range(min=1000, max=60000),
-        cv.Optional(CONF_MIC_GAIN_CONTROLLER): cv.use_id(cg.Component),
         cv.Optional(CONF_STARTUP_GUARD): cv.use_id(cg.Component),
     }
 ).extend(cv.COMPONENT_SCHEMA)
@@ -61,7 +59,5 @@ async def to_code(config):
     cg.add(var.set_ready_keyword_enabled(config[CONF_READY_KEYWORD]))
     cg.add(var.set_playback_prebuffer_frames(config[CONF_PLAYBACK_PREBUFFER_FRAMES]))
     cg.add(var.set_audio_stats_interval_ms(config[CONF_AUDIO_STATS_INTERVAL_MS]))
-    if CONF_MIC_GAIN_CONTROLLER in config:
-        cg.add(var.set_mic_gain_controller(await cg.get_variable(config[CONF_MIC_GAIN_CONTROLLER])))
     if CONF_STARTUP_GUARD in config:
         cg.add(var.set_startup_guard(await cg.get_variable(config[CONF_STARTUP_GUARD])))

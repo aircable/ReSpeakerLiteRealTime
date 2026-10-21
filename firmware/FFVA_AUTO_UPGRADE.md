@@ -1,5 +1,10 @@
 # ReSpeaker Lite: stock 1.1.0 to Thinking Companion FFVA
 
+The first release is tagged `v1.0.0`. Its supported firmware path is the
+FFVA XMOS-clock-master image and the ESP32 auto-upgrade configuration below.
+Earlier experimental XMOS control and diagnostic components are not part of
+this release.
+
 The [FFVA auto-upgrade configuration](respeaker-thinking-companion-ffva-auto-upgrade.yaml)
 builds one ESP32-S3 firmware image containing the matching XMOS application. On first boot it
 upgrades a **stock Seeed XMOS 1.1.0** application over I²C, then reboots the ESP32 into the
