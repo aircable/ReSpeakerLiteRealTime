@@ -12,22 +12,47 @@ Home Assistant, Hermes, OpenWebUI, and Pipecat are not in the audio path.
 
 ## Run the published container
 
-Images for both amd64 and arm64 are published to GitHub Container Registry after tests pass on
-the `main` branch. Docker repository names are lowercase, so pull
-`ghcr.io/aircable/respeakerliterealtime:main`.
+The [v1.0.0 release](https://github.com/aircable/ReSpeakerLiteRealTime/releases/tag/v1.0.0)
+provides a tested gateway image for amd64 and arm64. Pin the release tag for a stable install;
+`:main` follows ongoing development.
 
-Create a persistent data directory and an environment file based on `.env.example`, then run:
+### Home Assistant OS host install
+
+This runs the independent gateway in Docker on the Home Assistant OS host; Home Assistant is
+not in the audio path. From a host shell with Docker access, create
+`/mnt/data/supervisor/share/realtimevoice` and put an `.env` file there containing at least
+`OPENAI_API_KEY`, `DEVICE_TOKEN`, and `UI_TOKEN` (see [`.env.example`](.env.example)). Keep
+the same token values when upgrading. The bind mount makes gateway data available from the
+Home Assistant share. Do not put real keys in a script committed to Git.
+
+The following also upgrades an existing container named `realtimevoice`. It pulls the new image
+*before* stopping the old one, preserves `/data`, and uses host port `8090` because `8080` may
+already be occupied on Home Assistant OS:
 
 ```sh
-mkdir -p /data/respeaker-realtime
+mkdir -p /mnt/data/supervisor/share/realtimevoice
+docker pull ghcr.io/aircable/respeakerliterealtime:v1.0.0
+if docker container inspect realtimevoice >/dev/null 2>&1; then
+  docker stop realtimevoice
+  docker rm realtimevoice
+fi
 docker run -d \
-  --name respeaker-realtime \
+  --name realtimevoice \
   --restart unless-stopped \
-  --env-file /data/respeaker-realtime/.env \
-  -p 8080:8080 \
-  -v /data/respeaker-realtime/data:/data \
-  ghcr.io/aircable/respeakerliterealtime:main
+  --env-file /mnt/data/supervisor/share/realtimevoice/.env \
+  -p 8090:8080 \
+  --mount type=bind,source=/mnt/data/supervisor/share/realtimevoice,target=/data,bind-propagation=rslave \
+  ghcr.io/aircable/respeakerliterealtime:v1.0.0
 ```
+
+Open `http://<home-assistant-host>:8090/` and enter `UI_TOKEN`. Check
+`http://<home-assistant-host>:8090/health` for the running version. On this HA OS host,
+use the tested `--mount ... bind-propagation=rslave` form rather than the generic `-v` example;
+the path and mount propagation are important for the shared directory. For firmware installation,
+see the [matching FFVA upgrade guide](firmware/FFVA_AUTO_UPGRADE.md).
+If you keep an existing `INSTALL.sh` with `-e` options, retain its working mount and port and
+change **both** image references from `:main` to `:v1.0.0`. The `.env` form above avoids putting
+keys directly in the command; restrict that file's permissions (for example, `chmod 600`).
 
 The container needs no Home Assistant token. `OPENAI_API_KEY` is the OpenAI API key,
 `DEVICE_TOKEN` must match the token compiled into the ReSpeaker firmware, and `UI_TOKEN` protects
