@@ -84,9 +84,12 @@ guide the model's intent-based selection; they are not an exact-match speech par
 | “Cancel the pasta timer” | `cancel_timer` | Cancels a matching timer |
 
 `wait_for_ready` is advertised only when the firmware reports the `ready_keyword` capability.
-Timer commands are advertised only when the firmware reports `timer_alarm`. Set **Time zone** in
-the web UI to an IANA zone such as `America/Los_Angeles`; the default is UTC. Timer deadlines are
-stored in UTC and survive a gateway restart. The alarm is a local repeating chime with an amber
+Timer commands are advertised only when the firmware reports `timer_alarm`. On a new installation,
+opening the authenticated web UI detects the browser's IANA time zone and saves it to the gateway.
+The zone is shared by all devices; the last browser to open the page sets it. Turn off automatic
+mode in **Voice settings** to enter a zone manually. Until a browser syncs, the gateway uses UTC
+or the `TIME_ZONE` environment variable. Timer deadlines are stored in UTC and survive a gateway
+restart. The alarm is a local repeating chime with an amber
 status LED; USER or the wake word dismisses it. A disconnected ReSpeaker rings after reconnecting,
 not while it is offline. Output volume at zero also silences the alarm.
 The chime stops automatically after 60 seconds if not dismissed.

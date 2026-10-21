@@ -61,6 +61,34 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
     get_settings.cache_clear()
 
 
+async def test_time_zone_defaults_to_browser_sync_but_preserves_manual_zone(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer browser-secret"}
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            initial = (await client.get("/api/settings", headers=headers)).json()
+            assert initial["time_zone"] == "UTC"
+            assert initial["time_zone_auto"] is True
+
+            assert (await client.patch(
+                "/api/settings", headers=headers, json={"time_zone": "America/Los_Angeles"}
+            )).status_code == 200
+            manual = (await client.get("/api/settings", headers=headers)).json()
+            assert manual["time_zone"] == "America/Los_Angeles"
+            assert manual["time_zone_auto"] is False
+
+            assert (await client.patch(
+                "/api/settings", headers=headers,
+                json={"time_zone": "America/New_York", "time_zone_auto": True},
+            )).status_code == 200
+            assert (await client.get("/api/settings", headers=headers)).json()["time_zone_auto"] is True
+            assert (await client.patch(
+                "/api/settings", headers=headers, json={"time_zone": "not-a-zone"}
+            )).status_code == 422
+    get_settings.cache_clear()
+
+
 async def test_startup_logs_and_health_identify_build(monkeypatch, tmp_path, caplog):
     configure(monkeypatch, tmp_path)
     with caplog.at_level(logging.INFO, logger="gateway.app"):

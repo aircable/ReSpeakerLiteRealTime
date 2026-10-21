@@ -126,6 +126,20 @@ async def test_local_time_uses_configured_zone(tmp_path):
     assert result["local_datetime"]
 
 
+async def test_local_time_and_timers_pick_up_zone_during_active_session(tmp_path):
+    session, _ = make_session(tmp_path)
+    cloud = session.cloud
+    session.db.create_timer("device", 60, "tea")
+    session.db.update_settings({"time_zone": "America/Los_Angeles"})
+
+    await session._voice_get_local_time(cloud, "time", {})
+    assert cloud.tool_outputs[-1][1]["time_zone"] == "America/Los_Angeles"
+    assert cloud.tool_outputs[-1][1]["local_datetime"].endswith(("-07:00", "-08:00"))
+
+    await session._voice_list_timers(cloud, "timers", {})
+    assert cloud.tool_outputs[-1][1]["timers"][0]["due_at_local"].endswith(("-07:00", "-08:00"))
+
+
 async def test_timer_alarm_survives_disconnection_and_dismisses(tmp_path):
     session, ws = make_session(tmp_path)
     session.timer_alarm_enabled = True

@@ -279,7 +279,10 @@ class DeviceSession:
             return
         # The device WebSocket is persistent, so reload UI overrides for every
         # billed voice session rather than only when the device authenticates.
-        self.settings = self.settings.model_copy(update=self.db.setting_overrides())
+        overrides = self.db.setting_overrides()
+        self.settings = self.settings.model_copy(update={
+            key: value for key, value in overrides.items() if key in Settings.model_fields
+        })
         self.planner.settings = self.settings
         self.accepting_audio = True
         self.end_session_pending = False
@@ -957,11 +960,12 @@ class DeviceSession:
     async def _voice_get_local_time(
         self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
     ) -> None:
-        local = datetime.now(ZoneInfo(self.settings.time_zone))
+        time_zone = self.db.setting_overrides().get("time_zone", self.settings.time_zone)
+        local = datetime.now(ZoneInfo(time_zone))
         await cloud.submit_tool_output(call_id, {
             "ok": True,
             "local_datetime": local.isoformat(timespec="seconds"),
-            "time_zone": self.settings.time_zone,
+            "time_zone": time_zone,
             "weekday": local.strftime("%A"),
         })
         await cloud.request_response()
@@ -989,12 +993,13 @@ class DeviceSession:
     async def _voice_list_timers(
         self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
     ) -> None:
-        local_now = datetime.now(ZoneInfo(self.settings.time_zone))
+        time_zone = ZoneInfo(self.db.setting_overrides().get("time_zone", self.settings.time_zone))
+        local_now = datetime.now(time_zone)
         timers = [{
             "timer_id": row["id"], "label": row["label"], "status": row["status"],
             "seconds_remaining": max(0, int((datetime.fromisoformat(row["due_at"]) - local_now).total_seconds())),
             "due_at_local": datetime.fromisoformat(row["due_at"]).astimezone(
-                ZoneInfo(self.settings.time_zone)).isoformat(timespec="seconds"),
+                time_zone).isoformat(timespec="seconds"),
         } for row in self.db.list_timers(self.device_id)]
         await cloud.submit_tool_output(call_id, {"ok": True, "timers": timers})
         await cloud.request_response()

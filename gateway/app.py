@@ -102,6 +102,7 @@ class GatewaySettingsUpdate(BaseModel):
     announce_active_project: bool | None = None
     transcript_retention_days: int | None = Field(default=None, ge=0, le=3650)
     time_zone: str | None = None
+    time_zone_auto: bool | None = None
 
 
 class DeviceVolumeUpdate(BaseModel):
@@ -222,7 +223,12 @@ async def gateway_settings(
 ) -> dict[str, Any]:
     keys = set(GatewaySettingsUpdate.model_fields)
     current = settings.model_dump(include=keys)
-    current.update(db.setting_overrides())
+    overrides = db.setting_overrides()
+    current.update(overrides)
+    # Existing explicitly configured zones remain manual after this upgrade.
+    current["time_zone_auto"] = overrides.get(
+        "time_zone_auto", "time_zone" not in overrides and settings.time_zone == "UTC"
+    )
     return current
 
 
