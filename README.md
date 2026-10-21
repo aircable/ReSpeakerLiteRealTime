@@ -46,8 +46,10 @@ docker run -d \
 ```
 
 Open `http://<home-assistant-host>:8090/` and enter `UI_TOKEN`. Check
-`http://<home-assistant-host>:8090/health` for the running version. On this HA OS host,
-use the tested `--mount ... bind-propagation=rslave` form rather than the generic `-v` example;
+`http://<home-assistant-host>:8090/health` for the running version. Set the firmware's
+`gateway_ws_url` to `ws://<home-assistant-host>:8090/ws/device` and use the same `DEVICE_TOKEN`.
+On this HA OS host, use the tested `--mount ... bind-propagation=rslave` form rather than the
+generic `-v` example;
 the path and mount propagation are important for the shared directory. For firmware installation,
 see the [matching FFVA upgrade guide](firmware/FFVA_AUTO_UPGRADE.md).
 If you keep an existing `INSTALL.sh` with `-e` options, retain its working mount and port and
