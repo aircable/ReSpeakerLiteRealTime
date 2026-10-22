@@ -189,6 +189,13 @@ survive gateway reconnects and device reboots.
 
 ## Development
 
+Potential XMOS enhancements are recorded in [XMOS_FUTURE_WORK.md](XMOS_FUTURE_WORK.md).
+They are deferred while the current release is evaluated in everyday use.
+The separate [gateway provider-adapter proposal](GATEWAY_FUTURE_WORK.md) describes a staged
+Hugging Face Speech-to-Speech and Moshi evaluation; it is future work, not part of v1.0.0.
+An [optional Home Assistant App proposal](HOME_ASSISTANT_APP_FUTURE.md) covers packaging the
+independent gateway without changing the live audio path.
+
 ```sh
 uv sync --extra test
 uv run pytest
