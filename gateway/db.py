@@ -81,9 +81,15 @@ CREATE INDEX IF NOT EXISTS timers_due ON timers(status, due_at);
 CREATE INDEX IF NOT EXISTS timers_device ON timers(device_id, status, due_at);
 """
 
+_ANY_PROJECT = object()
+
 
 def now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def normalized_project_name(name: str) -> str:
+    return " ".join(name.casefold().split())
 
 
 class Database:
@@ -187,10 +193,8 @@ class Database:
         stamp = now()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            if any(
-                " ".join(row["name"].casefold().split()) == " ".join(name.casefold().split())
-                for row in conn.execute("SELECT name FROM projects")
-            ):
+            if any(normalized_project_name(row["name"]) == normalized_project_name(name)
+                   for row in conn.execute("SELECT name FROM projects")):
                 raise ValueError("A project with that name already exists")
             cursor = conn.execute(
                 "INSERT INTO projects(name, goal, instructions, pinned_notes, created_at, updated_at) "
@@ -205,14 +209,94 @@ class Database:
         values = {key: value for key, value in values.items() if key in allowed}
         if not values:
             return self.get_project(project_id)
+        if "name" in values:
+            name = values["name"].strip()
+            if not name or len(name) > 120:
+                raise ValueError("Project name must be 1-120 characters")
+            values["name"] = name
         values["updated_at"] = now()
         assignments = ", ".join(f"{key}=?" for key in values)
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if "name" in values and any(
+                normalized_project_name(row["name"]) == normalized_project_name(values["name"])
+                for row in conn.execute("SELECT name FROM projects WHERE id<>?", (project_id,))
+            ):
+                raise ValueError("A project with that name already exists")
             conn.execute(
                 f"UPDATE projects SET {assignments} WHERE id=?",  # noqa: S608 - keys allowlisted
                 (*values.values(), project_id),
             )
         return self.get_project(project_id)
+
+    def find_exact_project(self, name: str) -> dict[str, Any] | None:
+        matches = [project for project in self.list_projects()
+                   if normalized_project_name(project["name"]) == normalized_project_name(name)]
+        if len(matches) > 1:
+            raise ValueError("Several projects share that name; rename duplicates before overwriting")
+        return matches[0] if matches else None
+
+    def save_project_persona(
+        self, name: str, goal: str, instructions: str, pinned_notes: str,
+        expected_project_id: int | None | object = _ANY_PROJECT,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create or replace persona fields without discarding project history."""
+        name = name.strip()
+        if not name or len(name) > 120:
+            raise ValueError("Project name must be 1-120 characters")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            matches = [row for row in conn.execute("SELECT id, name FROM projects")
+                       if normalized_project_name(row["name"]) == normalized_project_name(name)]
+            if len(matches) > 1:
+                raise ValueError("Several projects share that name; rename duplicates before overwriting")
+            matched_id = matches[0]["id"] if matches else None
+            if expected_project_id is not _ANY_PROJECT and matched_id != expected_project_id:
+                raise ValueError("The project list changed after the draft; review the draft again")
+            stamp = now()
+            if matches:
+                project_id = matches[0]["id"]
+                conn.execute(
+                    "UPDATE projects SET goal=?, instructions=?, pinned_notes=?, updated_at=? WHERE id=?",
+                    (goal, instructions, pinned_notes, stamp, project_id),
+                )
+                created = False
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO projects(name, goal, instructions, pinned_notes, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (name, goal, instructions, pinned_notes, stamp, stamp),
+                )
+                project_id = cursor.lastrowid
+                created = True
+        return self.get_project(project_id), created
+
+    def delete_project(self, project_id: int) -> int:
+        """Delete a project and its DB history, activating a remaining project if needed."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            project = conn.execute("SELECT active FROM projects WHERE id=?", (project_id,)).fetchone()
+            if project is None:
+                raise KeyError("project not found")
+            if conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1:
+                raise ValueError("Create another project before deleting the last one")
+            conn.execute(
+                "DELETE FROM turns WHERE session_id IN (SELECT id FROM sessions WHERE project_id=?)",
+                (project_id,),
+            )
+            conn.execute("DELETE FROM plan_revisions WHERE project_id=?", (project_id,))
+            conn.execute("DELETE FROM sessions WHERE project_id=?", (project_id,))
+            conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+            if project["active"]:
+                replacement = conn.execute(
+                    "SELECT id FROM projects ORDER BY updated_at DESC, id DESC LIMIT 1"
+                ).fetchone()["id"]
+                conn.execute(
+                    "UPDATE projects SET active=1, updated_at=? WHERE id=?", (now(), replacement)
+                )
+            else:
+                replacement = conn.execute("SELECT id FROM projects WHERE active=1").fetchone()["id"]
+        return replacement
 
     def activate_project(self, project_id: int) -> None:
         with self.connect() as conn:
@@ -223,9 +307,9 @@ class Database:
 
     def find_project(self, name: str) -> dict[str, Any] | None:
         """Resolve a spoken project name without silently choosing an ambiguous match."""
-        requested = " ".join(name.casefold().split())
+        requested = normalized_project_name(name)
         projects = self.list_projects()
-        exact = [p for p in projects if " ".join(p["name"].casefold().split()) == requested]
+        exact = [p for p in projects if normalized_project_name(p["name"]) == requested]
         if len(exact) == 1:
             return exact[0]
         partial = [p for p in projects if requested and requested in p["name"].casefold()]

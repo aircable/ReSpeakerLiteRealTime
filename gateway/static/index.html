@@ -10,7 +10,7 @@
     main{max-width:1100px;margin:auto;padding:2rem}.bar{display:flex;gap:.7rem;align-items:center;flex-wrap:wrap}
     h1{font-size:1.6rem;margin-right:auto}.panel{background:var(--panel);border-radius:12px;padding:1.2rem;margin:1rem 0}
     input,textarea,select,button{font:inherit;border:1px solid #3a4657;border-radius:7px;padding:.65rem;background:#111722;color:var(--ink)}
-    textarea{width:100%;min-height:90px;resize:vertical}#plan{min-height:330px}button{cursor:pointer}button.primary{background:var(--accent);color:#07130f;border:0}
+    textarea{width:100%;min-height:90px;resize:vertical}#plan{min-height:330px}button{cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}button.primary{background:var(--accent);color:#07130f;border:0}
     label{display:block;color:var(--muted);margin:.8rem 0 .3rem}.projects button{margin:.2rem}.active{outline:2px solid var(--accent)}
     .status{color:var(--muted)}@media(max-width:650px){main{padding:1rem}}
     .voice-help{margin-top:1rem;padding:.7rem 1rem;border:1px solid #3a4657;border-radius:8px}
@@ -22,12 +22,13 @@
     #projectDraft[hidden]{display:none}#projectDraft pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}
     #searchResults[hidden]{display:none}#searchResults p{white-space:pre-wrap}#searchResults a{color:var(--accent)}
     .settings-group{border-top:1px solid #3a4657;margin-top:1rem;padding-top:.7rem}.settings-group h3{font-size:1rem;margin:.2rem 0}.settings-group>p{margin:.25rem 0 .5rem}
+    button.danger{border-color:#b75b5b;color:#ffd7d7}
   </style>
 </head>
 <body><main>
   <div class="bar"><h1 id="appTitle">Thinking Companion</h1><span id="status" class="status">Enter UI token</span><button onclick="setToken()">Token</button></div>
   <section class="panel"><div class="bar projects" id="projects"></div><div class="bar"><input id="newName" placeholder="New project"><button onclick="createProject()">Create</button></div></section>
-  <section class="panel" id="projectDraft" hidden><strong>Proposed project</strong><p class="status">Review this draft, then tell the assistant to change it or say “save that project.” It is not saved yet.</p><p><strong>Name:</strong> <span id="draftName"></span></p><p><strong>Goal:</strong> <span id="draftGoal"></span></p><strong>Project instructions</strong><pre id="draftInstructions"></pre><strong>Pinned notes</strong><pre id="draftNotes"></pre></section>
+  <section class="panel" id="projectDraft" hidden><strong>Proposed project</strong><p id="draftNotice" class="status">Review this draft, then tell the assistant to change it or say “save that project.” It is not saved yet.</p><p><strong>Name:</strong> <span id="draftName"></span></p><p><strong>Goal:</strong> <span id="draftGoal"></span></p><strong>Project instructions</strong><pre id="draftInstructions"></pre><strong>Pinned notes</strong><pre id="draftNotes"></pre></section>
   <section class="panel" aria-labelledby="voiceSettingsHeading">
     <div class="bar">
       <strong id="voiceSettingsHeading">Shared assistant settings</strong>
@@ -97,7 +98,7 @@
     <label>Pinned notes</label><textarea id="notes"></textarea>
     <label>Rolling summary</label><textarea id="summary"></textarea>
     <label>Markdown plan</label><textarea id="plan"></textarea>
-    <div class="bar"><button class="primary" onclick="save()">Save</button><button onclick="activate()">Make active</button><button onclick="showHistory()">Plan history</button><button onclick="exportPlan()">Export Markdown</button><span id="saved" class="status"></span></div><pre id="history" class="status"></pre>
+    <div class="bar"><button class="primary" onclick="save()">Save</button><button onclick="activate()">Make active</button><button onclick="showHistory()">Plan history</button><button onclick="exportPlan()">Export Markdown</button><button id="deleteProjectButton" class="danger" onclick="deleteProject()">Delete project</button><span id="saved" class="status"></span></div><pre id="history" class="status"></pre>
   </section>
   <section class="panel"><strong>Live transcript</strong><p class="status">Shows the selected device's conversation. The active project remains shared.</p><div id="transcript" class="status">Select a device to view its transcript.</div><div id="searchResults" hidden><h3>Latest web search</h3><p id="searchQuery" class="status"></p><p id="searchAnswer"></p></div></section>
 </main><script>
@@ -105,7 +106,7 @@ let token=localStorage.uiToken||'', current=null, all=[], live=null;
 let selectedDeviceId=localStorage.selectedDeviceId||'', connectedDevices=[], transcriptRole=null;
 async function loadVersion(){try{const h=await (await fetch('/health')).json();const label=`Thinking Companion V${h.version}`;document.getElementById('appTitle').textContent=label;document.title=label}catch(e){}}
 function setToken(){token=prompt('UI token',token)||'';localStorage.uiToken=token;load();connectLive()}
-async function api(path,options={}){options.headers={...(options.headers||{}),Authorization:`Bearer ${token}`,'Content-Type':'application/json'};const r=await fetch(path,options);if(!r.ok)throw Error(await r.text());return r}
+async function api(path,options={}){options.headers={...(options.headers||{}),Authorization:`Bearer ${token}`,'Content-Type':'application/json'};const r=await fetch(path,options);if(!r.ok){const body=await r.text();let detail=body;try{detail=JSON.parse(body).detail||body}catch(e){}throw Error(detail)}return r}
 function browserTimeZone(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||null}catch(e){return null}}
 function setTimeZoneMode(){timeZone.disabled=autoTimeZone.checked;if(autoTimeZone.checked)timeZone.value=browserTimeZone()||timeZone.value}
 async function syncBrowserTimeZone(settings){
@@ -117,10 +118,17 @@ async function syncBrowserTimeZone(settings){
   try{await api('/api/settings',{method:'PATCH',body:JSON.stringify({time_zone:zone,time_zone_auto:true})});status.textContent=`Gateway time zone updated to ${zone}`}
   catch(e){status.textContent=`Time zone sync failed: ${e.message}`}
 }
-async function load(){try{all=await (await api('/api/projects')).json();const s=await (await api('/api/settings')).json();const devices=await (await api('/api/devices')).json();rtModel.value=s.realtime_model;voice.value=s.voice;timeZone.value=s.time_zone;autoTimeZone.checked=s.time_zone_auto;setTimeZoneMode();effort.value=s.reasoning_effort;idle.value=s.idle_timeout_seconds;announceProject.checked=s.announce_active_project;openaiTrace.checked=s.openai_trace;diagnostic.checked=s.diagnostic_audio;status.textContent='Gateway connected';await syncBrowserTimeZone(s);projects.innerHTML='';all.forEach(p=>{const b=document.createElement('button');b.textContent=p.name+(p.active?' ●':'');b.className=p.active?'active':'';b.onclick=()=>select(p.id);projects.append(b)});renderDevices(devices);await loadDeviceAudioSettings();if(current)await select(current)}catch(e){status.textContent=`Gateway load failed: ${e.message}`}}
+async function load(){try{all=await (await api('/api/projects')).json();const s=await (await api('/api/settings')).json();const devices=await (await api('/api/devices')).json();rtModel.value=s.realtime_model;voice.value=s.voice;timeZone.value=s.time_zone;autoTimeZone.checked=s.time_zone_auto;setTimeZoneMode();effort.value=s.reasoning_effort;idle.value=s.idle_timeout_seconds;announceProject.checked=s.announce_active_project;openaiTrace.checked=s.openai_trace;diagnostic.checked=s.diagnostic_audio;status.textContent='Gateway connected';await syncBrowserTimeZone(s);projects.innerHTML='';all.forEach(p=>{const b=document.createElement('button');b.textContent=p.name+(p.active?' ●':'');b.className=p.active?'active':'';b.onclick=()=>select(p.id);projects.append(b)});deleteProjectButton.disabled=all.length<=1;deleteProjectButton.title=deleteProjectButton.disabled?'Create another project before deleting the last one':'';renderDevices(devices);await loadDeviceAudioSettings();if(current)await select(current)}catch(e){status.textContent=`Gateway load failed: ${e.message}`}}
 async function select(id){current=id;const p=await (await api(`/api/projects/${id}`)).json();editor.hidden=false;name.value=p.name;goal.value=p.goal;instructions.value=p.instructions;notes.value=p.pinned_notes;summary.value=p.summary;plan.value=p.plan_markdown;await loadTranscript()}
-async function save(){await api(`/api/projects/${current}`,{method:'PATCH',body:JSON.stringify({name:name.value,goal:goal.value,instructions:instructions.value,pinned_notes:notes.value,summary:summary.value,plan_markdown:plan.value})});saved.textContent='Saved';setTimeout(()=>saved.textContent='',1500);load()}
+async function save(){try{await api(`/api/projects/${current}`,{method:'PATCH',body:JSON.stringify({name:name.value,goal:goal.value,instructions:instructions.value,pinned_notes:notes.value,summary:summary.value,plan_markdown:plan.value})});saved.textContent='Saved';setTimeout(()=>saved.textContent='',1500);load()}catch(e){saved.textContent=`Save failed: ${e.message}`}}
 async function activate(){await api(`/api/projects/${current}/activate`,{method:'POST'});load()}
+async function deleteProject(){
+  if(!current)return;
+  const projectId=current,projectName=all.find(p=>p.id===projectId)?.name||name.value;
+  if(!confirm(`Delete “${projectName}” and its saved conversation history? This cannot be undone. Diagnostic audio files, if enabled, remain in their separate folder.`))return;
+  try{const result=await (await api(`/api/projects/${projectId}`,{method:'DELETE'})).json();if(current===projectId){current=result.active_project_id;projectDraft.hidden=true}await load();status.textContent=`Deleted ${projectName}`}
+  catch(e){saved.textContent=`Delete failed: ${e.message}`}
+}
 async function createProject(){if(!newName.value)return;const p=await (await api('/api/projects',{method:'POST',body:JSON.stringify({name:newName.value})})).json();newName.value='';await load();select(p.id)}
 function exportPlan(){window.open(`/api/projects/${current}/export.md?token=${encodeURIComponent(token)}`)}
 async function saveSettings(){try{await api('/api/settings',{method:'PATCH',body:JSON.stringify({realtime_model:rtModel.value,voice:voice.value,time_zone:autoTimeZone.checked?(browserTimeZone()||timeZone.value):timeZone.value,time_zone_auto:autoTimeZone.checked,reasoning_effort:effort.value,idle_timeout_seconds:Number(idle.value),announce_active_project:announceProject.checked,openai_trace:openaiTrace.checked,diagnostic_audio:diagnostic.checked})});status.textContent='Shared settings saved; voice settings apply next session'}catch(e){status.textContent=`Save failed: ${e.message}`}}
@@ -186,9 +194,10 @@ function showSearchResult(message){
   }
   searchAnswer.append(document.createTextNode(chars.slice(position).join('')));
 }
-function showProjectDraft(draft){
+function showProjectDraft(draft,replacing=false){
   projectDraft.hidden=false;draftName.textContent=draft.name||'';draftGoal.textContent=draft.goal||'';
   draftInstructions.textContent=draft.instructions||'';draftNotes.textContent=draft.pinned_notes||'(none)';
+  draftNotice.textContent=replacing?'Saving this draft will replace the existing persona’s goal, instructions, and pinned notes. Conversation history stays. Ask the assistant to save after reviewing.':'Review this draft, then tell the assistant to change it or say “save that project.” It is not saved yet.';
 }
 deviceSelect.onchange=async()=>{selectedDeviceId=deviceSelect.value;localStorage.selectedDeviceId=selectedDeviceId;searchResults.hidden=true;showSelectedDevice();await loadDeviceAudioSettings();await loadTranscript()};
 deviceVolume.onchange=async()=>{if(!selectedDeviceId||deviceVolume.disabled)return;await api(`/api/devices/${encodeURIComponent(selectedDeviceId)}/volume`,{method:'PATCH',body:JSON.stringify({level_percent:Number(deviceVolume.value)})})};
@@ -205,10 +214,10 @@ function connectLive(){
     if(m.type==='state'&&device){device.state=m.state;renderDevices(connectedDevices)}
     if(m.type==='volume.changed'&&device){device.volume_percent=m.level_percent??m.level*100;showSelectedDevice()}
     if(m.device_id!==selectedDeviceId)return;
-    if(m.type==='project.draft'){showProjectDraft(m.draft||{});return}
-    if(m.type==='project.created'){
+    if(m.type==='project.draft'){showProjectDraft(m.draft||{},Boolean(m.replacing));return}
+    if(m.type==='project.created'||m.type==='project.updated'){
       projectDraft.hidden=true;
-      load().then(()=>select(m.project_id)).then(()=>{status.textContent=`Project ${m.name} saved`}).catch(()=>{});return;
+      load().then(()=>select(m.project_id)).then(()=>{status.textContent=`Project ${m.name} ${m.type==='project.updated'?'updated':'created'}`}).catch(()=>{});return;
     }
     if(current&&m.project_id!=null&&m.project_id!==current)return;
     if(m.type==='transcript.delta')appendTranscript(m.role,m.text);

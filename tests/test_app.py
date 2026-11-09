@@ -84,6 +84,38 @@ async def test_project_api_accepts_persona_fields_and_rejects_duplicate_name(mon
             assert duplicate.status_code == 409
 
 
+async def test_project_delete_requires_auth_and_keeps_live_or_last_project(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer browser-secret"}
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = (await client.get("/api/projects", headers=headers)).json()[0]
+            assert (await client.delete(f"/api/projects/{first['id']}")).status_code == 401
+            assert (await client.delete("/api/projects/9999", headers=headers)).status_code == 404
+            assert (await client.delete(f"/api/projects/{first['id']}", headers=headers)).status_code == 409
+            second = (await client.post(
+                "/api/projects", headers=headers, json={"name": "Cooking Companion"},
+            )).json()
+            assert (await client.patch(
+                f"/api/projects/{second['id']}", headers=headers,
+                json={"name": " first  PROJECT "},
+            )).status_code == 409
+            live = type("LiveSession", (), {"project_id": second["id"], "session_id": 42})()
+            device_sessions["kitchen-test"] = live
+            try:
+                assert (await client.delete(
+                    f"/api/projects/{second['id']}", headers=headers,
+                )).status_code == 409
+            finally:
+                device_sessions.pop("kitchen-test", None)
+            deleted = await client.delete(f"/api/projects/{second['id']}", headers=headers)
+            assert deleted.status_code == 200
+            assert deleted.json() == {"deleted": True, "active_project_id": first["id"]}
+            assert [p["id"] for p in (await client.get("/api/projects", headers=headers)).json()] == [first["id"]]
+    get_settings.cache_clear()
+
+
 async def test_time_zone_defaults_to_browser_sync_but_preserves_manual_zone(monkeypatch, tmp_path):
     configure(monkeypatch, tmp_path)
     headers = {"Authorization": "Bearer browser-secret"}

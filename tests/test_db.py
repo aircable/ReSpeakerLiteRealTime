@@ -53,6 +53,70 @@ def test_project_creation_saves_persona_fields_and_rejects_duplicate_names(tmp_p
         db.create_project("electronics  MENTOR")
 
 
+def test_same_name_persona_save_replaces_fields_but_keeps_history_and_active_state(tmp_path):
+    db = Database(tmp_path / "personas.db")
+    db.initialize()
+    project = db.create_project("Cooking Companion", "Old goal", "Old rules", "Old notes")
+    db.activate_project(project["id"])
+    session_id = db.start_session(project["id"], "kitchen", "test-model")
+    db.add_turn(session_id, "user", "Let's make soup")
+    db.apply_plan_update(project["id"], session_id, {
+        "summary": "Soup is planned", "decisions": [], "open_questions": [],
+        "plan_markdown": "- [ ] Make soup",
+    })
+
+    updated, created = db.save_project_persona(
+        "  cooking   companion ", "New goal", "New rules", "New notes",
+        expected_project_id=project["id"],
+    )
+    assert created is False
+    assert updated["id"] == project["id"]
+    assert updated["name"] == "Cooking Companion"
+    assert (updated["goal"], updated["instructions"], updated["pinned_notes"]) == (
+        "New goal", "New rules", "New notes",
+    )
+    assert updated["active"] == 1
+    assert updated["summary"] == "Soup is planned"
+    assert db.project_turns(project["id"])[0]["text"] == "Let's make soup"
+    assert len(db.plan_history(project["id"])) == 1
+    assert len(db.list_projects()) == 2
+
+
+def test_persona_save_rejects_project_added_after_draft(tmp_path):
+    db = Database(tmp_path / "personas.db")
+    db.initialize()
+    db.create_project("Cooking Companion")
+    with pytest.raises(ValueError, match="changed after the draft"):
+        db.save_project_persona(
+            "Cooking Companion", "New goal", "New rules", "New notes", expected_project_id=None,
+        )
+
+
+def test_deleting_project_removes_db_history_and_selects_remaining_project(tmp_path):
+    db = Database(tmp_path / "projects.db")
+    db.initialize()
+    first = db.get_project()
+    with pytest.raises(ValueError, match="last one"):
+        db.delete_project(first["id"])
+    second = db.create_project("Cooking Companion")
+    db.activate_project(second["id"])
+    session_id = db.start_session(second["id"], "kitchen", "test-model")
+    db.add_turn(session_id, "user", "Make soup")
+    db.apply_plan_update(second["id"], session_id, {
+        "summary": "Soup", "decisions": [], "open_questions": [], "plan_markdown": "Plan",
+    })
+
+    assert db.delete_project(second["id"]) == first["id"]
+    assert db.get_project()["id"] == first["id"]
+    assert db.list_projects() == [db.get_project()]
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sessions WHERE project_id=?", (second["id"],)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM turns WHERE session_id=?", (session_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM plan_revisions WHERE project_id=?", (second["id"],)).fetchone()[0] == 0
+    with pytest.raises(KeyError):
+        db.delete_project(second["id"])
+
+
 def test_find_project_accepts_case_insensitive_unique_spoken_match(tmp_path):
     db = Database(tmp_path / "test.db")
     db.initialize()

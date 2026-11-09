@@ -162,6 +162,7 @@ class DeviceSession:
         self.pending_ready_call_id: str | None = None
         self.search_tasks: set[asyncio.Task[None]] = set()
         self.project_draft: dict[str, str] | None = None
+        self.project_draft_existing_id: int | None = None
         self.project_draft_speech_turn = 0
         self.speech_turns = 0
 
@@ -303,6 +304,7 @@ class DeviceSession:
         self.end_session_response_id = None
         self.end_session_response_done = False
         self.project_draft = None
+        self.project_draft_existing_id = None
         self.project_draft_speech_turn = 0
         self.speech_turns = 0
         self.warmup_vad_items.clear()
@@ -984,12 +986,27 @@ class DeviceSession:
             })
             await cloud.request_response()
             return
+        try:
+            existing = self.db.find_exact_project(draft["name"])
+        except ValueError as exc:
+            await cloud.submit_tool_output(call_id, {"ok": False, "error": str(exc)})
+            await cloud.request_response()
+            return
         self.project_draft = draft
+        self.project_draft_existing_id = existing["id"] if existing is not None else None
         self.project_draft_speech_turn = self.speech_turns
-        await self.publish_json("project.draft", draft=draft)
+        await self.publish_json(
+            "project.draft", draft=draft, replacing=existing is not None,
+        )
         await cloud.submit_tool_output(call_id, {
             "ok": True, "saved": False, "draft": draft,
-            "next_step": "Summarize the draft and ask the user to approve it in a later turn.",
+            "replacing_existing": existing is not None,
+            "next_step": (
+                "Explain that saving will replace this existing persona's goal, instructions, "
+                "and pinned notes while keeping history; ask for approval in a later turn."
+                if existing is not None else
+                "Summarize the draft and ask the user to approve it in a later turn."
+            ),
         })
         await cloud.request_response()
         logger.info("Project draft prepared device=%s name=%s", self.device_id, draft["name"])
@@ -1007,19 +1024,30 @@ class DeviceSession:
             }
         else:
             try:
-                project = self.db.create_project(
-                    draft["name"], draft["goal"], draft["instructions"], draft["pinned_notes"]
+                project, created = self.db.save_project_persona(
+                    draft["name"], draft["goal"], draft["instructions"], draft["pinned_notes"],
+                    expected_project_id=self.project_draft_existing_id,
                 )
             except ValueError as exc:
                 result = {"ok": False, "error": str(exc)}
             else:
                 self.project_draft = None
-                await self.publish_json("project.created", project_id=project["id"], name=project["name"])
+                self.project_draft_existing_id = None
+                await self.publish_json(
+                    "project.created" if created else "project.updated",
+                    project_id=project["id"], name=project["name"],
+                )
                 result = {
                     "ok": True, "project_id": project["id"], "name": project["name"],
-                    "active": False,
+                    "active": bool(project["active"]),
                 }
-                logger.info("Project created by voice device=%s project=%s", self.device_id, project["id"])
+                if not created:
+                    result["updated"] = True
+                    result["history_preserved"] = True
+                logger.info(
+                    "Project %s by voice device=%s project=%s", "created" if created else "updated",
+                    self.device_id, project["id"],
+                )
         await cloud.submit_tool_output(call_id, result)
         await cloud.request_response()
 
@@ -1356,6 +1384,7 @@ class DeviceSession:
         self.pending_ready_call_id = None
         self.warmup_vad_items.clear()
         self.project_draft = None
+        self.project_draft_existing_id = None
         self.project_draft_speech_turn = 0
         self.speech_turns = 0
         if self.ready_keyword_enabled:
@@ -1601,6 +1630,7 @@ class DeviceSession:
             self.waiting_for_ready = False
             self.pending_ready_call_id = None
             self.project_draft = None
+            self.project_draft_existing_id = None
             self.project_draft_speech_turn = 0
             self.speech_turns = 0
             self.warmup_vad_items.clear()

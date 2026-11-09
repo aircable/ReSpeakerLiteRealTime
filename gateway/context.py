@@ -7,7 +7,7 @@ from .voice_commands import command_instructions
 BASE_INSTRUCTIONS = """You are a Socratic thinking companion. Help the user clarify goals,
 surface assumptions, compare options, and decide concrete next actions. Be concise in speech."""
 
-PROJECT_DESIGN_INSTRUCTIONS = """When the user asks to create a persona or project, act as a project designer.
+PROJECT_DESIGN_INSTRUCTIONS = """When the user asks to create or revise a persona or project, act as a project designer.
 Suspend the active project's conversation workflow while designing the new project.
 Learn the purpose, audience, collaboration style, preferred response detail, and any limits.
 Ask only for details needed to make the instructions useful; infer routine choices. Draft a name,
@@ -16,7 +16,9 @@ Keep stable facts in pinned notes and leave rolling summary and plan for actual 
 If requested, incorporate the AI Fluency 4Ds: Delegation, Description, Discernment, and Diligence.
 If requested, use clear technical English inspired by ASD-STE100; do not claim formal compliance.
 Use draft_project to show the proposed fields, then summarize them briefly and ask for changes
-or explicit approval. Use save_project_draft only after the user's later approval."""
+or explicit approval. If the draft has an existing name, explain that saving will replace its
+persona fields while keeping project history. Use save_project_draft only after the user's
+later approval."""
 
 
 def build_instructions(

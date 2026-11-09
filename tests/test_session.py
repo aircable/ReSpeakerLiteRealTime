@@ -1190,6 +1190,39 @@ async def test_voice_project_draft_requires_later_turn_before_saving(tmp_path):
     assert session.db.get_project()["name"] == "First project"
 
 
+async def test_voice_project_draft_updates_same_name_persona_after_approval(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.observer = AsyncMock()
+    existing = session.db.create_project("Cooking Companion", "Old goal", "Old rules", "Old notes")
+    history_id = session.db.start_session(existing["id"], "device", "test")
+    session.db.add_turn(history_id, "user", "Bake bread")
+    draft = {
+        "name": " cooking  companion ", "goal": "Make dinner",
+        "instructions": "Guide one stage at a time.", "pinned_notes": "Use metric units.",
+    }
+    await session._handle_tool_call({
+        "name": "draft_project", "call_id": "draft", "arguments": json.dumps(draft),
+    })
+    assert session.cloud.tool_outputs[-1][1]["replacing_existing"] is True
+    assert any(call.args[0]["type"] == "project.draft" and call.args[0]["replacing"]
+               for call in session.observer.await_args_list)
+
+    await session.handle_openai_event({
+        "type": "input_audio_buffer.speech_started", "item_id": "approval-turn",
+    })
+    await session._handle_tool_call({"name": "save_project_draft", "call_id": "save", "arguments": "{}"})
+    result = session.cloud.tool_outputs[-1][1]
+    updated = session.db.get_project(existing["id"])
+    assert result["ok"] and result["updated"] and result["history_preserved"]
+    assert result["project_id"] == existing["id"]
+    assert updated["instructions"] == draft["instructions"]
+    assert updated["pinned_notes"] == draft["pinned_notes"]
+    assert session.db.project_turns(existing["id"])[0]["text"] == "Bake bread"
+    assert len(session.db.list_projects()) == 2
+    assert any(call.args[0]["type"] == "project.updated"
+               for call in session.observer.await_args_list)
+
+
 async def test_voice_project_draft_rejects_incomplete_fields(tmp_path):
     session, _ = make_session(tmp_path)
     cloud = session.cloud

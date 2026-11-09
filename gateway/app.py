@@ -360,7 +360,30 @@ async def get_project(project_id: int, db: Annotated[Database, Depends(database)
 async def update_project(
     project_id: int, body: ProjectUpdate, db: Annotated[Database, Depends(database)]
 ) -> dict[str, Any]:
-    return db.update_project(project_id, body.model_dump(exclude_none=True))
+    try:
+        return db.update_project(project_id, body.model_dump(exclude_none=True))
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.delete("/api/projects/{project_id}", dependencies=[Depends(require_ui_token)])
+async def delete_project(
+    project_id: int, db: Annotated[Database, Depends(database)]
+) -> dict[str, Any]:
+    if any(
+        session.project_id == project_id and session.session_id is not None
+        for session in device_sessions.values()
+    ):
+        raise HTTPException(409, "End the voice session using this project before deleting it")
+    try:
+        replacement = db.delete_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"deleted": True, "active_project_id": replacement}
 
 
 @app.post("/api/projects/{project_id}/activate", dependencies=[Depends(require_ui_token)])

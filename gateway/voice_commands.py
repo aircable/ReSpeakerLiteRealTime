@@ -144,17 +144,21 @@ VOICE_COMMANDS = (
     VoiceCommand(
         name="draft_project",
         handler="_voice_draft_project",
-        purpose="Prepare or revise a new project persona for the user to review before saving.",
-        examples=("help me create a new persona", "draft a project for learning electronics"),
+        purpose="Prepare a new project persona or a revision to an existing persona for review.",
+        examples=(
+            "help me create a new persona", "draft a project for learning electronics",
+            "revise my Cooking Companion persona",
+        ),
         use_when=(
-            "the user wants a new project or asks to revise the current unsaved project draft. "
+            "the user wants a new project, wants to revise an existing named persona, "
+            "or asks to revise the current unsaved draft. "
             "Ask for missing essentials, then write a useful name, goal, and complete project instructions."
         ),
         avoid_when="the user only asks about an existing project or wants to switch projects.",
         effect=(
             "Keeps an unsaved draft in this voice session and shows it in the web UI. "
-            "Summarize the draft in speech and ask for corrections or explicit permission to save. "
-            "Never claim the project exists yet."
+            "An exact existing name means saving replaces its persona fields but preserves its history. "
+            "Summarize the draft and ask for corrections or explicit permission to save."
         ),
         parameters={
             "type": "object",
@@ -181,13 +185,22 @@ VOICE_COMMANDS = (
     VoiceCommand(
         name="save_project_draft",
         handler="_voice_save_project_draft",
-        purpose="Save the reviewed project persona as a new inactive project.",
-        examples=("save that new project", "yes, create the persona we just drafted"),
+        purpose="Save a reviewed project persona, creating it or updating the exact-name project.",
+        examples=(
+            "save that new project", "yes, create the persona we just drafted",
+            "save the revised Cooking Companion persona",
+        ),
         use_when="an unsaved project draft exists and the user explicitly approves it in a later turn.",
         avoid_when="the user has not reviewed the draft or is still requesting changes.",
-        effect="Stores the draft as a project; the active project stays unchanged until switched.",
+        effect=(
+            "Creates a new inactive project or replaces goal, instructions, and pinned notes "
+            "of an exact-name project while preserving its active state and history."
+        ),
         parameters=EMPTY_ARGUMENTS,
-        response_rule="After saving, say the name and explain that the user can switch to it by voice.",
+        response_rule=(
+            "If the draft replaces a persona, explain that before approval. After saving, say whether "
+            "it was created or updated; revised instructions take effect in the next voice session."
+        ),
     ),
     VoiceCommand(
         name="switch_project",
