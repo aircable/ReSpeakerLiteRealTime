@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Web
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from .config import Settings, get_settings
+from .config import DEVICE_AUDIO_FIELDS, Settings, get_settings
 from .db import Database
 from .planner import Planner
 from .protocol import (
@@ -109,6 +109,19 @@ class GatewaySettingsUpdate(BaseModel):
 
 class DeviceVolumeUpdate(BaseModel):
     level_percent: float = Field(ge=0.0, le=100.0)
+
+
+class DeviceAudioSettingsUpdate(BaseModel):
+    input_noise_reduction: str | None = Field(default=None, pattern="^(far_field|near_field|off)$")
+    vad_mode: str | None = Field(default=None, pattern="^(semantic_vad|server_vad)$")
+    vad_eagerness: str | None = Field(default=None, pattern="^(low|medium|high|auto)$")
+    vad_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    vad_prefix_padding_ms: int | None = Field(default=None, ge=0, le=5000)
+    vad_silence_duration_ms: int | None = Field(default=None, ge=100, le=5000)
+    barge_in_enabled: bool | None = None
+    barge_in_rms_threshold: int | None = Field(default=None, ge=0, le=32768)
+    listening_rms_threshold: int | None = Field(default=None, ge=0, le=32768)
+    xvf_agc_ch0_gain: float | None = Field(default=None, ge=0.0, le=1000.0)
 
 
 async def settings_dependency() -> Settings:
@@ -246,17 +259,25 @@ async def update_gateway_settings(
             raise HTTPException(422, "Use an IANA time zone such as America/Los_Angeles") from exc
     db.update_settings(values)
     if "xvf_agc_ch0_gain" in values:
-        for session in tuple(device_sessions.values()):
-            if session.xvf_agc_ch0_supported:
+        for device_id, session in tuple(device_sessions.items()):
+            try:
+                has_override = "xvf_agc_ch0_gain" in db.device_setting_overrides(device_id)
+            except KeyError:
+                has_override = False
+            if session.xvf_agc_ch0_supported and not has_override:
                 with suppress(WebSocketDisconnect, RuntimeError):
                     await session.request_xvf_gain(values["xvf_agc_ch0_gain"])
     return {"saved": True}
 
 
 @app.get("/api/devices", dependencies=[Depends(require_ui_token)])
-async def connected_devices() -> list[dict[str, Any]]:
-    return [
-        {
+async def connected_devices(db: Annotated[Database, Depends(database)]) -> list[dict[str, Any]]:
+    profiles = {row["device_id"]: {
+        "device_id": row["device_id"], "name": row["name"], "state": "offline",
+        "volume_percent": row["volume_percent"],
+    } for row in db.list_device_profiles()}
+    profiles.update({
+        session.device_id: {
             "device_id": session.device_id,
             "name": session.device_name,
             "state": session.state.value,
@@ -265,7 +286,48 @@ async def connected_devices() -> list[dict[str, Any]]:
             ),
         }
         for session in device_sessions.values()
-    ]
+    })
+    return list(profiles.values())
+
+
+@app.get("/api/devices/{device_id}/audio-settings", dependencies=[Depends(require_ui_token)])
+async def get_device_audio_settings(
+    device_id: str, settings: Annotated[Settings, Depends(settings_dependency)],
+    db: Annotated[Database, Depends(database)],
+) -> dict[str, Any]:
+    try:
+        overrides = db.device_setting_overrides(device_id)
+    except KeyError as exc:
+        raise HTTPException(404, "unknown device") from exc
+    defaults = settings.model_dump(include=DEVICE_AUDIO_FIELDS)
+    defaults.update({key: value for key, value in db.setting_overrides().items() if key in DEVICE_AUDIO_FIELDS})
+    defaults.update(overrides)
+    return {"device_id": device_id, "settings": defaults, "overrides": overrides}
+
+
+@app.patch("/api/devices/{device_id}/audio-settings", dependencies=[Depends(require_ui_token)])
+async def update_device_audio_settings(
+    device_id: str, body: DeviceAudioSettingsUpdate,
+    db: Annotated[Database, Depends(database)],
+) -> dict[str, Any]:
+    values = body.model_dump(exclude_none=True)
+    try:
+        db.update_device_settings(device_id, values)
+    except KeyError as exc:
+        raise HTTPException(404, "unknown device") from exc
+    session = device_sessions.get(device_id)
+    if session is not None:
+        old_barge_in = session.settings.barge_in_enabled
+        if "listening_rms_threshold" in values:
+            session._reset_listening_level_gate()
+        if "barge_in_rms_threshold" in values or "barge_in_enabled" in values:
+            session._reset_barge_in_level_gate()
+        session.refresh_settings()
+        if "xvf_agc_ch0_gain" in values:
+            await session.request_xvf_gain(session.settings.xvf_agc_ch0_gain)
+        if "barge_in_enabled" in values and session.cloud is not None and old_barge_in != session.settings.barge_in_enabled:
+            await session.cloud.set_barge_in(session.settings.barge_in_enabled)
+    return {"saved": True, "device_id": device_id}
 
 
 @app.patch("/api/devices/{device_id}/volume", dependencies=[Depends(require_ui_token)])
@@ -345,12 +407,11 @@ async def device_socket(websocket: WebSocket) -> None:
             await websocket.close(code=1008)
             return
         db = Database(settings.database_path)
-        effective_settings = settings.model_copy(update=db.setting_overrides())
-        planner = Planner(effective_settings, db)
+        planner = Planner(settings, db)
         session = DeviceSession(
             websocket,
             auth.device_id,
-            effective_settings,
+            settings,
             db,
             planner,
             live_hub.publish,
@@ -372,7 +433,7 @@ async def device_socket(websocket: WebSocket) -> None:
         await session.notify_pending_timer()
         # Apply before the wake word whenever the device is already online.
         # start() resends current UI overrides for a persistent connection.
-        await session.request_xvf_gain(effective_settings.xvf_agc_ch0_gain)
+        await session.request_xvf_gain(session.settings.xvf_agc_ch0_gain)
         while True:
             incoming = await websocket.receive()
             if incoming.get("bytes") is not None:

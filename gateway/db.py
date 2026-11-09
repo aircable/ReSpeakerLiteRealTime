@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS device_profiles (
+  device_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  volume_percent INTEGER,
+  settings_json TEXT NOT NULL DEFAULT '{}'
+);
 CREATE TABLE IF NOT EXISTS timers (
   id INTEGER PRIMARY KEY,
   device_id TEXT NOT NULL,
@@ -319,3 +326,49 @@ class Database:
                     "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
                     (key, json.dumps(value)),
                 )
+
+    def register_device(self, device_id: str, name: str | None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO device_profiles(device_id, name, last_seen) VALUES(?,?,?) "
+                "ON CONFLICT(device_id) DO UPDATE SET name=excluded.name, last_seen=excluded.last_seen",
+                (device_id, name or device_id, now()),
+            )
+
+    def list_device_profiles(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT device_id, name, last_seen, volume_percent FROM device_profiles ORDER BY name, device_id"
+            )]
+
+    def get_device_profile(self, device_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM device_profiles WHERE device_id=?", (device_id,)).fetchone()
+        if row is None:
+            raise KeyError("device not found")
+        return dict(row)
+
+    def device_setting_overrides(self, device_id: str) -> dict[str, Any]:
+        return json.loads(self.get_device_profile(device_id)["settings_json"])
+
+    def update_device_settings(self, device_id: str, values: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT settings_json FROM device_profiles WHERE device_id=?", (device_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError("device not found")
+            current = json.loads(row["settings_json"])
+            current.update(values)
+            conn.execute(
+                "UPDATE device_profiles SET settings_json=? WHERE device_id=?",
+                (json.dumps(current), device_id),
+            )
+
+    def update_device_volume(self, device_id: str, volume_percent: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE device_profiles SET volume_percent=? WHERE device_id=?",
+                (volume_percent, device_id),
+            )

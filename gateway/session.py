@@ -77,9 +77,13 @@ class DeviceSession:
         self.websocket = websocket
         self.device_id = device_id
         self.device_name = device_name or device_id
-        self.settings = settings
+        self.base_settings = settings
         self.db = db
+        self.db.register_device(device_id, self.device_name)
+        self.settings = settings
+        self.refresh_settings()
         self.planner = planner
+        self.planner.settings = self.settings
         self.cloud: RealtimeConnection | None = None
         self.session_id: int | None = None
         self.project_id: int | None = None
@@ -161,6 +165,16 @@ class DeviceSession:
         self.project_draft_speech_turn = 0
         self.speech_turns = 0
 
+    def refresh_settings(self) -> None:
+        """Apply shared defaults and this board's saved acoustic overrides."""
+        overrides = self.db.setting_overrides()
+        overrides.update(self.db.device_setting_overrides(self.device_id))
+        self.settings = self.base_settings.model_copy(update={
+            key: value for key, value in overrides.items() if key in Settings.model_fields
+        })
+        if hasattr(self, "planner"):
+            self.planner.settings = self.settings
+
     async def send_json(self, message_type: str, **payload: Any) -> None:
         message = server_message(message_type, **{"device_id": self.device_id, **payload})
         async with self.send_lock:
@@ -177,6 +191,7 @@ class DeviceSession:
 
     async def report_volume(self, level: float) -> None:
         self.device_volume = max(0.0, min(1.0, level))
+        self.db.update_device_volume(self.device_id, round(self.device_volume * 100))
         await self.publish_json(
             "volume.changed",
             level=self.device_volume,
@@ -282,11 +297,7 @@ class DeviceSession:
             return
         # The device WebSocket is persistent, so reload UI overrides for every
         # billed voice session rather than only when the device authenticates.
-        overrides = self.db.setting_overrides()
-        self.settings = self.settings.model_copy(update={
-            key: value for key, value in overrides.items() if key in Settings.model_fields
-        })
-        self.planner.settings = self.settings
+        self.refresh_settings()
         self.accepting_audio = True
         self.end_session_pending = False
         self.end_session_response_id = None
@@ -1130,7 +1141,7 @@ class DeviceSession:
                     await cloud.set_barge_in(enabled)
                 self.settings.barge_in_enabled = enabled
                 self._reset_barge_in_level_gate()
-                self.db.update_settings({"barge_in_enabled": enabled})
+                self.db.update_device_settings(self.device_id, {"barge_in_enabled": enabled})
                 await self.publish_json("settings.changed", barge_in_enabled=enabled)
                 logger.info("Voice barge-in changed device=%s enabled=%s", self.device_id, enabled)
                 result = {"ok": True, "barge_in_enabled": enabled}

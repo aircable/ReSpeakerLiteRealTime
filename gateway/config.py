@@ -7,6 +7,14 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# Acoustic settings can differ by room and are overlaid on gateway defaults.
+DEVICE_AUDIO_FIELDS = frozenset({
+    "input_noise_reduction", "vad_mode", "vad_eagerness", "vad_threshold",
+    "vad_prefix_padding_ms", "vad_silence_duration_ms", "barge_in_enabled",
+    "barge_in_rms_threshold", "listening_rms_threshold", "xvf_agc_ch0_gain",
+})
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

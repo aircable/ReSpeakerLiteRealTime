@@ -80,6 +80,25 @@ def test_project_turns_can_be_filtered_to_one_device(tmp_path):
     ]
 
 
+def test_device_profiles_keep_room_settings_and_last_volume_independent(tmp_path):
+    path = tmp_path / "profiles.db"
+    db = Database(path)
+    db.initialize()
+    db.register_device("0D44", "Kitchen Companion")
+    db.register_device("AB12", "Desk Companion")
+    db.update_device_settings("0D44", {"listening_rms_threshold": 300, "xvf_agc_ch0_gain": 30})
+    db.update_device_volume("0D44", 48)
+
+    reopened = Database(path)
+    assert reopened.device_setting_overrides("0D44") == {
+        "listening_rms_threshold": 300, "xvf_agc_ch0_gain": 30,
+    }
+    assert reopened.device_setting_overrides("AB12") == {}
+    profiles = {row["device_id"]: row for row in reopened.list_device_profiles()}
+    assert profiles["0D44"]["volume_percent"] == 48
+    assert profiles["AB12"]["volume_percent"] is None
+
+
 def test_timers_persist_and_ring_only_on_the_owning_device(tmp_path):
     path = tmp_path / "timers.db"
     db = Database(path)

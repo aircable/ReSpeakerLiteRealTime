@@ -21,6 +21,7 @@
     #transcript{white-space:pre-wrap;max-height:260px;overflow:auto}
     #projectDraft[hidden]{display:none}#projectDraft pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}
     #searchResults[hidden]{display:none}#searchResults p{white-space:pre-wrap}#searchResults a{color:var(--accent)}
+    .settings-group{border-top:1px solid #3a4657;margin-top:1rem;padding-top:.7rem}.settings-group h3{font-size:1rem;margin:.2rem 0}.settings-group>p{margin:.25rem 0 .5rem}
   </style>
 </head>
 <body><main>
@@ -29,30 +30,46 @@
   <section class="panel" id="projectDraft" hidden><strong>Proposed project</strong><p class="status">Review this draft, then tell the assistant to change it or say “save that project.” It is not saved yet.</p><p><strong>Name:</strong> <span id="draftName"></span></p><p><strong>Goal:</strong> <span id="draftGoal"></span></p><strong>Project instructions</strong><pre id="draftInstructions"></pre><strong>Pinned notes</strong><pre id="draftNotes"></pre></section>
   <section class="panel" aria-labelledby="voiceSettingsHeading">
     <div class="bar">
-      <strong id="voiceSettingsHeading">Voice settings</strong>
+      <strong id="voiceSettingsHeading">Shared assistant settings</strong>
       <label>Model <input id="rtModel" placeholder="Realtime model" title="Model used for new voice sessions"></label>
       <label>Voice <input id="voice" placeholder="Voice" title="Assistant voice for new sessions"></label>
       <label>Time zone <input id="timeZone" placeholder="America/Los_Angeles" title="IANA time zone for spoken clock and timer deadlines"></label>
       <label><input id="autoTimeZone" type="checkbox" onchange="setTimeZoneMode()"> use this browser's time zone automatically</label>
       <label>Reasoning <select id="effort" title="Low is responsive; higher effort can add latency"><option>low</option><option>medium</option><option>high</option></select></label>
-      <label>Noise reduction <select id="noiseReduction" title="Input noise reduction"><option value="far_field">Far-field noise reduction</option><option value="near_field">Near-field noise reduction</option><option value="off">Noise reduction off</option></select></label>
-      <label>VAD mode <select id="vadMode" title="Voice activity detection"><option value="semantic_vad">Semantic VAD</option><option value="server_vad">Server VAD</option></select></label>
-      <label>Semantic eagerness <select id="vadEagerness" title="Only used in Semantic VAD mode"><option>auto</option><option>low</option><option>medium</option><option>high</option></select></label>
-      <label>Server VAD threshold <input id="vadThreshold" type="number" min="0" max="1" step="0.05" title="OpenAI Server VAD threshold, 0–1; higher is less sensitive; ignored in Semantic VAD"></label>
-      <label>Server VAD silence (ms) <input id="vadSilence" type="number" min="100" max="5000" step="50" title="Silence before a turn ends, in milliseconds; ignored in Semantic VAD"></label>
       <label>Idle timeout (s) <input id="idle" type="number" min="0" max="900" title="Seconds of idle listening before session end; 0 disables automatic idle end"></label>
       <label><input id="announceProject" type="checkbox"> announce active project</label>
-      <label><input id="bargeIn" type="checkbox"> spoken barge-in</label>
-      <label>Barge-in minimum RMS <input id="bargeInRms" type="number" min="0" max="32768" step="500" title="Minimum 400 ms microphone RMS during assistant playback; 0 disables the local level gate"></label>
-      <label>XVF channel-0 gain <input id="xvfGain" type="number" min="0" max="1000" step="0.5" title="Fixed XMOS microphone gain; 0 restores adaptive AGC. Applies immediately to connected XVF devices."></label>
-      <label>Listening minimum RMS <input id="listeningRms" type="number" min="0" max="32768" step="100" title="Outside playback, require at least six of eight 20-ms frames over this PCM level; 0 disables. Tune after setting fixed gain."></label>
       <label><input id="openaiTrace" type="checkbox"> OpenAI trace</label>
       <label><input id="diagnostic" type="checkbox"> diagnostic audio</label>
-      <button onclick="saveSettings()">Save</button>
+      <button onclick="saveSettings()">Save shared settings</button>
     </div>
+    <p class="status">These settings and the active project apply to every board. Room acoustics are set below for the selected device.</p>
+  </section>
+  <section class="panel" aria-labelledby="deviceAudioHeading">
+    <div class="bar"><strong id="deviceAudioHeading">Device audio settings</strong><label for="deviceSelect">Device</label><select id="deviceSelect" disabled><option value="">No known devices</option></select><span id="deviceState" class="status">offline</span></div>
+    <p class="status">Select the board by name or device ID. Its settings remain available while it is offline. Saved values override the gateway defaults for this board only.</p>
+    <div class="settings-group"><h3>Board output and microphone</h3><p class="status">Volume changes while this board is connected. XMOS gain changes the level before the gateway receives audio.</p><div class="bar">
+      <label for="deviceVolume">Speaker volume</label><input id="deviceVolume" type="range" min="0" max="100" step="1" disabled><span id="deviceVolumeValue" class="status">--</span>
+      <label>XVF channel-0 gain <input id="xvfGain" type="number" min="0" max="1000" step="0.5" title="Fixed XMOS mic gain for this board; 0 restores adaptive AGC"></label>
+    </div></div>
+    <div class="settings-group"><h3>Gateway level gates</h3><p class="status">These gates inspect PCM after XMOS gain, before sending speech to OpenAI. Set 0 to disable a gate.</p><div class="bar">
+      <label>Listening minimum RMS <input id="listeningRms" type="number" min="0" max="32768" step="100" title="Gateway 6 of 8 frames over this PCM level; 0 disables this gate"></label>
+      <label><input id="bargeIn" type="checkbox"> spoken barge-in</label>
+      <label>Barge-in minimum RMS <input id="bargeInRms" type="number" min="0" max="32768" step="500" title="Gateway 400 ms PCM level during assistant playback; 0 disables this gate"></label>
+    </div></div>
+    <div class="settings-group"><h3>OpenAI cloud processing</h3><p class="status">These controls act only on audio that passed the gateway. Server VAD threshold is inactive in Semantic VAD mode.</p><div class="bar">
+      <label>Noise reduction <select id="noiseReduction" title="OpenAI input noise reduction for this board"><option value="far_field">Far-field noise reduction</option><option value="near_field">Near-field noise reduction</option><option value="off">Noise reduction off</option></select></label>
+      <label>OpenAI VAD mode <select id="vadMode" onchange="updateVadControls()"><option value="semantic_vad">Semantic VAD</option><option value="server_vad">Server VAD</option></select></label>
+      <label id="vadEagernessLabel">Semantic eagerness <select id="vadEagerness"><option>auto</option><option>low</option><option>medium</option><option>high</option></select></label>
+      <label id="vadThresholdLabel">Server VAD threshold <input id="vadThreshold" type="number" min="0" max="1" step="0.05" title="Only used in Server VAD mode; higher is less sensitive"></label>
+      <label id="vadSilenceLabel">Server VAD silence (ms) <input id="vadSilence" type="number" min="100" max="5000" step="50" title="Only used in Server VAD mode"></label>
+    </div></div>
+    <p><button id="saveDeviceAudioButton" onclick="saveDeviceAudioSettings()" disabled>Save this device</button></p>
+    <p id="deviceAudioStatus" class="status">Select a device to adjust its audio.</p>
     <details id="voiceSettingsHelp" class="voice-help">
       <summary>Help and starting values</summary>
-      <p>Keep a working setup and change one control at a time. These are starting points, not universal limits. Save changes and start a new voice session to test them; XVF gain applies immediately.</p>
+      <p>Audio path: firmware wake word → gateway Listening minimum RMS gate → OpenAI VAD → assistant response. During assistant speech, the separate gateway Barge-in minimum RMS gate also applies. If the listening gate blocks your voice, OpenAI only receives silence and changing Server VAD cannot help.</p>
+      <p>Keep a working setup and change one control at a time. These are starting points, not universal limits. Save changes and start a new voice session to test cloud settings; XVF gain and the gateway RMS gates apply immediately.</p>
+      <p>For a distant board that wakes but misses speech, first check gateway logs for <code>Listening level guard device=… margin=…</code> and <code>Listening level qualified</code>. A negative margin means the local gate rejected that voice. Lower this board's listening RMS or use 0 briefly to diagnose. If it qualifies but no <code>OpenAI VAD speech started</code> appears, investigate OpenAI VAD and the microphone audio.</p>
       <dl>
         <dt>Model and voice</dt><dd>Keep the model and voice you like unless you are testing quality or latency. Changing speaker voice or volume can change acoustic leakage, so retest barge-in afterward.</dd>
         <dt>Time zone</dt><dd>The control page detects this browser's IANA zone and saves it to the gateway automatically. Turn off automatic mode to enter a zone manually. The last browser to open the page sets the shared zone. Without an open browser or a manual setting, the gateway uses UTC (or <code>TIME_ZONE</code> from its environment). The clock and timer tools use the zone for spoken times; countdowns still run by elapsed seconds.</dd>
@@ -60,13 +77,13 @@
         <dt>Noise reduction</dt><dd><code>far_field</code> suits the ReSpeaker room microphones; <code>near_field</code> is for close-talking mics. Use <code>off</code> mainly to diagnose audio.</dd>
         <dt>VAD mode</dt><dd><code>server_vad</code> uses the threshold and silence controls below. <code>semantic_vad</code> decides when a thought is complete and instead uses eagerness.</dd>
         <dt>Semantic eagerness</dt><dd><code>auto</code> is the default; <code>low</code> waits longer for you to finish. Ignored in Server VAD mode.</dd>
-        <dt>Server VAD threshold</dt><dd>OpenAI's scale is 0–1, with 0.5 as its default. Higher values reject more faint sound but can miss soft speech. This is separate from the gateway RMS gates.</dd>
+        <dt>Server VAD threshold</dt><dd>OpenAI's scale is 0–1, with 0.5 as its default. Higher values reject more faint sound but can miss soft speech. This is separate from the gateway RMS gates and has no effect in Semantic VAD mode.</dd>
         <dt>Server VAD silence</dt><dd>500 ms is the OpenAI default. Shorter responds sooner; longer gives you more time to pause mid-sentence. Ignored in Semantic VAD mode.</dd>
         <dt>Idle timeout</dt><dd>600–900 seconds allows a 10–15 minute hands-free pause; 0 disables the idle timeout, but the session still has a hard limit. This only counts while listening, not while speaking.</dd>
         <dt>Project announcement</dt><dd>Enable for audible confirmation of the active project; disable for a quiet start.</dd>
         <dt>Spoken barge-in</dt><dd>Enable to interrupt assistant speech with your voice. Disable when you want playback protected from interruptions.</dd>
         <dt>Barge-in minimum RMS</dt><dd>Local 400 ms PCM level during playback, not OpenAI VAD. 3000 worked in one test on this setup; raise it if speaker echo interrupts, lower it if you must speak too loudly. 0 disables this local gate, not VAD. The first second of playback is guarded separately.</dd>
-        <dt>XVF channel-0 gain</dt><dd>25 is this setup's fixed-gain baseline; 0 restores adaptive AGC. Only applies to connected XVF-compatible devices.</dd>
+        <dt>XVF channel-0 gain</dt><dd>25 is this setup's fixed-gain baseline; 0 restores adaptive AGC. Only applies to connected XVF-compatible devices. Gain changes both your voice and acoustic leakage.</dd>
         <dt>Listening minimum RMS</dt><dd>800 is this setup's baseline while the assistant is not speaking. Raise it if small noises start turns; lower it if your quiet voice is missed. 0 disables this local gate.</dd>
         <dt>Trace and recordings</dt><dd>Leave off for normal use. OpenAI trace adds event logs; diagnostic audio saves raw microphone and output recordings, which may contain private speech and use storage.</dd>
       </dl>
@@ -82,7 +99,7 @@
     <label>Markdown plan</label><textarea id="plan"></textarea>
     <div class="bar"><button class="primary" onclick="save()">Save</button><button onclick="activate()">Make active</button><button onclick="showHistory()">Plan history</button><button onclick="exportPlan()">Export Markdown</button><span id="saved" class="status"></span></div><pre id="history" class="status"></pre>
   </section>
-  <section class="panel"><div class="bar"><strong>Live device</strong><label for="deviceSelect">Device</label><select id="deviceSelect" disabled><option value="">No connected devices</option></select><span id="deviceState" class="status">offline</span><label for="deviceVolume">Volume</label><input id="deviceVolume" type="range" min="0" max="100" step="1" disabled><span id="deviceVolumeValue" class="status">--</span></div><p class="status">Selection filters this transcript and volume control. Speak to the board you want to use; voice settings and the active project are shared.</p><div id="transcript" class="status">Select a device to view its transcript.</div><div id="searchResults" hidden><h3>Latest web search</h3><p id="searchQuery" class="status"></p><p id="searchAnswer"></p></div></section>
+  <section class="panel"><strong>Live transcript</strong><p class="status">Shows the selected device's conversation. The active project remains shared.</p><div id="transcript" class="status">Select a device to view its transcript.</div><div id="searchResults" hidden><h3>Latest web search</h3><p id="searchQuery" class="status"></p><p id="searchAnswer"></p></div></section>
 </main><script>
 let token=localStorage.uiToken||'', current=null, all=[], live=null;
 let selectedDeviceId=localStorage.selectedDeviceId||'', connectedDevices=[], transcriptRole=null;
@@ -100,29 +117,40 @@ async function syncBrowserTimeZone(settings){
   try{await api('/api/settings',{method:'PATCH',body:JSON.stringify({time_zone:zone,time_zone_auto:true})});status.textContent=`Gateway time zone updated to ${zone}`}
   catch(e){status.textContent=`Time zone sync failed: ${e.message}`}
 }
-async function load(){try{all=await (await api('/api/projects')).json();const s=await (await api('/api/settings')).json();const devices=await (await api('/api/devices')).json();rtModel.value=s.realtime_model;voice.value=s.voice;timeZone.value=s.time_zone;autoTimeZone.checked=s.time_zone_auto;setTimeZoneMode();effort.value=s.reasoning_effort;noiseReduction.value=s.input_noise_reduction;vadMode.value=s.vad_mode;vadEagerness.value=s.vad_eagerness;vadThreshold.value=s.vad_threshold;vadSilence.value=s.vad_silence_duration_ms;idle.value=s.idle_timeout_seconds;announceProject.checked=s.announce_active_project;bargeIn.checked=s.barge_in_enabled;bargeInRms.value=s.barge_in_rms_threshold;xvfGain.value=s.xvf_agc_ch0_gain;listeningRms.value=s.listening_rms_threshold;openaiTrace.checked=s.openai_trace;diagnostic.checked=s.diagnostic_audio;status.textContent='Gateway connected';await syncBrowserTimeZone(s);projects.innerHTML='';all.forEach(p=>{const b=document.createElement('button');b.textContent=p.name+(p.active?' ●':'');b.className=p.active?'active':'';b.onclick=()=>select(p.id);projects.append(b)});renderDevices(devices);if(current)await select(current)}catch(e){status.textContent='Authentication required'}}
+async function load(){try{all=await (await api('/api/projects')).json();const s=await (await api('/api/settings')).json();const devices=await (await api('/api/devices')).json();rtModel.value=s.realtime_model;voice.value=s.voice;timeZone.value=s.time_zone;autoTimeZone.checked=s.time_zone_auto;setTimeZoneMode();effort.value=s.reasoning_effort;idle.value=s.idle_timeout_seconds;announceProject.checked=s.announce_active_project;openaiTrace.checked=s.openai_trace;diagnostic.checked=s.diagnostic_audio;status.textContent='Gateway connected';await syncBrowserTimeZone(s);projects.innerHTML='';all.forEach(p=>{const b=document.createElement('button');b.textContent=p.name+(p.active?' ●':'');b.className=p.active?'active':'';b.onclick=()=>select(p.id);projects.append(b)});renderDevices(devices);await loadDeviceAudioSettings();if(current)await select(current)}catch(e){status.textContent=`Gateway load failed: ${e.message}`}}
 async function select(id){current=id;const p=await (await api(`/api/projects/${id}`)).json();editor.hidden=false;name.value=p.name;goal.value=p.goal;instructions.value=p.instructions;notes.value=p.pinned_notes;summary.value=p.summary;plan.value=p.plan_markdown;await loadTranscript()}
 async function save(){await api(`/api/projects/${current}`,{method:'PATCH',body:JSON.stringify({name:name.value,goal:goal.value,instructions:instructions.value,pinned_notes:notes.value,summary:summary.value,plan_markdown:plan.value})});saved.textContent='Saved';setTimeout(()=>saved.textContent='',1500);load()}
 async function activate(){await api(`/api/projects/${current}/activate`,{method:'POST'});load()}
 async function createProject(){if(!newName.value)return;const p=await (await api('/api/projects',{method:'POST',body:JSON.stringify({name:newName.value})})).json();newName.value='';await load();select(p.id)}
 function exportPlan(){window.open(`/api/projects/${current}/export.md?token=${encodeURIComponent(token)}`)}
-async function saveSettings(){await api('/api/settings',{method:'PATCH',body:JSON.stringify({realtime_model:rtModel.value,voice:voice.value,time_zone:autoTimeZone.checked?(browserTimeZone()||timeZone.value):timeZone.value,time_zone_auto:autoTimeZone.checked,reasoning_effort:effort.value,input_noise_reduction:noiseReduction.value,vad_mode:vadMode.value,vad_eagerness:vadEagerness.value,vad_threshold:Number(vadThreshold.value),vad_silence_duration_ms:Number(vadSilence.value),idle_timeout_seconds:Number(idle.value),announce_active_project:announceProject.checked,barge_in_enabled:bargeIn.checked,barge_in_rms_threshold:Number(bargeInRms.value),xvf_agc_ch0_gain:Number(xvfGain.value),listening_rms_threshold:Number(listeningRms.value),openai_trace:openaiTrace.checked,diagnostic_audio:diagnostic.checked})});status.textContent='Time zone and XMOS gain apply now; other settings apply next session'}
+async function saveSettings(){try{await api('/api/settings',{method:'PATCH',body:JSON.stringify({realtime_model:rtModel.value,voice:voice.value,time_zone:autoTimeZone.checked?(browserTimeZone()||timeZone.value):timeZone.value,time_zone_auto:autoTimeZone.checked,reasoning_effort:effort.value,idle_timeout_seconds:Number(idle.value),announce_active_project:announceProject.checked,openai_trace:openaiTrace.checked,diagnostic_audio:diagnostic.checked})});status.textContent='Shared settings saved; voice settings apply next session'}catch(e){status.textContent=`Save failed: ${e.message}`}}
+function updateVadControls(){const server=vadMode.value==='server_vad';vadThreshold.disabled=!server;vadSilence.disabled=!server;vadEagerness.disabled=server;vadThresholdLabel.style.opacity=server?'1':'.55';vadSilenceLabel.style.opacity=server?'1':'.55';vadEagernessLabel.style.opacity=server?'.55':'1'}
+async function loadDeviceAudioSettings(){
+  const deviceId=selectedDeviceId;saveDeviceAudioButton.disabled=!deviceId;
+  if(!deviceId){deviceAudioStatus.textContent='Select a device to adjust its audio.';return}
+  try{const profile=await (await api(`/api/devices/${encodeURIComponent(deviceId)}/audio-settings`)).json();if(deviceId!==selectedDeviceId)return;
+    const s=profile.settings;noiseReduction.value=s.input_noise_reduction;vadMode.value=s.vad_mode;vadEagerness.value=s.vad_eagerness;vadThreshold.value=s.vad_threshold;vadSilence.value=s.vad_silence_duration_ms;bargeIn.checked=s.barge_in_enabled;bargeInRms.value=s.barge_in_rms_threshold;xvfGain.value=s.xvf_agc_ch0_gain;listeningRms.value=s.listening_rms_threshold;updateVadControls();
+    deviceAudioStatus.textContent=`${Object.keys(profile.overrides).length} saved device overrides; other values use gateway defaults.`;
+  }catch(e){if(deviceId===selectedDeviceId){deviceAudioStatus.textContent=`Could not load device audio: ${e.message}`;saveDeviceAudioButton.disabled=true}}
+}
+async function saveDeviceAudioSettings(){if(!selectedDeviceId)return;const deviceId=selectedDeviceId;try{await api(`/api/devices/${encodeURIComponent(deviceId)}/audio-settings`,{method:'PATCH',body:JSON.stringify({input_noise_reduction:noiseReduction.value,vad_mode:vadMode.value,vad_eagerness:vadEagerness.value,vad_threshold:Number(vadThreshold.value),vad_silence_duration_ms:Number(vadSilence.value),barge_in_enabled:bargeIn.checked,barge_in_rms_threshold:Number(bargeInRms.value),xvf_agc_ch0_gain:Number(xvfGain.value),listening_rms_threshold:Number(listeningRms.value)})});if(deviceId===selectedDeviceId)deviceAudioStatus.textContent='Saved for this board. Gateway RMS and XVF gain apply now; OpenAI VAD and noise reduction apply next session.'}catch(e){deviceAudioStatus.textContent=`Device save failed: ${e.message}`}}
 async function showHistory(){const h=await (await api(`/api/projects/${current}/history`)).json();history.textContent=h.map(x=>`${x.created_at}\n${x.plan_markdown}`).join('\n\n')||'No automatic revisions yet.'}
 function renderDevices(devices){
   connectedDevices=devices;
-  if(!selectedDeviceId&&devices.length===1){selectedDeviceId=devices[0].device_id;localStorage.selectedDeviceId=selectedDeviceId}
+  const previousDeviceId=selectedDeviceId;
+  if(devices.length&&(!selectedDeviceId||!devices.some(d=>d.device_id===selectedDeviceId))){selectedDeviceId=devices[0].device_id;localStorage.selectedDeviceId=selectedDeviceId}
   deviceSelect.replaceChildren();
   if(!selectedDeviceId){const option=new Option(devices.length?'Select a device':'No connected devices','');deviceSelect.add(option)}
-  if(selectedDeviceId&&!devices.some(d=>d.device_id===selectedDeviceId)){deviceSelect.add(new Option(`${selectedDeviceId} (offline)`,selectedDeviceId))}
   for(const d of devices){const label=d.name&&d.name!==d.device_id?`${d.name} (${d.device_id})`:d.device_id;deviceSelect.add(new Option(`${label} — ${d.state}`,d.device_id))}
   deviceSelect.value=selectedDeviceId||'';
   deviceSelect.disabled=!devices.length;
   showSelectedDevice();
+  if(previousDeviceId!==selectedDeviceId)loadDeviceAudioSettings().catch(()=>{});
 }
 function showSelectedDevice(){
   const device=connectedDevices.find(d=>d.device_id===selectedDeviceId);
   deviceState.textContent=device?device.state:'offline';
-  deviceVolume.disabled=!device||device.volume_percent==null;
+  deviceVolume.disabled=!device||device.state==='offline'||device.volume_percent==null;
   deviceVolumeValue.textContent=device&&device.volume_percent!=null?`${Math.round(device.volume_percent)}%`:'--';
   if(device&&device.volume_percent!=null)deviceVolume.value=device.volume_percent;
 }
@@ -162,7 +190,7 @@ function showProjectDraft(draft){
   projectDraft.hidden=false;draftName.textContent=draft.name||'';draftGoal.textContent=draft.goal||'';
   draftInstructions.textContent=draft.instructions||'';draftNotes.textContent=draft.pinned_notes||'(none)';
 }
-deviceSelect.onchange=async()=>{selectedDeviceId=deviceSelect.value;localStorage.selectedDeviceId=selectedDeviceId;searchResults.hidden=true;showSelectedDevice();await loadTranscript()};
+deviceSelect.onchange=async()=>{selectedDeviceId=deviceSelect.value;localStorage.selectedDeviceId=selectedDeviceId;searchResults.hidden=true;showSelectedDevice();await loadDeviceAudioSettings();await loadTranscript()};
 deviceVolume.onchange=async()=>{if(!selectedDeviceId||deviceVolume.disabled)return;await api(`/api/devices/${encodeURIComponent(selectedDeviceId)}/volume`,{method:'PATCH',body:JSON.stringify({level_percent:Number(deviceVolume.value)})})};
 function connectLive(){
   if(live)live.close();
@@ -172,7 +200,7 @@ function connectLive(){
   socket.onmessage=e=>{
     const m=JSON.parse(e.data);
     if(m.type==='auth.ok')refreshDevices().catch(()=>{});
-    if(m.type==='settings.changed'&&typeof m.barge_in_enabled==='boolean')bargeIn.checked=m.barge_in_enabled;
+    if(m.type==='settings.changed'&&m.device_id===selectedDeviceId&&typeof m.barge_in_enabled==='boolean')bargeIn.checked=m.barge_in_enabled;
     const device=connectedDevices.find(d=>d.device_id===m.device_id);
     if(m.type==='state'&&device){device.state=m.state;renderDevices(connectedDevices)}
     if(m.type==='volume.changed'&&device){device.volume_percent=m.level_percent??m.level*100;showSelectedDevice()}

@@ -7,6 +7,9 @@ from fastapi import WebSocketDisconnect
 
 from gateway.app import app, device_sessions, device_socket
 from gateway.config import get_settings
+from gateway.db import Database
+from gateway.planner import Planner
+from gateway.session import DeviceSession
 
 
 def configure(monkeypatch, tmp_path):
@@ -269,6 +272,45 @@ async def test_connected_devices_show_names_and_transcripts_filter_by_device(mon
         get_settings.cache_clear()
 
 
+async def test_device_audio_settings_are_independent_and_require_known_device(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer browser-secret"}
+    async with app.router.lifespan_context(app):
+        db = Database(tmp_path / "app.db")
+        db.register_device("0D44", "Kitchen Companion")
+        db.register_device("AB12", "Desk Companion")
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            assert (await client.get("/api/devices/0D44/audio-settings")).status_code == 401
+            assert (await client.get("/api/devices/missing/audio-settings", headers=headers)).status_code == 404
+            before = (await client.get("/api/devices/0D44/audio-settings", headers=headers)).json()
+            assert before["settings"]["listening_rms_threshold"] == 800
+            assert before["overrides"] == {}
+            result = await client.patch(
+                "/api/devices/0D44/audio-settings", headers=headers,
+                json={"listening_rms_threshold": 300, "vad_mode": "server_vad", "vad_threshold": 0.35},
+            )
+            assert result.status_code == 200
+            assert (await client.patch(
+                "/api/devices/0D44/audio-settings", headers=headers,
+                json={"listening_rms_threshold": -1},
+            )).status_code == 422
+            assert (await client.patch(
+                "/api/devices/missing/audio-settings", headers=headers,
+                json={"listening_rms_threshold": 300},
+            )).status_code == 404
+            kitchen = (await client.get("/api/devices/0D44/audio-settings", headers=headers)).json()
+            desk = (await client.get("/api/devices/AB12/audio-settings", headers=headers)).json()
+            assert kitchen["settings"]["listening_rms_threshold"] == 300
+            assert kitchen["settings"]["vad_threshold"] == 0.35
+            assert desk["settings"]["listening_rms_threshold"] == 800
+            assert desk["settings"]["vad_mode"] == "semantic_vad"
+            devices = (await client.get("/api/devices", headers=headers)).json()
+            assert {d["device_id"] for d in devices} == {"0D44", "AB12"}
+            assert all(d["state"] == "offline" for d in devices)
+    get_settings.cache_clear()
+
+
 async def test_xvf_device_gets_gain_on_authentication(monkeypatch, tmp_path):
     configure(monkeypatch, tmp_path)
     async with app.router.lifespan_context(app):
@@ -279,6 +321,54 @@ async def test_xvf_device_gets_gain_on_authentication(monkeypatch, tmp_path):
     ]
     assert socket.sent[1]["ch0_gain"] == 25.0
     assert socket.sent[2]["monotonic_ms"] == 123
+    get_settings.cache_clear()
+
+
+async def test_device_authentication_applies_its_saved_xvf_gain(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    async with app.router.lifespan_context(app):
+        db = Database(tmp_path / "app.db")
+        db.register_device("0D44", "Kitchen Companion")
+        db.update_device_settings("0D44", {"xvf_agc_ch0_gain": 18.0})
+        socket = FakeDeviceSocket({"xvf_agc_ch0": True}, device_id="0D44")
+        await device_socket(socket)
+    assert socket.sent[1]["type"] == "mic_gain.set"
+    assert socket.sent[1]["ch0_gain"] == 18.0
+    get_settings.cache_clear()
+
+
+async def test_device_audio_patch_updates_only_selected_live_board(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer browser-secret"}
+    async with app.router.lifespan_context(app):
+        db = Database(tmp_path / "app.db")
+        settings = get_settings()
+        kitchen_socket = FakeDeviceSocket()
+        desk_socket = FakeDeviceSocket()
+        kitchen = DeviceSession(
+            kitchen_socket, "0D44", settings, db, Planner(settings, db),
+            capabilities={"xvf_agc_ch0": True},
+        )
+        desk = DeviceSession(
+            desk_socket, "AB12", settings, db, Planner(settings, db),
+            capabilities={"xvf_agc_ch0": True},
+        )
+        device_sessions.update({"0D44": kitchen, "AB12": desk})
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.patch(
+                    "/api/devices/0D44/audio-settings", headers=headers,
+                    json={"listening_rms_threshold": 350, "xvf_agc_ch0_gain": 18.0},
+                )
+            assert response.status_code == 200
+            assert kitchen.settings.listening_rms_threshold == 350
+            assert desk.settings.listening_rms_threshold == 800
+            assert kitchen_socket.sent[-1]["ch0_gain"] == 18.0
+            assert desk_socket.sent == []
+        finally:
+            device_sessions.pop("0D44", None)
+            device_sessions.pop("AB12", None)
     get_settings.cache_clear()
 
 

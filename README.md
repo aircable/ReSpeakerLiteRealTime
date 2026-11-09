@@ -152,19 +152,44 @@ Its ESP32 firmware embeds the matching XMOS image and performs the one-time I²C
 first boot. The gateway must also be updated to expose the time and timer tools. The older
 `respeaker-thinking-companion.yaml` below targets the original Seeed XMOS image, not FFVA.
 
+## Multiple devices
+
+The gateway now identifies each board using its Wi-Fi MAC: for example,
+`Thinking Companion 1C80` with device ID `thinking-companion-dcb4d93b1c80`.
+The short display suffix is easy to read; the full MAC in the ID avoids collisions.
+Both boards may use the same gateway URL and device token. ESPHome's OTA hostname
+is unchanged by this gateway identity. If using OTA with multiple boards running
+the same YAML, still give each board a distinct `substitutions.name` so their
+`.local` addresses do not conflict; USB flashing does not require that.
+The web UI's **Device audio settings** selector shows each known device by name and ID,
+including offline boards. Each board has its own volume, microphone gain,
+listening and barge-in RMS thresholds, and OpenAI VAD settings. The selected
+device's transcript appears below. Existing timers and
+history under the old shared ID remain in the gateway database but are not
+automatically reassigned to a new board-specific ID. Selecting in the UI does
+not route speech: the board that hears the wake word starts the voice session.
+The model, assistant voice, time zone, and default active project remain shared
+across devices. Existing gateway voice settings become defaults for each board
+until that board's audio settings are saved. Volume is stored by the firmware and
+last reported to the gateway; change it while the board is connected.
+
+When a distant board wakes but does not start a conversation, check the gateway's
+`Listening level guard device=… margin=…` log first. A negative margin means
+the local gate sent silence to OpenAI; lower **Listening minimum RMS** for that
+board and retest. `Listening level qualified` means the gateway passed speech.
+If OpenAI still reports no `VAD speech started`, examine the OpenAI VAD mode and
+input audio. **Server VAD threshold** affects only `server_vad`, not the default
+`semantic_vad` mode. The barge-in RMS gate applies during assistant playback.
+
 ## Legacy Seeed firmware
 
 The XMOS chip must first have the formatBCE/Seeed 48 kHz I²S firmware v1.1.0 or newer. Copy
 `firmware/secrets.example.yaml` to `firmware/secrets.yaml`, point `gateway_ws_url` at the gateway,
 then compile `firmware/respeaker-thinking-companion.yaml` with ESPHome 2026.6 or newer.
 
-For multiple boards, give each firmware build a unique `substitutions.name` and
-`substitutions.friendly_name` before flashing. The `name` becomes the gateway `device_id`; both
-boards may use the same gateway URL and device token. The web UI's **Live device** selector shows
-each connected device by friendly name and ID, and limits its transcript and volume control to
-that device. Older firmware that does not report a friendly name still appears by ID. Selecting
-in the UI does not route speech: the board that hears the wake word starts the voice session.
-Voice settings and the default active project remain shared across devices.
+For multiple legacy boards, give each firmware build a unique `substitutions.name`
+and `substitutions.friendly_name`. The name becomes the gateway device ID on this
+firmware; boards that do not report a friendly name appear by ID in the UI.
 
 ### Optional local “ready” model
 

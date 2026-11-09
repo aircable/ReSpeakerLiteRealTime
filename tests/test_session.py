@@ -270,10 +270,23 @@ async def test_voice_command_enables_barge_in_live_and_saves_setting(tmp_path):
 
     assert session.cloud.barge_in_updates == [True]
     assert session.settings.barge_in_enabled is True
-    assert session.db.setting_overrides()["barge_in_enabled"] is True
+    assert session.db.device_setting_overrides("device")["barge_in_enabled"] is True
     assert session.cloud.tool_outputs == [("barge-call", {"ok": True, "barge_in_enabled": True})]
     assert session.cloud.response_requests == [None]
     assert any(event["type"] == "settings.changed" and event["barge_in_enabled"] for event in events)
+
+
+async def test_device_settings_refresh_overrides_shared_defaults_without_sticking(tmp_path):
+    session, _ = make_session(tmp_path, listening_rms_threshold=800)
+    session.db.update_settings({"listening_rms_threshold": 600})
+    session.db.update_device_settings("device", {"listening_rms_threshold": 300})
+    session.refresh_settings()
+    assert session.settings.listening_rms_threshold == 300
+    assert session.planner.settings.listening_rms_threshold == 300
+
+    session.db.update_device_settings("device", {"listening_rms_threshold": 500})
+    session.refresh_settings()
+    assert session.settings.listening_rms_threshold == 500
 
 
 async def test_voice_command_rejects_missing_barge_in_state(tmp_path):
