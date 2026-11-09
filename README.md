@@ -102,6 +102,8 @@ guide the model's intent-based selection; they are not an exact-match speech par
 | --- | --- | --- |
 | “Go to sleep” | `end_session` | Ends the session and resumes wake-word listening |
 | “Which project is active?” | `list_projects` | Read-only lookup |
+| “Help me create a new persona for learning electronics” | `draft_project` | Proposes a name, goal, instructions, and pinned notes for review |
+| “Save that project” | `save_project_draft` | Saves the reviewed draft as an inactive project |
 | “Switch to Cooking Companion” | `switch_project` | Changes the active project and Realtime context |
 | “Set volume to 40 percent” | `control_volume` | Changes and persists device playback volume |
 | “Pause until ready” | `wait_for_ready` | Stops microphone upload and arms local ready-word detection |
@@ -109,6 +111,17 @@ guide the model's intent-based selection; they are not an exact-match speech par
 | “Set a five-minute timer” | `set_timer` | Stores a countdown and rings on this ReSpeaker |
 | “How much time is left?” | `list_timers` | Reports this device’s active timers |
 | “Cancel the pasta timer” | `cancel_timer` | Cancels a matching timer |
+| “Search the web for current XMOS documentation” | `search_web` | Looks up current information on demand |
+
+To create a persona by voice, describe what you want to discuss and how the assistant should
+collaborate with you. The assistant asks for missing essentials, drafts the project fields, and
+shows the complete draft in the web UI. You can ask for revisions. In a later turn, say “save that
+project” to create it; say “switch to NAME” to start using it. A draft is kept only for the current
+voice session. The project designer can incorporate the AI Fluency 4Ds when requested and can
+favor clear technical English inspired by ASD-STE100, but does not certify strict conformance.
+The 4Ds are described in [Anthropic's AI Fluency Framework](https://www.anthropic.com/ai-fluency/overview);
+[ASD-STE100](https://www.asd-ste100.org/about_STE.html) is a controlled language for technical
+documentation, so “inspired by” is the appropriate setting for a conversational persona.
 
 `wait_for_ready` is advertised only when the firmware reports the `ready_keyword` capability.
 Timer commands are advertised only when the firmware reports `timer_alarm`. On a new installation,
@@ -122,7 +135,7 @@ not while it is offline. Output volume at zero also silences the alarm.
 The chime stops automatically after 60 seconds if not dismissed.
 To add a new command, add a registry entry and a corresponding `_voice_*` handler on
 `DeviceSession`, then test its capability gate and result. A project instruction cannot add a
-function that is absent from the gateway's registry. Web search is not registered yet.
+function that is absent from the gateway's registry.
 
 Home Assistant OS normally manages containers as Apps (formerly add-ons). Running this command
 directly requires host-level SSH access and is not managed by Supervisor; packaging the image as a

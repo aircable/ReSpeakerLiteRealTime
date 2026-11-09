@@ -27,7 +27,8 @@ def test_ready_tool_is_advertised_only_with_device_capability():
     with_ready = tool_specs({"ready_keyword": True})
 
     assert {tool["name"] for tool in without_ready} == {
-        "get_local_time", "end_session", "list_projects", "switch_project", "control_volume", "set_barge_in", "search_web"
+        "get_local_time", "end_session", "list_projects", "draft_project",
+        "save_project_draft", "switch_project", "control_volume", "set_barge_in", "search_web"
     }
     assert {tool["name"] for tool in with_ready} == {
         tool["name"] for tool in without_ready
@@ -47,6 +48,8 @@ def test_context_rules_follow_same_capability_gate_as_tool_list():
     assert "pause until ready" in with_ready
     assert "casual 'wait a moment'" in with_ready
     assert "stop the current answer" in with_ready
+    assert "project designer" in with_ready
+    assert "Delegation, Description, Discernment, and Diligence" in with_ready
 
 
 def test_timer_tools_follow_device_capability():

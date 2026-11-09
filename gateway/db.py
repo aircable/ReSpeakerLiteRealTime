@@ -171,12 +171,24 @@ class Database:
                 raise KeyError("project not found")
             return dict(row)
 
-    def create_project(self, name: str, goal: str = "") -> dict[str, Any]:
+    def create_project(
+        self, name: str, goal: str = "", instructions: str = "", pinned_notes: str = ""
+    ) -> dict[str, Any]:
+        name = name.strip()
+        if not name or len(name) > 120:
+            raise ValueError("Project name must be 1-120 characters")
         stamp = now()
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if any(
+                " ".join(row["name"].casefold().split()) == " ".join(name.casefold().split())
+                for row in conn.execute("SELECT name FROM projects")
+            ):
+                raise ValueError("A project with that name already exists")
             cursor = conn.execute(
-                "INSERT INTO projects(name, goal, created_at, updated_at) VALUES(?,?,?,?)",
-                (name, goal, stamp, stamp),
+                "INSERT INTO projects(name, goal, instructions, pinned_notes, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (name, goal, instructions, pinned_notes, stamp, stamp),
             )
             project_id = cursor.lastrowid
         return self.get_project(project_id)

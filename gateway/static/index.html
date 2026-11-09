@@ -19,12 +19,14 @@
     .voice-help dt{font-weight:600}.voice-help dd{margin:0;color:var(--muted)}.voice-help a{color:var(--accent)}
     @media(max-width:650px){.voice-help dl{grid-template-columns:1fr}.voice-help dd{margin-bottom:.4rem}}
     #transcript{white-space:pre-wrap;max-height:260px;overflow:auto}
+    #projectDraft[hidden]{display:none}#projectDraft pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}
     #searchResults[hidden]{display:none}#searchResults p{white-space:pre-wrap}#searchResults a{color:var(--accent)}
   </style>
 </head>
 <body><main>
   <div class="bar"><h1 id="appTitle">Thinking Companion</h1><span id="status" class="status">Enter UI token</span><button onclick="setToken()">Token</button></div>
   <section class="panel"><div class="bar projects" id="projects"></div><div class="bar"><input id="newName" placeholder="New project"><button onclick="createProject()">Create</button></div></section>
+  <section class="panel" id="projectDraft" hidden><strong>Proposed project</strong><p class="status">Review this draft, then tell the assistant to change it or say “save that project.” It is not saved yet.</p><p><strong>Name:</strong> <span id="draftName"></span></p><p><strong>Goal:</strong> <span id="draftGoal"></span></p><strong>Project instructions</strong><pre id="draftInstructions"></pre><strong>Pinned notes</strong><pre id="draftNotes"></pre></section>
   <section class="panel" aria-labelledby="voiceSettingsHeading">
     <div class="bar">
       <strong id="voiceSettingsHeading">Voice settings</strong>
@@ -156,6 +158,10 @@ function showSearchResult(message){
   }
   searchAnswer.append(document.createTextNode(chars.slice(position).join('')));
 }
+function showProjectDraft(draft){
+  projectDraft.hidden=false;draftName.textContent=draft.name||'';draftGoal.textContent=draft.goal||'';
+  draftInstructions.textContent=draft.instructions||'';draftNotes.textContent=draft.pinned_notes||'(none)';
+}
 deviceSelect.onchange=async()=>{selectedDeviceId=deviceSelect.value;localStorage.selectedDeviceId=selectedDeviceId;searchResults.hidden=true;showSelectedDevice();await loadTranscript()};
 deviceVolume.onchange=async()=>{if(!selectedDeviceId||deviceVolume.disabled)return;await api(`/api/devices/${encodeURIComponent(selectedDeviceId)}/volume`,{method:'PATCH',body:JSON.stringify({level_percent:Number(deviceVolume.value)})})};
 function connectLive(){
@@ -171,11 +177,16 @@ function connectLive(){
     if(m.type==='state'&&device){device.state=m.state;renderDevices(connectedDevices)}
     if(m.type==='volume.changed'&&device){device.volume_percent=m.level_percent??m.level*100;showSelectedDevice()}
     if(m.device_id!==selectedDeviceId)return;
+    if(m.type==='project.draft'){showProjectDraft(m.draft||{});return}
+    if(m.type==='project.created'){
+      projectDraft.hidden=true;
+      load().then(()=>select(m.project_id)).then(()=>{status.textContent=`Project ${m.name} saved`}).catch(()=>{});return;
+    }
     if(current&&m.project_id!=null&&m.project_id!==current)return;
     if(m.type==='transcript.delta')appendTranscript(m.role,m.text);
     if(m.type==='transcript.committed')appendTranscript(m.role,m.text);
     if(m.type==='search.result')showSearchResult(m);
-    if(m.type==='session.ended'&&current)loadTranscript().catch(()=>{});
+    if(m.type==='session.ended'){projectDraft.hidden=true;if(current)loadTranscript().catch(()=>{})}
   };
   socket.onclose=e=>{
     if(live!==socket)return;

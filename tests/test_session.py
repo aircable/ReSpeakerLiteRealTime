@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import json
 import logging
 import math
 from fastapi import WebSocketDisconnect
@@ -1140,6 +1141,50 @@ async def test_list_projects_tool_returns_names_and_active_project(tmp_path):
     assert output["active_project"] == "First project"
     assert set(output["projects"]) == {"First project", "Second project"}
     assert session.cloud.response_requests == [None]
+
+
+async def test_voice_project_draft_requires_later_turn_before_saving(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.observer = AsyncMock()
+    cloud = session.cloud
+    draft = {
+        "name": "Electronics Mentor",
+        "goal": "Design a reliable audio board",
+        "instructions": "Ask about constraints; explain tradeoffs in clear technical English.",
+        "pinned_notes": "The user designs ESP32 boards.",
+    }
+    await session._handle_tool_call({
+        "name": "draft_project", "call_id": "draft", "arguments": json.dumps(draft)
+    })
+    assert cloud.tool_outputs[-1][1]["saved"] is False
+    assert session.db.find_project("Electronics Mentor") is None
+    session.observer.assert_awaited()
+
+    await session._handle_tool_call({"name": "save_project_draft", "call_id": "early", "arguments": "{}"})
+    assert cloud.tool_outputs[-1][1]["ok"] is False
+    assert session.db.find_project("Electronics Mentor") is None
+
+    await session.handle_openai_event({
+        "type": "input_audio_buffer.speech_started", "item_id": "approval-turn"
+    })
+    await session._handle_tool_call({"name": "save_project_draft", "call_id": "save", "arguments": "{}"})
+    saved = session.db.find_project("Electronics Mentor")
+    assert cloud.tool_outputs[-1][1] == {
+        "ok": True, "project_id": saved["id"], "name": saved["name"], "active": False,
+    }
+    assert saved["instructions"] == draft["instructions"]
+    assert saved["pinned_notes"] == draft["pinned_notes"]
+    assert session.db.get_project()["name"] == "First project"
+
+
+async def test_voice_project_draft_rejects_incomplete_fields(tmp_path):
+    session, _ = make_session(tmp_path)
+    cloud = session.cloud
+    await session._voice_draft_project(cloud, "draft", {
+        "name": "Empty", "goal": "", "instructions": "Be clear", "pinned_notes": ""
+    })
+    assert cloud.tool_outputs[-1][1]["ok"] is False
+    assert session.project_draft is None
 
 
 async def test_switch_project_opens_clean_context_on_same_device_socket(

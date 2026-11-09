@@ -157,6 +157,9 @@ class DeviceSession:
         self.waiting_for_ready = False
         self.pending_ready_call_id: str | None = None
         self.search_tasks: set[asyncio.Task[None]] = set()
+        self.project_draft: dict[str, str] | None = None
+        self.project_draft_speech_turn = 0
+        self.speech_turns = 0
 
     async def send_json(self, message_type: str, **payload: Any) -> None:
         message = server_message(message_type, **{"device_id": self.device_id, **payload})
@@ -288,6 +291,9 @@ class DeviceSession:
         self.end_session_pending = False
         self.end_session_response_id = None
         self.end_session_response_done = False
+        self.project_draft = None
+        self.project_draft_speech_turn = 0
+        self.speech_turns = 0
         self.warmup_vad_items.clear()
         self._reset_barge_in_level_gate()
         self._reset_listening_level_gate()
@@ -777,6 +783,7 @@ class DeviceSession:
             if self.output is not None and not self.settings.barge_in_enabled:
                 logger.info("Ignoring assistant-echo VAD start device=%s", self.device_id)
                 return
+            self.speech_turns += 1
             self.last_activity = time.monotonic()
             await self.interrupt()
             return
@@ -944,6 +951,65 @@ class DeviceSession:
                 "projects": [project["name"] for project in projects],
             },
         )
+        await cloud.request_response()
+
+    async def _voice_draft_project(
+        self, cloud: RealtimeConnection, call_id: str, arguments: dict[str, Any]
+    ) -> None:
+        limits = {"name": 120, "goal": 2000, "instructions": 10000, "pinned_notes": 5000}
+        draft: dict[str, str] = {}
+        for field, limit in limits.items():
+            value = arguments.get(field)
+            if not isinstance(value, str) or len(value.strip()) > limit:
+                await cloud.submit_tool_output(call_id, {
+                    "ok": False, "error": f"{field} must be text of at most {limit} characters.",
+                })
+                await cloud.request_response()
+                return
+            draft[field] = value.strip()
+        if not all(draft[field] for field in ("name", "goal", "instructions")):
+            await cloud.submit_tool_output(call_id, {
+                "ok": False, "error": "Name, goal, and instructions are required for a draft.",
+            })
+            await cloud.request_response()
+            return
+        self.project_draft = draft
+        self.project_draft_speech_turn = self.speech_turns
+        await self.publish_json("project.draft", draft=draft)
+        await cloud.submit_tool_output(call_id, {
+            "ok": True, "saved": False, "draft": draft,
+            "next_step": "Summarize the draft and ask the user to approve it in a later turn.",
+        })
+        await cloud.request_response()
+        logger.info("Project draft prepared device=%s name=%s", self.device_id, draft["name"])
+
+    async def _voice_save_project_draft(
+        self, cloud: RealtimeConnection, call_id: str, _arguments: dict[str, Any]
+    ) -> None:
+        draft = self.project_draft
+        if draft is None:
+            result = {"ok": False, "error": "There is no project draft in this session."}
+        elif self.speech_turns <= self.project_draft_speech_turn:
+            result = {
+                "ok": False,
+                "error": "Ask the user to review and approve the draft in a later spoken turn.",
+            }
+        else:
+            try:
+                project = self.db.create_project(
+                    draft["name"], draft["goal"], draft["instructions"], draft["pinned_notes"]
+                )
+            except ValueError as exc:
+                result = {"ok": False, "error": str(exc)}
+            else:
+                self.project_draft = None
+                await self.publish_json("project.created", project_id=project["id"], name=project["name"])
+                result = {
+                    "ok": True, "project_id": project["id"], "name": project["name"],
+                    "active": False,
+                }
+                logger.info("Project created by voice device=%s project=%s", self.device_id, project["id"])
+        await cloud.submit_tool_output(call_id, result)
         await cloud.request_response()
 
     async def _voice_control_volume(
@@ -1278,6 +1344,9 @@ class DeviceSession:
         self.waiting_for_ready = False
         self.pending_ready_call_id = None
         self.warmup_vad_items.clear()
+        self.project_draft = None
+        self.project_draft_speech_turn = 0
+        self.speech_turns = 0
         if self.ready_keyword_enabled:
             await self.send_json("keyword.mode", mode="wake")
         await self.set_state(DeviceState.CONNECTING)
@@ -1520,6 +1589,9 @@ class DeviceSession:
             self.ready_wait_requested = False
             self.waiting_for_ready = False
             self.pending_ready_call_id = None
+            self.project_draft = None
+            self.project_draft_speech_turn = 0
+            self.speech_turns = 0
             self.warmup_vad_items.clear()
             self._reset_barge_in_level_gate()
             self._reset_listening_level_gate()

@@ -61,6 +61,26 @@ async def test_ui_api_uses_separate_bearer_token(monkeypatch, tmp_path):
     get_settings.cache_clear()
 
 
+async def test_project_api_accepts_persona_fields_and_rejects_duplicate_name(monkeypatch, tmp_path):
+    configure(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer browser-secret"}
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = {
+                "name": "Learning Coach", "goal": "Learn audio DSP",
+                "instructions": "Use short spoken examples.", "pinned_notes": "Uses ReSpeaker Lite.",
+            }
+            created = await client.post("/api/projects", headers=headers, json=payload)
+            assert created.status_code == 200
+            assert created.json()["instructions"] == payload["instructions"]
+            assert created.json()["pinned_notes"] == payload["pinned_notes"]
+            duplicate = await client.post(
+                "/api/projects", headers=headers, json={"name": " learning  coach "}
+            )
+            assert duplicate.status_code == 409
+
+
 async def test_time_zone_defaults_to_browser_sync_but_preserves_manual_zone(monkeypatch, tmp_path):
     configure(monkeypatch, tmp_path)
     headers = {"Authorization": "Bearer browser-secret"}

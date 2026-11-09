@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from gateway.db import Database
 
 
@@ -34,6 +36,21 @@ def test_only_one_project_can_be_active(tmp_path):
     db.activate_project(second["id"])
     assert db.get_project()["id"] == second["id"]
     assert sum(project["active"] for project in db.list_projects()) == 1
+
+
+def test_project_creation_saves_persona_fields_and_rejects_duplicate_names(tmp_path):
+    db = Database(tmp_path / "test.db")
+    db.initialize()
+    project = db.create_project(
+        "  Electronics Mentor  ", "Learn PCB design", "Explain tradeoffs clearly", "ESP32-S3 board"
+    )
+    assert project["name"] == "Electronics Mentor"
+    assert project["goal"] == "Learn PCB design"
+    assert project["instructions"] == "Explain tradeoffs clearly"
+    assert project["pinned_notes"] == "ESP32-S3 board"
+    assert project["active"] == 0
+    with pytest.raises(ValueError, match="already exists"):
+        db.create_project("electronics  MENTOR")
 
 
 def test_find_project_accepts_case_insensitive_unique_spoken_match(tmp_path):

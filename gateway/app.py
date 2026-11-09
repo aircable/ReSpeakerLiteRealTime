@@ -65,6 +65,8 @@ device_sessions: dict[str, DeviceSession] = {}
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     goal: str = ""
+    instructions: str = ""
+    pinned_notes: str = ""
 
 
 class ProjectUpdate(BaseModel):
@@ -278,7 +280,10 @@ async def update_device_volume(device_id: str, body: DeviceVolumeUpdate) -> dict
 async def create_project(
     body: ProjectCreate, db: Annotated[Database, Depends(database)]
 ) -> dict[str, Any]:
-    return db.create_project(body.name, body.goal)
+    try:
+        return db.create_project(body.name, body.goal, body.instructions, body.pinned_notes)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/projects/{project_id}", dependencies=[Depends(require_ui_token)])
